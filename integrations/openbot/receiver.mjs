@@ -6,7 +6,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { ENV_FILE, loadEnvFile, readConfig } from './config.mjs';
+import { ENV_FILE, enforceEnvPerms, loadEnvFile, readConfig } from './config.mjs';
 import { openStore } from './store.mjs';
 import { cliForwarder } from './forward.mjs';
 import { ensureSubscribed } from './subscribe.mjs';
@@ -83,8 +83,10 @@ export function createReceiver({ secret, subscriberId, store, forward, log = def
       }
       let body;
       try { body = JSON.parse(raw.toString('utf8')); } catch { send(400, { error: 'body is not JSON' }); return; }
-      if (body.subscriberId !== subscriberId || !Array.isArray(body.events)) { send(400, { error: 'unexpected body' }); return; }
-      const events = body.events.filter((e) => typeof e?.id === 'string' && typeof e?.type === 'string');
+      if (!body || typeof body !== 'object' || body.subscriberId !== subscriberId || !Array.isArray(body.events)) { send(400, { error: 'unexpected body' }); return; }
+      const events = body.events;
+      // 有一条不合格就整批拒收：回 200 会让麦田当成送达，不合格的事件就丢了
+      if (!events.every((e) => e && typeof e.id === 'string' && e.id && typeof e.type === 'string' && e.type)) { send(400, { error: 'event without id or type' }); return; }
       const r = store.receive(events, now());
       log(`收到 ${events.length} 条（新 ${r.accepted}，重复 ${r.duplicate}）`);
       send(200, { ok: true, ...r });
@@ -96,6 +98,7 @@ export function createReceiver({ secret, subscriberId, store, forward, log = def
 }
 
 export async function main() {
+  enforceEnvPerms(ENV_FILE);
   loadEnvFile(ENV_FILE);
   const cfg = readConfig();
   const { secret, created } = await ensureSubscribed(cfg, { envFile: ENV_FILE });
@@ -103,6 +106,7 @@ export async function main() {
   const store = openStore(cfg.stateDb);
   const receiver = createReceiver({ secret, subscriberId: cfg.subscriberId, store, forward: cliForwarder({ cli: cfg.cli, agent: cfg.agent }) });
   const server = http.createServer(receiver.handler);
+  server.requestTimeout = 20_000;   // 拖着不发完请求体的连接 20 秒断开，保证 30 秒内有回应
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(cfg.port, '127.0.0.1', resolve); });
   defaultLog(`接收端已启动：127.0.0.1:${cfg.port}${HOOK_PATH}，投给 OpenBot「${cfg.agent}」`);
   receiver.drain();

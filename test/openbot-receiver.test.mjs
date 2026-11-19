@@ -9,8 +9,8 @@ import http from 'node:http';
 import { createHmac } from 'node:crypto';
 import { createReceiver, HOOK_PATH } from '../integrations/openbot/receiver.mjs';
 import { openStore, batchKey, RETRY_DELAYS_MS, MAX_ATTEMPTS } from '../integrations/openbot/store.mjs';
-import { readConfig, writeEnvValue } from '../integrations/openbot/config.mjs';
-import { taskText, clientMessageId, cliForwarder } from '../integrations/openbot/forward.mjs';
+import { readConfig, writeEnvValue, enforceEnvPerms } from '../integrations/openbot/config.mjs';
+import { taskText, clientMessageId, cliForwarder, childEnv } from '../integrations/openbot/forward.mjs';
 import { ensureSubscribed, subscribeViaMcp } from '../integrations/openbot/subscribe.mjs';
 import { subscribe } from '../src/ops/engage/subscribers.mjs';
 import { ingestSnapshot } from '../src/ops/engage/store.mjs';
@@ -133,6 +133,15 @@ describe('接收端', () => {
     assert.deepEqual(s.receive([ev('a'), ev('b')], T0), { accepted: 1, duplicate: 1 });
     s.close();
   });
+
+  test('合法签名但 body 是 null、事件缺 id/type：回 400，不崩、不入队', async () => {
+    const t = await start();
+    assert.equal((await t.post(null)).status, 400);
+    assert.equal((await t.post(batch([{ type: 'comment.created' }]))).status, 400);
+    assert.equal((await t.post(batch([ev('ok'), { id: '', type: 'x' }]))).status, 400);
+    assert.equal(t.store.stats().total, 0);
+    await t.close();
+  });
 });
 
 describe('投递给 OpenBot', () => {
@@ -188,6 +197,21 @@ describe('配置', () => {
     writeEnvValue(f, 'MAITIAN_SECRET', 'new');
     assert.equal(fs.readFileSync(f, 'utf8'), 'OPENBOT_AGENT=x\nMAITIAN_SECRET=new\n');
     assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  });
+
+  test('已有 .env 权限过宽：启动时收紧到 0600', () => {
+    const f = path.join(tmpDir(), '.env');
+    fs.writeFileSync(f, 'MAITIAN_SECRET=x\n', { mode: 0o644 });
+    fs.chmodSync(f, 0o644);
+    enforceEnvPerms(f);
+    assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+    enforceEnvPerms(path.join(tmpDir(), 'none'));
+  });
+
+  test('子进程环境里没有 MAITIAN_SECRET', () => {
+    const env = childEnv({ MAITIAN_SECRET: 's', PATH: '/bin' });
+    assert.equal(env.MAITIAN_SECRET, undefined);
+    assert.equal(env.PATH, '/bin');
   });
 });
 

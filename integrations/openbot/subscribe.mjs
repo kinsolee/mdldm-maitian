@@ -3,10 +3,11 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { writeEnvValue } from './config.mjs';
+import { childEnv } from './forward.mjs';
 
 /** 返回 subscribe_events 的结果（created、secret 等）。MCP 报错时抛错。 */
 export async function subscribeViaMcp({ mcpServer, opsDb, subscriberId, url, types, platforms }) {
-  const env = { ...process.env };
+  const env = childEnv();
   if (opsDb) env.MAITIAN_OPS_DB = opsDb;
   const transport = new StdioClientTransport({ command: process.execPath, args: [mcpServer, '--scope', 'read'], env, stderr: 'ignore' });
   const client = new Client({ name: 'openbot-receiver', version: '1' });

@@ -12,6 +12,12 @@ export function taskText(ids) {
   ].join('\n');
 }
 
+/** 给子进程的环境：去掉麦田签名密钥，子进程用不到它。 */
+export function childEnv(env = process.env) {
+  const { MAITIAN_SECRET: _drop, ...rest } = env;
+  return rest;
+}
+
 /** OpenBot 的重试键：同一批事件永远是同一个键，重投会被 OpenBot 认成同一条消息。 */
 export const clientMessageId = (key) => `maitian-${key}`;
 
@@ -21,7 +27,7 @@ export const clientMessageId = (key) => `maitian-${key}`;
  */
 export function cliForwarder({ cli, agent, timeoutMs = FORWARD_TIMEOUT_MS, node = process.execPath }) {
   return (ids, key) => new Promise((resolve, reject) => {
-    const child = spawn(node, [cli, 'run', agent, '-', '--id', clientMessageId(key), '--json'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(node, [cli, 'run', agent, '-', '--id', clientMessageId(key), '--json'], { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv() });
     let out = '';
     let err = '';
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`openbot-cli 超时（${Math.round(timeoutMs / 1000)} 秒）`)); }, timeoutMs);
@@ -39,6 +45,7 @@ export function cliForwarder({ cli, agent, timeoutMs = FORWARD_TIMEOUT_MS, node 
         resolve({ deliveryId: null, status: null });
       }
     });
+    child.stdin.on('error', () => {});   // 子进程早退时 EPIPE 不能把接收端带崩；结果看退出码
     child.stdin.end(taskText(ids));
   });
 }

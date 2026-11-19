@@ -48,6 +48,12 @@ export function writeEnvValue(file, key, value) {
     if (lines.length && lines.at(-1) === '') lines.pop();
     lines.push(`${key}=${value}`, '');
   }
+  if (fs.existsSync(file)) fs.chmodSync(file, 0o600);   // 先收紧再写，写入密钥时不会有可读窗口
   fs.writeFileSync(file, lines.join('\n'), { mode: 0o600 });
   fs.chmodSync(file, 0o600);
+}
+
+/** .env 存在就把权限收紧到 0600（启动时调，覆盖重复登记不写文件的路径）。 */
+export function enforceEnvPerms(file) {
+  if (fs.existsSync(file) && (fs.statSync(file).mode & 0o777) !== 0o600) fs.chmodSync(file, 0o600);
 }
