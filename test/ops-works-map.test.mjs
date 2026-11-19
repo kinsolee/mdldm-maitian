@@ -935,3 +935,97 @@ describe('http 2xx（不只是 200）都算成功', () => {
     assert.deepEqual(r.stats.fansProblems, []);
   });
 });
+
+// 评审 X-B3：粉丝分日固定近 30 天，和作品窗口 --days 无关
+describe('粉丝分日固定 30 天，不跟着 days 走', () => {
+  test('fmt.FANS_DAILY_DAYS = 30', () => assert.equal(fmt.FANS_DAILY_DAYS, 30));
+
+  test('抖音 fetchRaw days=7：dashboard/fans 仍请求 recent_days=30；map 不截短 daily', async () => {
+    const dy = await import('../src/ops/works/douyin.mjs');
+    const nowMs = cstMs('2026-11-19 14:50:13');
+    const trends = Array.from({ length: 30 }, (_, i) => ({ date_time: fmt.cstDate(cstMs('2026-10-20 00:00:00') / 1000 + i * 86400).replaceAll('-', ''), value: i }));
+    const page = fakePage({ routes: [
+      [/user\/info/, { body: { status_code: 0, user: { uid: 1 } } }],
+      [/work_list/, { body: { status_code: 0, total: 0, has_more: false, max_cursor: 0, aweme_list: [], items: [] } }],
+      [/dashboard\/fans/, { body: { status_code: 0, metrics: [{ english_metric_name: 'total_fans_cnt', trends }, { english_metric_name: 'net_fans_cnt', trends }] } }],
+    ] });
+    const raw = await dy.fetchRaw(page, { days: 7, nowMs, ...fakeSleep() });
+    const fansCall = page.calls.find((c) => /dashboard\/fans/.test(c.url));
+    assert.match(fansCall.url, /recent_days=30(&|$)/);
+    assert.equal(dy.map(raw, { days: 7, nowMs }).account.daily.length, 30);
+  });
+
+  test('视频号 fetchRaw days=7：fans_trend 的 startTs 是 30 天前东八区 0 点；map 的 daily 日期按它推、不截短', async () => {
+    const ch = await import('../src/ops/works/channels.mjs');
+    const nowMs = cstMs('2026-11-19 15:36:47');
+    const total = Array.from({ length: 31 }, (_, i) => i);
+    const page = fakePage({ routes: [
+      [/auth\/auth_data/, { body: { errCode: 0, data: { finderUser: { finderUsername: 'f', uniqId: 'sph', fansCount: 1 } } } }],
+      [/post_list/, { body: { errCode: 0, data: { totalCount: 0, list: [] } } }],
+      [/fans_trend/, { body: { errCode: 0, data: { total, netAdd: total } } }],
+    ] });
+    const raw = await ch.fetchRaw(page, { days: 7, nowMs, ...fakeSleep() });
+    const pl = JSON.parse(page.calls.find((c) => /post_list/.test(c.url)).opts.body);
+    const ft = JSON.parse(page.calls.find((c) => /fans_trend/.test(c.url)).opts.body);
+    assert.equal(pl.startTime, cstMs('2026-11-12 00:00:00') / 1000);         // 作品窗口仍按 days
+    assert.equal(ft.startTs, String(cstMs('2026-10-20 00:00:00') / 1000));   // 粉丝固定 30 天
+    const { daily } = ch.map(raw, { days: 7, nowMs }).account;
+    assert.equal(daily.length, 31);
+    assert.equal(daily[0].date, '2026-10-20');
+    assert.equal(daily.at(-1).date, '2026-11-19');
+  });
+
+  test('小红书 overall_new、B站 fans/stat/graph?period=1 的请求不带 days', async () => {
+    const src = (f) => fs.readFileSync(path.join(ROOT, 'src/ops/works', f), 'utf8');
+    assert.match(src('bili.mjs'), /fans\/stat\/graph\?type=all_fans&period=1'/);
+    assert.match(src('xhs.mjs'), /fans\/overall_new'/);
+  });
+});
+
+// 评审 X-B5：缺 id 的作品不能生成 "undefined" 这样的 postId；整个平台 complete=false
+describe('作品缺 id → postId=null、complete=false', () => {
+  const badId = (r) => r.posts.filter((p) => p.postId == null || /^(undefined|null)$/.test(String(p.postId)) || /undefined|null$/.test(String(p.url ?? '')));
+  const check = (r, field) => {
+    assert.equal(r.complete, false);
+    assert.match(r.incomplete, new RegExp(field));
+    for (const p of r.posts) assert.ok(!/^(undefined|null)$/.test(String(p.postId)) || p.postId === null, 'postId 不能是 "undefined"/"null" 字符串');
+    assert.ok(badId(r).every((p) => p.postId === null));
+    assert.doesNotMatch(JSON.stringify(r.posts), /"postId":"(undefined|null)"|\/(video|explore)\/(undefined|null)"/);
+  };
+
+  test('视频号缺 objectNonce', async () => {
+    const ch = await import('../src/ops/works/channels.mjs');
+    const fx = fixture('channels-account');
+    const list = structuredClone(sample('channels').raw.postList);
+    list.data.totalCount = 1;
+    delete list.data.list[0].objectNonce;
+    check(ch.map({ auth: fx.auth, postList: [{ ...list, http: 200 }], fansTrend: fx.fansTrend }, { days: 30, nowMs: cstMs('2026-11-19 15:36:47') }), 'objectNonce');
+  });
+
+  test('抖音缺 aweme_id', async () => {
+    const dy = await import('../src/ops/works/douyin.mjs');
+    const fx = fixture('douyin-account');
+    const wl = structuredClone(sample('douyin').raw.work_list);
+    delete wl.aweme_list[1].aweme_id;
+    check(dy.map({ info: fx.info, pages: [{ ...wl, http: 200 }], fans: fx.fans }, { days: 30, nowMs: cstMs('2026-11-19 14:50:13') }), 'aweme_id');
+  });
+
+  test('B站缺 bvid', async () => {
+    const bili = await import('../src/ops/works/bili.mjs');
+    const S = sample('bili');
+    const fx = fixture('bili-account');
+    const a = structuredClone(S.raw.archives);
+    a.data.arc_audits[0].Archive.bvid = '';
+    check(bili.map({ nav: fx.nav, archives: [{ ...a, http: 200 }], compare: S.raw.compare, fansGraph: fx.fansGraph, fansNum: S.raw.fansNum }, { days: 30, nowMs: cstMs('2026-11-19 14:26:35') }), 'bvid');
+  });
+
+  test('小红书缺 id', async () => {
+    const xhs = await import('../src/ops/works/xhs.mjs');
+    const S = sample('xhs');
+    const fx = fixture('xhs-account');
+    const an = structuredClone(S.raw.analyze);
+    an.data.total = 1;
+    an.data.note_infos[0].id = null;
+    check(xhs.map({ atLoginPage: false, analyze: [{ ...an, http: 200 }], posted: [], userInfo: fx.userInfo, personalInfo: S.raw.personal_info, fans: fx.fans }, { days: 30, nowMs: cstMs('2026-11-19 14:26:09') }), '\\bid\\b');
+  });
+});

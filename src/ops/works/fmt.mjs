@@ -41,3 +41,15 @@ export function pageProblem(api, index, { http, code, error }, dataOk) {
   const why = error ? `error=${error}` : !httpOk(http) ? 'http 不是 2xx' : code !== 0 ? 'code 不是 0' : !dataOk ? 'data 缺失' : null;
   return why && `${api} 第 ${index + 1} 页没读成功：${why}（http=${http ?? null} code=${code ?? null}）`;
 }
+
+// 粉丝分日固定取近 30 天（spec：粉丝总数 + 近 30 天分日），和作品窗口 --days 无关
+export const FANS_DAILY_DAYS = 30;
+
+// 作品 id → 字符串；缺值 / 空串 → null。不能用 String(undefined) 生成 "undefined"：
+// 它会被当成合法 postId 写库导出，backfill 按它建重复笔记
+export const idOf = (v) => (v == null || v === '' ? null : String(v));
+// 窗口内有作品缺 id 时整个平台算不完整（只丢那一条会让导出悄悄少一条）
+export function missingIdProblem(api, field, posts) {
+  const bad = posts.filter((p) => p.postId == null);
+  return bad.length ? `${api} 有 ${bad.length} 条作品缺 ${field}（postTime=${bad.map((p) => p.postTime).join('、')}）` : null;
+}

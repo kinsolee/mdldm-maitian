@@ -3,7 +3,7 @@
 // 不用签名，靠 cookie；请求体要带 _log_finder_id=finderUsername。finderUsername 只在 fetchRaw 里当局部变量用，
 // 不进 raw、不进 map 的返回值。用 page.fetch 发（page.evaluate 有 15 秒上限，连发几次会超时）。
 // 这些接口是只读查询，虽然是 POST。fetchRaw 在 Ego space 里跑；map 是宿主侧纯函数。
-import { DAY, cst, cstDate, cstDay0, num, pct, pick, pageProblem } from './fmt.mjs';
+import { DAY, cst, cstDate, cstDay0, num, pct, pick, pageProblem, idOf, missingIdProblem, FANS_DAILY_DAYS } from './fmt.mjs';
 
 export const PLATFORM = 'Channels';
 export const START_URL = 'https://channels.weixin.qq.com/platform';
@@ -13,6 +13,8 @@ const MAX_PAGES = 10;   // 每页 20 条
 
 // 东八区当天 0 点往前 N 天（秒）；post_list 的 startTime/endTime 是秒
 const startOf = (days, nowMs) => cstDay0(Math.floor(nowMs / 1000)) - days * DAY;
+// 粉丝分日固定近 30 天，和作品窗口 days 无关
+const fansStartOf = (nowMs) => startOf(FANS_DAILY_DAYS, nowMs);
 
 async function post(page, url, body) {
   const r = await page.fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), timeout: 40000 });
@@ -57,10 +59,11 @@ export async function fetchRaw(page, { days, nowMs, sleep }) {
 
   await sleep(PAGE_GAP_MS);
   const today = cstDay0(now);
-  const tr = await call('statistic/fans_trend', { startTs: String(start), endTs: String(today), interval: 3 });
+  const fansStart = fansStartOf(nowMs);
+  const tr = await call('statistic/fans_trend', { startTs: String(fansStart), endTs: String(today), interval: 3 });
   const t = tr.json?.data;
   // 第 i 个点是 startTs + i 天，map 要用 startTs 推日期
-  raw.fansTrend = { http: tr.http, errCode: tr.json?.errCode ?? null, startTs: start, data: t ? pick(t, ['add', 'reduce', 'netAdd', 'total']) : null };
+  raw.fansTrend = { http: tr.http, errCode: tr.json?.errCode ?? null, startTs: fansStart, data: t ? pick(t, ['add', 'reduce', 'netAdd', 'total']) : null };
   return raw;
 }
 
@@ -77,7 +80,7 @@ export function map(raw, { days, nowMs }) {
     const media = p.desc?.media?.[0];
     return {
       // 小V猫的 postId 是 objectNonce（不是 objectId），已回填的笔记按它存 post_id，换了会重复建
-      postId: String(p.objectNonce), objectId: p.objectId == null ? null : String(p.objectId), uid, platform: PLATFORM, account: fu?.nickname ?? null,
+      postId: idOf(p.objectNonce), objectId: p.objectId == null ? null : String(p.objectId), uid, platform: PLATFORM, account: fu?.nickname ?? null,
       title: p.desc?.shortTitle?.[0]?.shortTitle || (p.desc?.description || '').split('\n')[0].slice(0, 60), desc: p.desc?.description ?? null,
       cover: media?.coverUrl ?? media?.thumbUrl ?? null,
       // post_list 只含已发表的；仅自己可见的另外带 punish
@@ -103,10 +106,11 @@ export function map(raw, { days, nowMs }) {
     : !pl.length ? 'post_list 没读'
     : pl.map((x, i) => pageProblem('post_list', i, { http: x.http, code: x.errCode }, Array.isArray(x.data?.list) && x.data.totalCount != null)).find(Boolean)
       ?? (items.length < total ? `post_list 只拿到 ${items.length} 条，totalCount=${total}` : null)
+      ?? missingIdProblem('post_list', 'objectNonce', posts)
       ?? (raw.hitMaxPages ? `post_list 翻到 ${MAX_PAGES} 页上限还没翻完` : null);
 
   const t = raw.fansTrend?.data ?? {};
-  const t0 = raw.fansTrend?.startTs ?? start;
+  const t0 = raw.fansTrend?.startTs ?? fansStartOf(nowMs);
   const account = {
     uid, loginStatus: loggedIn ? '登录有效' : '登录失效', fans: num(fu?.fansCount), updateTime: cst(now),
     daily: (t.total ?? []).map((v, i) => ({ date: cstDate(t0 + i * DAY), fansTotal: num(v), fansNet: num(t.netAdd?.[i]), fansAdd: num(t.add?.[i]), fansDrop: num(t.reduce?.[i]) })),

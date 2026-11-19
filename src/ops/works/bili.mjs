@@ -1,7 +1,7 @@
 // B站：近 N 天稿件 + 指标、粉丝总数和分日粉丝。读法和字段对照见 spikes/results/06-works.md「B站」，
 // 请求、翻页、停止条件照搬 spikes/platform/06-works-bili.mjs（2026-11-19 实测）。
 // 都在 member.bilibili.com 页面里同源 GET，带 cookie，不用 w_rid 签名。fetchRaw 在 Ego space 里跑；map 是宿主侧纯函数。
-import { DAY, cst, cstDate, num, pick, pageProblem } from './fmt.mjs';
+import { DAY, cst, cstDate, num, pick, pageProblem, idOf, missingIdProblem } from './fmt.mjs';
 
 export const PLATFORM = 'Bili';
 export const START_URL = 'https://member.bilibili.com/platform/home';
@@ -71,15 +71,16 @@ export function map(raw, { days, nowMs }) {
   // 未发布的定时稿 ptime=0：发布时间回退到定时时间 dtime，再回退投稿时间 ctime（refresh.py 遇到空 postTime 会抛错）
   const postSec = (a) => a.ptime || a.dtime || a.ctime;
   const posts = arcs.filter(({ Archive: a }) => postSec(a) >= since || a.dtime > now).map(({ Archive: a, stat: s }) => {
-    const c = cmpBy.get(a.bvid);
+    const postId = idOf(a.bvid);
+    const c = postId ? cmpBy.get(postId) : undefined;
     const [publishStatus, statusText] = STATE[a.state] ?? ['unknown', a.state_desc || `state=${a.state}`];
     const ratio = num(c?.full_play_ratio);
     return {
-      postId: a.bvid, uid: a.mid != null ? String(a.mid) : uid, platform: PLATFORM, account: nav.uname ?? null,
+      postId, uid: a.mid != null ? String(a.mid) : uid, platform: PLATFORM, account: nav.uname ?? null,
       title: a.title ?? null, desc: a.desc ?? null, cover: a.cover ?? null,
       postType: '视频', postTypeCode: '1', publishStatus, statusText, status: a.state == null ? null : String(a.state),
       postTime: cst(postSec(a)), timing: a.dtime > now ? cst(a.dtime) : null,
-      url: `https://www.bilibili.com/video/${a.bvid}`,
+      url: postId && `https://www.bilibili.com/video/${postId}`,
       view: num(s?.view), like: num(s?.like), comment: num(s?.reply), favorite: num(s?.favorite), forward: num(s?.share),
       fansAdd: num(c?.total_new_attention_cnt), fansDrop: num(c?.unfollow),
       danmu: num(s?.danmaku), coin: num(s?.coin),
@@ -98,6 +99,7 @@ export function map(raw, { days, nowMs }) {
   const incomplete = !loggedIn ? '没登录，没读稿件列表'
     : !raw.archives?.length ? 'archives 没读'
     : raw.archives.map((p, i) => pageProblem('archives', i, p, arcsOk(p.data))).find(Boolean)
+      ?? missingIdProblem('archives', 'bvid', posts)
       ?? (raw.hitMaxPages ? `archives 翻到 ${MAX_PAGES} 页上限还没到窗口起点` : null);
   const sideProblem = (api, r, ok) => (!r ? (loggedIn ? `${api} 没读` : null) : pageProblem(api, 0, r, ok));
 
