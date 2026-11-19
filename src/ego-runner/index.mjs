@@ -6,15 +6,32 @@
 // 所以参数以 JSON 字面量写进脚本前言，模块用 file:// 绝对地址加载（已实测可以 import 本地 ESM）。
 import { spawn } from 'node:child_process';
 import { FORBIDDEN_PROFILE } from './space.mjs';
+import { OPS_DIR, opsPaths } from './paths.mjs';
+import { acquireSpaceLock } from './space-lock.mjs';
+import { HEARTBEAT_STALE_MS } from './heartbeat.mjs';
 
 export const DEFAULT_PROFILE = 'Profile 5';
 export const DEFAULT_PLUGIN_DIR = '/Users/kinso/code/github/kinsolee/mdldm-maitian-publisher';
 export const RESULT_PREFIX = '@@RESULT ';
+/** 前言自己判定失败（user-owned、deadline 等）时打一行 `@@OPS {"reason","error",...}` 再退出，runner 认这一行，不解析报错文字。 */
+export const OPS_PREFIX = '@@OPS ';
+export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
+
+/** reason → 退出码（CLI 的退出码就用它）。没列的失败一律 1。 */
+export const EXIT_CODES = {
+  locked: 5, 'previous-still-running': 5,
+  'user-owned': 4,
+  'profile-rejected': 3, 'profile-missing': 3,
+  'bad-space-name': 2,
+};
+export const exitCodeOf = (r) => (r.ok ? 0 : EXIT_CODES[r.reason] ?? 1);
 const SPACE_NAME = /^kinso\/[a-z0-9_-]+\/[^/\s]+$/i;
 const EGO_NOTICE = /^\[ego-browser:/;
 
 const SHIM_URL = new URL('../ego-shim.mjs', import.meta.url).href;
 const SPACE_URL = new URL('./space.mjs', import.meta.url).href;
+const HEARTBEAT_URL = new URL('./heartbeat.mjs', import.meta.url).href;
+const FOREGROUND_URL = new URL('./foreground.mjs', import.meta.url).href;
 
 /** 从子进程输出里取结果：最后一个非空、非 Ego 提示的行必须是 `@@RESULT <json>`，且退出码为 0。 */
 export function parseResult(output, code) {
@@ -26,13 +43,26 @@ export function parseResult(output, code) {
   catch (e) { return { ok: false, reason: 'bad-json', error: `@@RESULT 不是合法 JSON：${e.message}` }; }
 }
 
+/** 输出里有前言打的 `@@OPS` 行时，按它判失败原因（退出码是多少都以它为准）；没有返回 null。 */
+export function parseOps(output) {
+  const line = output.split('\n').map((l) => l.trim()).filter((l) => l.startsWith(OPS_PREFIX)).at(-1);
+  if (!line) return null;
+  try {
+    const { reason, error, ...detail } = JSON.parse(line.slice(OPS_PREFIX.length));
+    return { ok: false, reason: String(reason), error: String(error ?? reason), ...detail };
+  } catch { return null; }
+}
+
 /** 原样跑一段 ego-browser nodejs 脚本（不加前言），返回 { ok, result | reason, error, code, stdout, stderr }。 */
-export function runEgoScript(source, { egoBin = 'ego-browser', timeoutMs = 10 * 60_000 } = {}) {
+export function runEgoScript(source, { egoBin = 'ego-browser', timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
   return new Promise((resolve) => {
     let stdout = '', stderr = '', settled = false, timedOut = false;
-    const done = (r) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ stdout, stderr, ...r }); } };
+    const done = (r) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', onAbort); resolve({ stdout, stderr, ...r }); } };
     const child = spawn(egoBin, ['nodejs'], { stdio: ['pipe', 'pipe', 'pipe'] });
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
+    // 本进程被打断（SIGINT/SIGTERM）时同步杀掉 CLI，不留子进程
+    const onAbort = () => { child.kill('SIGKILL'); done({ ok: false, reason: 'aborted', error: '任务被打断，已杀掉 ego-browser CLI' }); };
+    if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('error', (e) => done({ ok: false, reason: 'spawn-failed', error: e.message }));
@@ -46,35 +76,126 @@ export function runEgoScript(source, { egoBin = 'ego-browser', timeoutMs = 10 * 
   });
 }
 
-/** 把任务脚本包上前言：取用 space、装好 chrome 垫片、提供 params / loadPlugin，最后把返回值打成 @@RESULT。 */
-export function buildTaskSource({ space, profileId, params, pluginDir, script }) {
-  const ctx = { space, profileId, params, pluginDir, shimUrl: SHIM_URL, spaceUrl: SPACE_URL };
+/**
+ * 把任务脚本包上前言：写心跳、设截止时间、按名字取用 space（user-owned 不接管）、装好 chrome 垫片（切前台自动进前台锁），
+ * 提供 params / loadPlugin / withForegroundLock / deadline，最后把返回值打成 @@RESULT。
+ * 前言自己判定的失败打 @@OPS 行后 process.exit(1)；脚本自己抛的错照常让脚本以非零退出（不吞错）。
+ */
+export function buildTaskSource({ space, profileId, params, pluginDir, script, takeBack = false, deadline, opsDir = OPS_DIR }) {
+  const { heartbeat, foregroundLock } = opsPaths(space, opsDir);
+  const ctx = {
+    space, profileId, params, pluginDir, takeBack, deadline,
+    heartbeatPath: heartbeat, foregroundLockPath: foregroundLock,
+    shimUrl: SHIM_URL, spaceUrl: SPACE_URL, heartbeatUrl: HEARTBEAT_URL, foregroundUrl: FOREGROUND_URL,
+  };
   return `const __ctx = ${JSON.stringify(ctx)};
-const { openSpace } = await import(__ctx.spaceUrl);
+const { openSpace, USER_OWNED: __USER_OWNED } = await import(__ctx.spaceUrl);
 const { createEgoChrome } = await import(__ctx.shimUrl);
-const task = await openSpace({ listTaskSpaces, taskSpace, claimTaskSpace }, { name: __ctx.space, profileId: __ctx.profileId });
-const shim = createEgoChrome(task);
+const { startHeartbeat } = await import(__ctx.heartbeatUrl);
+const { createForegroundLock } = await import(__ctx.foregroundUrl);
+const __stopBeat = startHeartbeat(__ctx.heartbeatPath, { space: __ctx.space, deadline: __ctx.deadline });
+const __ops = (reason, error, extra = {}) => {
+  __stopBeat();
+  console.log(${JSON.stringify(OPS_PREFIX)} + JSON.stringify({ reason, error, ...extra }));
+  process.exit(1);
+};
+const deadline = __ctx.deadline;
+const __deadlineTimer = setTimeout(() => __ops("deadline", "脚本到了截止时间 " + new Date(deadline).toISOString() + "，自己退出"), Math.max(0, deadline - Date.now()));
+const withForegroundLock = createForegroundLock(__ctx.foregroundLockPath, { info: { space: __ctx.space } });
+let task;
+try {
+  if (!(await profiles()).some((p) => p.id === __ctx.profileId)) __ops("profile-missing", "Ego Lite 里没有 " + __ctx.profileId + "，需要先建好这个 profile（脚本不建 profile）");
+  task = await openSpace({ listTaskSpaces, taskSpace, claimTaskSpace, takeOverTaskSpace: globalThis.takeOverTaskSpace }, { name: __ctx.space, profileId: __ctx.profileId, takeBack: __ctx.takeBack });
+} catch (e) {
+  if (e.code === __USER_OWNED) __ops("user-owned", e.message, { ownership: e.ownership });
+  __ops("script-error", "取用 space 出错：" + e.message);
+}
+const shim = createEgoChrome(task, { withForegroundLock });
 globalThis.chrome = shim.chrome;
 const { chrome, recoverTabs } = shim;
 const params = __ctx.params;
 const pluginDir = __ctx.pluginDir;
 const loadPlugin = (rel) => import(new URL(rel, "file://" + pluginDir.replace(/\\/?$/, "/")).href);
-const __value = await (async () => {
+let __value;
+try {
+  __value = await (async () => {
 ${script}
-})();
+  })();
+} finally {
+  clearTimeout(__deadlineTimer);
+  __stopBeat();
+}
 if (__value !== undefined) console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify(__value));
 `;
 }
 
+function checkArgs(space, profileId) {
+  if (!profileId || profileId === FORBIDDEN_PROFILE) return { ok: false, reason: 'profile-rejected', error: `不允许使用 ${profileId || '空 profile'}` };
+  if (!SPACE_NAME.test(space || '')) return { ok: false, reason: 'bad-space-name', error: `space 名要是 kinso/<平台>/<uid>：${space}` };
+  return null;
+}
+
+// 脚本截止时间比 runner 杀 CLI 早一点，正常情况下脚本先自己退出，runner 不用杀
+const deadlineFor = (timeoutMs) => Date.now() + timeoutMs - Math.min(10_000, Math.floor(timeoutMs / 10));
+
 /**
- * 在一个 space 里跑一段任务脚本。脚本是 async 函数体，可用 task、chrome、recoverTabs、params、pluginDir、loadPlugin；
+ * 在一个 space 里跑一段任务脚本（不拿 space 锁；要锁用 runInSpace）。脚本是 async 函数体，
+ * 可用 task、chrome、recoverTabs、params、pluginDir、loadPlugin、withForegroundLock、deadline；
  * 返回值即结果（返回 undefined 视为没有结果、算失败）。
  * @returns {Promise<{ok: true, result: any} | {ok: false, reason: string, error: string}>}
  */
-export async function runEgoTask({ space, script, profileId = DEFAULT_PROFILE, params = {}, pluginDir = DEFAULT_PLUGIN_DIR, egoBin, timeoutMs } = {}) {
-  if (profileId === FORBIDDEN_PROFILE) return { ok: false, reason: 'profile-rejected', error: `不允许使用 ${FORBIDDEN_PROFILE}` };
-  if (!SPACE_NAME.test(space || '')) return { ok: false, reason: 'bad-space-name', error: `space 名要是 kinso/<平台>/<uid>：${space}` };
-  return runEgoScript(buildTaskSource({ space, profileId, params, pluginDir, script }), { egoBin, timeoutMs });
+export async function runEgoTask({ space, script, profileId = DEFAULT_PROFILE, params = {}, pluginDir = DEFAULT_PLUGIN_DIR, egoBin, timeoutMs = DEFAULT_TIMEOUT_MS, takeBack = false, opsDir = OPS_DIR, signal } = {}) {
+  const bad = checkArgs(space, profileId);
+  if (bad) return bad;
+  const source = buildTaskSource({ space, profileId, params, pluginDir, script, takeBack, opsDir, deadline: deadlineFor(timeoutMs) });
+  const r = await runEgoScript(source, { egoBin, timeoutMs, signal });
+  if (r.reason === 'timeout' || r.reason === 'aborted' || r.reason === 'spawn-failed') return r;
+  const ops = parseOps(r.stdout + r.stderr);
+  return ops ? { ...ops, code: r.code, stdout: r.stdout, stderr: r.stderr } : r;
+}
+
+/**
+ * 拿 space 锁后在 space 里跑任务脚本，返回带 exitCode（见 EXIT_CODES）。
+ * - lock 'wait'：排队等 space 锁（lockTimeoutMs 超时返回 locked）；'skip'：拿不到马上返回 locked。都不起子进程。
+ * - 上一个任务超时后心跳还新鲜：返回 previous-still-running。
+ * - 超时杀掉 CLI 后不放锁（脚本可能还在 Ego 里跑），等心跳过期后由下一个任务回收；其余结束方式（含 SIGINT/SIGTERM）都放锁。
+ * - finish=true：任务跑完（超时除外）后还持着锁时 finishSpace 关掉 space，结果放在 finish 字段。
+ * @returns {Promise<{ok: true, result: any, exitCode: 0} | {ok: false, reason: string, error: string, exitCode: number}>}
+ */
+export async function runInSpace({
+  space, script, profileId = DEFAULT_PROFILE, params = {}, pluginDir = DEFAULT_PLUGIN_DIR, egoBin, timeoutMs = DEFAULT_TIMEOUT_MS,
+  lock = 'wait', lockTimeoutMs, takeBack = false, finish = false, opsDir = OPS_DIR, heartbeatStaleMs = HEARTBEAT_STALE_MS,
+} = {}) {
+  const withCode = (r) => ({ ...r, exitCode: exitCodeOf(r) });
+  if (lock !== 'wait' && lock !== 'skip') throw new TypeError(`lock 只能是 wait 或 skip：${lock}`);
+  const bad = checkArgs(space, profileId);
+  if (bad) return withCode(bad);
+  const got = await acquireSpaceLock(space, { mode: lock, timeoutMs: lockTimeoutMs, opsDir, heartbeatStaleMs });
+  if (!got.ok) return withCode(got);
+
+  const ac = new AbortController();
+  let keepLock = false;
+  const onSignal = (sig) => {
+    ac.abort();
+    got.lock.release();
+    unhook();
+    process.kill(process.pid, sig);   // 放完锁按原信号退出
+  };
+  const onExit = () => { if (!keepLock) got.lock.release(); };
+  const unhook = () => { process.off('SIGINT', onSignal); process.off('SIGTERM', onSignal); process.off('exit', onExit); };
+  process.on('SIGINT', onSignal); process.on('SIGTERM', onSignal); process.on('exit', onExit);
+  try {
+    const r = await runEgoTask({ space, script, profileId, params, pluginDir, egoBin, timeoutMs, takeBack, opsDir, signal: ac.signal });
+    if (r.reason === 'timeout') { keepLock = true; got.lock.abandon(); return withCode(r); }
+    if (finish && r.reason !== 'user-owned' && r.reason !== 'profile-missing' && r.reason !== 'aborted') {
+      const { stdout: _o, stderr: _e, ...fin } = await finishSpace(space, { profileId, egoBin });
+      return { ...withCode(r), finish: fin };
+    }
+    return withCode(r);
+  } finally {
+    unhook();
+    if (!keepLock) got.lock.release();
+  }
 }
 
 /**

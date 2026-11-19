@@ -1,10 +1,12 @@
 // ego-shim 行为测试：在 Ego Lite Profile 5 的临时 space 里对本地测试页跑真实浏览器。
 import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { runEgoTask, finishSpace } from '../src/ego-runner/index.mjs';
+import { runEgoTask, runEgoScript, finishSpace } from '../src/ego-runner/index.mjs';
+import { createServer } from 'node:http';
 import { EGO_SKIP, tempSpaceName, fixtureUrl, FIXTURE_DIR } from './helpers/ego.mjs';
 
 const FIXTURE = fixtureUrl('basic.html');
+const SHIM_URL = new URL('../src/ego-shim.mjs', import.meta.url).href;
 
 async function run(space, script, params = {}) {
   const r = await runEgoTask({ space, script, params: { FIXTURE, FIXTURE_DIR, ...params } });
@@ -46,12 +48,18 @@ describe('ego-shim（真实 Ego Lite）', { skip: EGO_SKIP ?? false }, () => {
     assert.equal(r.got.url, FIXTURE + '#recover');
   });
 
-  test('找回：上一个进程 finish 保留页面后，下一个进程认领 space 再找回', async () => {
+  test('找回：上一个进程 finish 保留页面后，runner 不认领（user-owned）；人明确认领后下一个进程再找回', async () => {
     const s = space('kept');
     await run(s, `
       const tab = await chrome.tabs.create({ url: params.FIXTURE + "#kept", active: false });
       await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: "document.getElementById('marker').textContent = 'kept-1'" });
       return (await task.finish({ keep: "all" })).keptManagedLabels;`);
+    // KIN-327 故事 7：ownership=user 时 runner 不认领、不碰页面
+    const owned = await runEgoTask({ space: s, script: 'return 1' });
+    assert.equal(owned.reason, 'user-owned', `${owned.error} ${owned.stderr}`);
+    // 负责人明确同意接手时才认领（这里直接调 Ego 模拟），之后 runner 按 agent 取用，找回没有 label 的页
+    const claimed = await runEgoScript(`const e = (await listTaskSpaces()).find((x) => x.name === ${JSON.stringify(s)}); await claimTaskSpace(e.id); console.log("@@RESULT 1");`);
+    assert.equal(claimed.ok, true, claimed.error);
     const r = await run(s, `
       const ids = await recoverTabs(/#kept$/);
       return { ids, marker: (await chrome.debugger.sendCommand({ tabId: ids[0] }, "Runtime.evaluate", { expression: "document.getElementById('marker').textContent", returnByValue: true })).result.value };`);
@@ -159,5 +167,40 @@ describe('ego-shim（真实 Ego Lite）', { skip: EGO_SKIP ?? false }, () => {
     assert.equal(r.value, 'via setValue');
     assert.match(r.executeScript, /scripting/);
     assert.equal(typeof r.runtimeId, 'string');
+  });
+  test('tabs.create 不等 load：子资源一直不回的页面（长轮询 SPA 的样子）照样很快返回', async () => {
+    const server = createServer((req, res) => {
+      if (req.url === '/hang.js') { res.writeHead(200, { 'content-type': 'text/javascript' }); return; }   // 永远不结束
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><title>SPA</title><p id="x">ok</p><img src="/hang.js">');
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const url = `http://127.0.0.1:${server.address().port}/`;
+      const r = await run(space('spa'), `
+        const t0 = Date.now();
+        const tab = await chrome.tabs.create({ url: params.url, active: false });
+        const ms = Date.now() - t0;
+        const text = (await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: "document.getElementById('x').textContent", returnByValue: true })).result.value;
+        const state = (await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: "document.readyState", returnByValue: true })).result.value;
+        return { ms, text, state };`, { url });
+      assert.equal(r.text, 'ok');
+      assert.equal(r.state, 'interactive', 'load 还没来（子资源挂着），说明确实没等 load');
+      assert.ok(r.ms < 8000, `tabs.create 用了 ${r.ms}ms`);
+    } finally { server.closeAllConnections(); server.close(); }
+  });
+  test('tabs.create：HTML 一直传不完（DOMContentLoaded 不来）时等到上限就继续，不报错', async () => {
+    const server = createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.write('<!doctype html><title>half</title><p>'); });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const r = await run(space('half'), `
+        const { createEgoChrome } = await import(params.SHIM_URL);
+        const c = createEgoChrome(task, { domReadyWaitMs: 1500 });
+        const t0 = Date.now();
+        const tab = await c.chrome.tabs.create({ url: params.url, active: false });
+        return { ms: Date.now() - t0, id: typeof tab.id };`, { url: `http://127.0.0.1:${server.address().port}/`, SHIM_URL });
+      assert.equal(r.id, 'number');
+      assert.ok(r.ms >= 1400 && r.ms < 6000, `用了 ${r.ms}ms`);
+    } finally { server.closeAllConnections(); server.close(); }
   });
 });
