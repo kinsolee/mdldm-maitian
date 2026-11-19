@@ -57,6 +57,8 @@ export function parseArgs(argv) {
   const check = flags.includes('--check'), takeBack = flags.includes('--take-back');
   if (takeBack && !check) return null;
   if (check ? pos.length > 1 : pos.length !== 1) return null;
+  // 空串或全是空白（shell 变量为空时会这样）不能当成「没带平台」：拒绝
+  if (pos.some((x) => !x.trim())) return null;
   return { cmd: check ? 'login-check' : 'login', platArg: pos[0] ?? null, takeBack };
 }
 
@@ -94,8 +96,8 @@ export async function main(argv, deps = {}) {
   }
 
   // login / login --check
-  const plat = a.platArg ? resolvePlatform(a.platArg) : null;
-  if (a.platArg && !plat) { err(`认不出平台：${a.platArg}`); return 2; }
+  const plat = a.platArg !== null ? resolvePlatform(a.platArg) : null;
+  if (a.platArg !== null && !plat) { err(`认不出平台：${a.platArg}`); return 2; }
   // 点名不处理的平台：直接拒绝，不调 runInSpace、不开任何页面
   if (plat?.outOfScope) { json({ platform: plat.name, platformCode: plat.code, result: 'refused', reason: 'out-of-scope', note: '负责人定为暂时不处理，不检测、不开页面', exitCode: 2 }); return 2; }
 

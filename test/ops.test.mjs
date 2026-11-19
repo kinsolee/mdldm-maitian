@@ -300,10 +300,21 @@ describe('login --check', () => {
     assert.equal(e.calls[0].takeBack, true); assert.equal(e.calls[0].script, DETECT_SCRIPT);
   });
 
+  test('G2-B1 平台参数是空串：login "" 和 login --check "" 退出码 2，不调 runInSpace、不改登记', async () => {
+    for (const argv of [['login', ''], ['login', '--check', '']]) {
+      e.errs.length = 0;
+      assert.equal(await e.run(...argv), 2, JSON.stringify(argv));
+      assert.match(e.errs.join('\n'), /login --check/);
+    }
+    assert.equal(e.calls.length, 0);
+    assert.equal(e.acct('Douyin').loginState, 'unknown');
+  });
+
   test('G-B3 参数不对一律打印用法、退出码 2，不调 runInSpace', async () => {
     const bad = [
       ['login', 'douyin', '--take-back'], ['login', '--take-back'], ['login', '--check', 'douyin', 'bili'], ['login'],
       ['login', 'douyin', 'bili'], ['login', '--check', '--force'], ['login', 'douyin', '-x'], ['login', '--check', '--check'],
+      ['login', ''], ['login', '--check', ''], ['login', '   '], ['login', '--check', ' ', '--take-back'], ['login', '', 'douyin'],
       ['accounts', 'seed', 'extra'], ['accounts', 'list', '--all'], ['tokens', 'init', 'x'], ['tokens'], ['accounts'], ['nope'],
     ];
     for (const argv of bad) {
