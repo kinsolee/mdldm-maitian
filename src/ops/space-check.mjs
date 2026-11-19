@@ -44,18 +44,19 @@ const CHECKS = {
     if (!token) return { state: 'out', evidence: '落地 URL 不带 token', uidSeen: null };
     const seen = await page.evaluate(() => {
       const valid = (v) => typeof v === 'string' && /^gh_[0-9a-f]{12}$/.test(v);
-      let common = null;
-      try { common = [window.wx?.commonData?.data?.user_name, window.wx?.commonData?.user_name].find(valid) ?? null; } catch {}
+      let common = [];
+      try { common = [...new Set([window.wx?.commonData?.data?.user_name, window.wx?.commonData?.user_name].filter(valid))]; } catch {}
       return { common, html: [...new Set(document.documentElement.innerHTML.match(/gh_[0-9a-f]{12}\b/g) ?? [])] };
     });
     let source, ids, note = '';
-    if (seen.common) [source, ids] = ['commonData', [seen.common]];
+    if (seen.common.length) [source, ids] = ['commonData', seen.common];
     else if (seen.html.length) [source, ids] = ['html', seen.html];
     else {
       source = 'settingpage';
       try {
         const r = await page.fetch(`/cgi-bin/settingpage?t=setting/index&action=index&token=${token}&lang=zh_CN`, { method: 'GET', timeout: 15000 });
-        ids = [...new Set(String(r.body ?? '').match(/gh_[0-9a-f]{12}\b/g) ?? [])];
+        // 只认 2xx：500、302 跳登录之类的响应不可信，不解析
+        ids = r.status >= 200 && r.status < 300 ? [...new Set(String(r.body ?? '').match(/gh_[0-9a-f]{12}\b/g) ?? [])] : [];
         note = ` http=${r.status}`;
       } catch (e) { ids = []; note = ` 请求失败（${e.name}）`; }
     }
