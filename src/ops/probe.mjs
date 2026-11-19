@@ -11,6 +11,14 @@ async function getJson(page, url, opts = {}) {
   return { status: r.status, json };
 }
 
+// 公众号实际登录的号：页面配置优先；否则 HTML 里只有一个 gh_ 号就是它；有多个且不含登记的号，取第一个（宁可判不一致硬停）
+function pickGh({ own, ghs = [] }, uid) {
+  if (own && /^gh_[0-9a-z_]+$/i.test(own)) return own;
+  if (ghs.length === 1) return ghs[0];
+  if (ghs.length > 1 && !ghs.includes(uid)) return ghs[0];
+  return ghs.includes(uid) ? uid : null;
+}
+
 const str = (v) => (v == null || v === '' ? null : String(v));
 
 // 每个平台：home 是创作者后台首页，loginUrl 是扫码页；check 返回 { state: 'ok'|'out'|'unknown', evidence, uidSeen }
@@ -49,11 +57,19 @@ export const CHECKS = {
   GongZhongHao: {
     home: 'https://mp.weixin.qq.com/',
     loginUrl: 'https://mp.weixin.qq.com/',
-    // 公众号没有返回自己 gh_ id 的接口：登录后落地 URL 带 token，页面里出现登记的 gh_ id 才算读到 uid
+    // 实际登录的 gh_ 号：先看后台页面全局 wx.commonData.user_name，再看页面 HTML 里的 gh_ 号。
+    // 读到别的号就交给上层判 uid-mismatch；只读，不调接口、不点按钮。
     async check(page, { uid }) {
       const hasToken = /[?&]token=\d+/.test(await page.url());
-      const hasGh = hasToken && uid && uid !== 'pending' ? await page.evaluate((gh) => document.documentElement.innerHTML.includes(gh), uid) : false;
-      return { state: hasToken ? 'ok' : 'out', evidence: `落地 URL ${hasToken ? '带 token 参数（值不记）' : '不带 token'}；页面含登记的 gh_ id=${hasGh}`, uidSeen: hasGh ? uid : null };
+      const p = await page.evaluate(() => {
+        let own = null;
+        try { own = window.wx?.commonData?.user_name ?? null; } catch {}
+        const ghs = [...new Set(document.documentElement.innerHTML.match(/gh_[0-9a-z_]+/g) ?? [])];
+        const loginBox = !!document.querySelector('.login__type__container, .login_frame, .new-login, input[name="account"], input[type="password"]') || /扫码登录|使用账号登录/.test(document.body?.innerText ?? '');
+        return { own, ghs, loginBox };
+      }) ?? {};
+      if (!hasToken) return { state: p.loginBox ? 'out' : 'unknown', evidence: `落地 URL 不带 token；登录框${p.loginBox ? '有' : '无'}`, uidSeen: null };
+      return { state: 'ok', evidence: `落地 URL 带 token 参数（值不记）；${p.own ? '页面配置里有自己的 gh_ 号' : `页面里 gh_ 号 ${p.ghs?.length ?? 0} 个`}`, uidSeen: pickGh(p, uid) };
     },
   },
   Weibo: {

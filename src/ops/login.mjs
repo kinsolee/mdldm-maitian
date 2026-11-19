@@ -29,8 +29,23 @@ async function alertOut(db, acct, nowMs, notify) {
   return 'sent';
 }
 
+/** 关掉 pending 改名后留下的旧 space。只关 agent 持有的；在负责人手里（user-owned）不碰。 */
+async function closeOldSpace(acct, finishSpace) {
+  let r;
+  try { r = await finishSpace(acct.spaceName, { profileId: acct.profileId }); }
+  catch (e) { r = { ok: false, reason: 'error', error: String(e?.message ?? e) }; }
+  if (r.ok) return { status: 'closed', note: `旧 space ${acct.spaceName} 已关`, exitCode: 0 };
+  if (r.reason === 'user-owned') return { status: 'user-owned', note: `旧 space ${acct.spaceName} 在你手里，没关`, exitCode: 0 };
+  return { status: 'close-failed', note: `旧 space ${acct.spaceName} 没关掉（${r.reason}：${r.error ?? ''}），请在 Ego Lite 里手动关`, exitCode: 1 };
+}
+
+// Instagram、知识站：负责人定为暂时不处理。公开函数里也拦，直接调库函数同样不会交给 runner。
+const outOfScopeRow = (acct, note) => (platformOf(acct.platformCode)?.outOfScope
+  ? { platform: acct.platformName, platformCode: acct.platformCode, result: 'refused', reason: 'out-of-scope', note, exitCode: 2 }
+  : null);
+
 /** 检测一个账号，返回一行结果（含 exitCode）。只读：不改页面状态，只写本地登记。 */
-async function checkOne(db, acct, { runInSpace, notify, now, takeBack }) {
+async function checkOne(db, acct, { runInSpace, finishSpace, notify, now, takeBack }) {
   const base = { platform: acct.platformName, platformCode: acct.platformCode, spaceName: acct.spaceName };
   let r;
   try {
@@ -60,12 +75,13 @@ async function checkOne(db, acct, { runInSpace, notify, now, takeBack }) {
     return { ...row, result: 'uid-mismatch', loginState: acct.loginState, reason: 'uid-mismatch', error: `${acct.platformName} uid 不一致：登记 ${acct.uid}（${describe(acct.uid)}），读到 ${seen}（${describe(seen)}）；登记没改，先确认 space 里登录的是哪个账号`, exitCode: 6 };
   }
   if (seen != null && acct.uid === PENDING && state === 'ok') {
-    try {
-      const newName = adoptUid(db, acct, seen, state, at);
-      return { ...row, loginState: state, uid: seen, spaceName: newName, note: `space 改名：${acct.spaceName} → ${newName}（新 space 由 runner 下次按名字建，不用重扫；旧的 ${acct.spaceName} 没关，需要时手动关）`, exitCode: 0 };
-    } catch (e) {
-      return { ...row, result: 'error', loginState: acct.loginState, error: `uid 改名失败：${e.message}`, exitCode: 1 };
-    }
+    let newName;
+    try { newName = adoptUid(db, acct, seen, state, at); }
+    catch (e) { return { ...row, result: 'error', loginState: acct.loginState, error: `uid 改名失败：${e.message}`, exitCode: 1 }; }
+    // Ego 没有给 space 改名的接口：关掉旧的 .../pending，新名字的 space 由 runner 下次按名字建（登录态是 profile 级 cookie，不用重扫）。
+    // 这时 runInSpace 已经返回、旧名的锁已释放，finishSpace 自己拿锁。
+    const old = await closeOldSpace(acct, finishSpace);
+    return { ...row, loginState: state, uid: seen, spaceName: newName, oldSpace: old.status, note: `space 改名：${acct.spaceName} → ${newName}；${old.note}`, exitCode: old.exitCode };
   }
   setLoginState(db, acct, state, at);
   const out = { ...row, loginState: state, uid: seen ?? '未读到', exitCode: 0 };
@@ -80,7 +96,8 @@ async function checkOne(db, acct, { runInSpace, notify, now, takeBack }) {
 export async function checkLogin(db, accounts, deps) {
   const rows = [];
   for (const acct of accounts) {
-    if (platformOf(acct.platformCode)?.outOfScope) { rows.push({ platform: acct.platformName, platformCode: acct.platformCode, result: 'skipped', note: '跳过：负责人定为暂时不处理', exitCode: 0 }); continue; }
+    const skip = outOfScopeRow(acct, '跳过：负责人定为暂时不处理');
+    if (skip) { rows.push({ ...skip, result: 'skipped', exitCode: 0 }); continue; }
     rows.push(await checkOne(db, acct, deps));
   }
   return { rows, exitCode: worstExit(rows.map((r) => r.exitCode)) };
@@ -88,6 +105,8 @@ export async function checkLogin(db, accounts, deps) {
 
 /** login <平台>：排队拿锁，打开扫码页，handOff 交给负责人。 */
 export async function startLogin(db, acct, { runInSpace, now }) {
+  const refused = outOfScopeRow(acct, '负责人定为暂时不处理，不开登录页');
+  if (refused) return refused;
   const base = { platform: acct.platformName, platformCode: acct.platformCode, spaceName: acct.spaceName };
   const next = `扫完后跑 hub ops login --check ${cmdName(acct.platformCode)} --take-back`;
   let r;
