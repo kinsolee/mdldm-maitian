@@ -121,6 +121,12 @@ describe('条目 4：锁文件字段缺失或类型不对按损坏处理', () =>
     'null': null,
     '数字': 42,
     '字符串': 'lock',
+    // 下面几种心跳已过期、pid 已死（或无法判断），不当损坏的话会被接管：rmSync(undefined) / pidAlive 抛错
+    '缺 heartbeatFile（过期）': { token: 'x', pid: null, startedAt: 1, heartbeatAt: 1 },
+    'heartbeatFile 为数字（过期）': { token: 'x', pid: null, startedAt: 1, heartbeatAt: 1, heartbeatFile: 42 },
+    'heartbeatFile 为空串（过期）': { token: 'x', pid: null, startedAt: 1, heartbeatAt: 1, heartbeatFile: '' },
+    'pid 为字符串（过期）': { token: 'x', pid: 'abc', startedAt: 1, heartbeatAt: 1, heartbeatFile: '/nonexistent/x.hb' },
+    'pid 为负数（过期）': { token: 'x', pid: -1, startedAt: 1, heartbeatAt: 1, heartbeatFile: '/nonexistent/x.hb' },
   };
   const plant = (space, content) => {
     const path = spaceLockPath(LOCKS_DIR, space);
