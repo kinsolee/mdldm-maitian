@@ -3,6 +3,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
+import { migrateEngage } from './engage-db.mjs';
 
 export function openOpsDb(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -23,5 +24,6 @@ CREATE TABLE IF NOT EXISTS accounts (
   alertSentAt TEXT,          -- 上次发掉线/UID 不符提醒的时间（6 小时节流）
   PRIMARY KEY (platformCode, uid)
 );`);
+  migrateEngage(db);
   return db;
 }
