@@ -14,6 +14,7 @@ import { acquireSpaceLock } from '../src/ego-runner/space-lock.mjs';
 import { createForegroundLock } from '../src/ego-runner/foreground.mjs';
 import { opsPaths } from '../src/ego-runner/paths.mjs';
 import { openSpace } from '../src/ego-runner/space.mjs';
+import { closeTestSpace } from './helpers/ego.mjs';
 
 const FAKE_DIR = fileURLToPath(new URL('./fixtures/fake-ego/', import.meta.url));
 const FAKE_BIN = join(FAKE_DIR, 'ego-browser');
@@ -153,8 +154,12 @@ describe('X-B3 finishSpace 不碰用户的 space，且拿 space 锁', () => {
 });
 
 describe('X-B4 不拿锁的入口不公开', () => {
-  test('index.mjs 不再导出 runTaskInSpace', () => {
-    assert.equal('runTaskInSpace' in runner, false);
+  test('index.mjs 的导出是白名单：原来那个不拿锁的公开入口、runUnlocked 都不在里面（G2-B3）', () => {
+    assert.deepEqual(Object.keys(runner).sort(), [
+      'DEFAULT_PLUGIN_DIR', 'DEFAULT_PROFILE', 'DEFAULT_TIMEOUT_MS', 'EXIT_CODES', 'OPS_PREFIX', 'RESULT_PREFIX',
+      'buildTaskSource', 'exitCodeOf', 'finishSpace', 'parseOps', 'parseResult', 'runEgoScript', 'runInSpace',
+    ]);
+    assert.equal('runUnlocked' in runner, false);
   });
 });
 
@@ -217,5 +222,37 @@ describe('G-B9 前台锁的生命周期', () => {
     const r = await runInSpace({ space: SPACE, egoBin: FAKE_BIN, opsDir, timeoutMs: 3000, script: 'await withForegroundLock(() => new Promise(() => {})); return 1;' });
     assert.equal(r.reason, 'deadline', r.error);
     assert.equal(existsSync(fgFile()), false);
+  });
+});
+
+describe('G2-B2 runInSpace finish=true：finish 那步超时也不放锁', () => {
+  test('任务成功、finish 挂住超时：锁标 abandoned 不删，心跳过期前新任务 previous-still-running', async () => {
+    const STALE = 1000;
+    process.env.FAKE_EGO_FINISH_HANG = '1';
+    try {
+      const r = await within(runInSpace({ space: SPACE, script: 'return 1', egoBin: FAKE_BIN, opsDir, finish: true, timeoutMs: 1500, heartbeatStaleMs: STALE }), 8000);
+      assert.equal(r.ok, true, r.error); assert.equal(r.finish.reason, 'timeout');
+      assert.ok(existsSync(lockFile()), 'finish 超时后锁不该释放（Ego 里的 finish 脚本可能还在跑）');
+      assert.ok(JSON.parse(readFileSync(lockFile(), 'utf8')).abandonedAt > 0, '锁里应记下放弃时刻');
+      const busy = await runInSpace({ space: SPACE, script: 'return 1', egoBin: NOWHERE, opsDir, heartbeatStaleMs: STALE });
+      assert.equal(busy.reason, 'previous-still-running'); assert.equal(busy.exitCode, 5);
+    } finally { delete process.env.FAKE_EGO_FINISH_HANG; }
+    await sleep(1100);
+    const ok = await runInSpace({ space: SPACE, script: 'return 1', egoBin: FAKE_BIN, opsDir, heartbeatStaleMs: 1000 });
+    assert.equal(ok.ok, true, ok.error);
+  });
+});
+
+describe('G2-B4 测试收尾 closeTestSpace 关不掉就抛错', () => {
+  test('ego-browser 起不来：抛错', async () => {
+    await assert.rejects(closeTestSpace(SPACE, { egoBin: NOWHERE }), /没关掉临时 space/);
+  });
+  test('finish 后 space 没关上（closedSpace 不是 true）：抛错', async () => {
+    await assert.rejects(closeTestSpace(SPACE, { egoBin: FAKE_BIN }), /没关掉临时 space/);
+  });
+  test('space 不存在：不抛', async () => {
+    useSpaces([]);
+    const r = await closeTestSpace(SPACE, { egoBin: FAKE_BIN });
+    assert.deepEqual(r.result, { existed: false });
   });
 });

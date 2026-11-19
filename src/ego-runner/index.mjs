@@ -159,6 +159,8 @@ async function runUnlocked({ space, script, profileId, params, pluginDir, egoBin
   return ops ? { ...ops, code: r.code, stdout: r.stdout, stderr: r.stderr } : r;
 }
 
+// 关 space 的脚本最多跑这么久（runInSpace 的 timeoutMs 更短时取更短的）
+const FINISH_TIMEOUT_MS = 60_000;
 const withCode = (r) => ({ ...r, exitCode: exitCodeOf(r) });
 
 /**
@@ -184,7 +186,8 @@ async function withSpaceLock(space, { lock, lockTimeoutMs, opsDir, heartbeatStal
   process.on('SIGINT', onSignal); process.on('SIGTERM', onSignal); process.on('exit', onExit);
   try {
     const r = await fn(ac.signal);
-    if (r.reason === 'timeout' || r.reason === 'aborted') abandon();
+    // 任务本身或 runInSpace finish=true 的关 space 那步被杀（超时、打断），Ego 里的脚本都可能还在跑
+    if ([r.reason, r.finish?.reason].some((x) => x === 'timeout' || x === 'aborted')) abandon();
     return r;
   } finally {
     unhook();
@@ -198,7 +201,7 @@ async function withSpaceLock(space, { lock, lockTimeoutMs, opsDir, heartbeatStal
  * 返回值即结果（返回 undefined 视为没有结果、算失败）。
  * - lock 'wait'：排队等 space 锁（lockTimeoutMs 超时返回 locked）；'skip'：拿不到马上返回 locked。都不起子进程。
  * - 上一个任务超时或被打断后心跳还新鲜：返回 previous-still-running。
- * - 超时、被 SIGINT/SIGTERM 打断：杀掉 CLI，不放锁（脚本可能还在 Ego 里跑），等心跳过期后由下一个任务回收。
+ * - 超时、被 SIGINT/SIGTERM 打断（含 finish 那步）：杀掉 CLI，不放锁（脚本可能还在 Ego 里跑），等心跳过期后由下一个任务回收。
  * - finish=true：任务跑完（超时、打断、user-owned、profile-missing 除外）后，仍在同一把锁里关掉 space，结果放在 finish 字段。
  * @returns {Promise<{ok: true, result: any, exitCode: 0} | {ok: false, reason: string, error: string, exitCode: number}>}
  */
@@ -211,13 +214,13 @@ export async function runInSpace({
   return withCode(await withSpaceLock(space, { lock, lockTimeoutMs, opsDir, heartbeatStaleMs }, async (signal) => {
     const r = await runUnlocked({ space, script, profileId, params, pluginDir, egoBin, timeoutMs, takeBack, opsDir, signal });
     if (!finish || ['timeout', 'aborted', 'user-owned', 'profile-missing'].includes(r.reason)) return r;
-    const { stdout: _o, stderr: _e, ...fin } = await finishUnlocked(space, { profileId, egoBin, signal });
+    const { stdout: _o, stderr: _e, ...fin } = await finishUnlocked(space, { profileId, egoBin, signal, timeoutMs: Math.min(timeoutMs, FINISH_TIMEOUT_MS) });
     return { ...r, finish: fin };
   }));
 }
 
 /** 不拿锁地关 space（内部用；调用方已持有这个 space 的锁）。只关 agent 持有的；用户的 space 不碰。 */
-async function finishUnlocked(space, { profileId, egoBin, timeoutMs = 60_000, signal } = {}) {
+async function finishUnlocked(space, { profileId, egoBin, timeoutMs = FINISH_TIMEOUT_MS, signal } = {}) {
   const r = await runEgoScript(`const s = (await listTaskSpaces()).find((x) => x.name === ${JSON.stringify(space)});
 const want = ${JSON.stringify(profileId)};
 let r = { closed: false, existed: !!s };
@@ -236,7 +239,7 @@ console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify(r));`, { egoBin, t
  * 同名 space 在别的 profile 上时不接管、不关，返回 profile-mismatch。
  */
 export async function finishSpace(space, {
-  profileId = DEFAULT_PROFILE, egoBin, timeoutMs = 60_000, lock = 'wait', lockTimeoutMs, opsDir = OPS_DIR, heartbeatStaleMs = HEARTBEAT_STALE_MS,
+  profileId = DEFAULT_PROFILE, egoBin, timeoutMs = FINISH_TIMEOUT_MS, lock = 'wait', lockTimeoutMs, opsDir = OPS_DIR, heartbeatStaleMs = HEARTBEAT_STALE_MS,
 } = {}) {
   const bad = checkArgs(space, profileId) ?? checkLockArgs({ lock, timeoutMs, lockTimeoutMs });
   if (bad) return withCode(bad);

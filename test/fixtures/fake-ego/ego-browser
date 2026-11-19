@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 // 假 ego-browser：`ego-browser nodejs` 从 stdin 读脚本，在 mock 的 Ego 全局函数下执行。
 // FAKE_EGO_SPACES：listTaskSpaces() 的返回（JSON）；FAKE_EGO_PROFILES：profiles() 返回的 profile id（JSON 数组，默认 ["Profile 5"]）；
+// FAKE_EGO_FINISH_HANG=1：task.finish() 永远不返回（测 finish 那步超时）。
 // FAKE_EGO_LOG：把 taskSpace/claimTaskSpace/takeOverTaskSpace/finish 调用逐行追加到这个文件。
 // 脚本的 console.log 跟真 CLI 一样写到 stderr。
 import { appendFileSync } from 'node:fs';
 const log = (call) => { if (process.env.FAKE_EGO_LOG) appendFileSync(process.env.FAKE_EGO_LOG, `${JSON.stringify(call)}\n`); };
 const spaces = JSON.parse(process.env.FAKE_EGO_SPACES || '[]');
-const fakeTask = (id) => ({ spaceId: id, async finish(o) { log({ fn: 'finish', id, keep: o?.keep }); return { closed: true }; } });
+const fakeTask = (id) => ({ spaceId: id, async finish(o) {
+  log({ fn: 'finish', id, keep: o?.keep });
+  if (process.env.FAKE_EGO_FINISH_HANG === '1') { setInterval(() => {}, 60_000); await new Promise(() => {}); }
+  return { closed: true };
+} });
 globalThis.listTaskSpaces = async () => spaces;
 globalThis.taskSpace = async (idOrName, opts) => { log({ fn: 'taskSpace', arg: idOrName, opts }); return fakeTask(idOrName); };
 globalThis.claimTaskSpace = async (id) => { log({ fn: 'claimTaskSpace', arg: id }); return fakeTask(id); };
