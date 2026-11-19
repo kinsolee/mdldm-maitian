@@ -25,7 +25,7 @@ const CORRUPT = Symbol('corrupt');
 const readJson = (path) => {
   let text;
   try { text = readFileSync(path, 'utf8'); }
-  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  catch (e) { if (e.code === 'ENOENT') return undefined; throw e; }   // 跟内容是 JSON null 区分开
   try { return JSON.parse(text); } catch { return CORRUPT; }
 };
 
@@ -45,11 +45,15 @@ export function pidAlive(pid) {
 /**
  * 读锁：不存在返回 null；心跳时间合并心跳文件。
  * 锁文件或心跳文件读到坏 JSON 时心跳按「现在」算（不可接管）；坏的锁文件另带 corrupt:true，要人工删。
+ * 锁文件是合法 JSON 但不是对象、token 不是非空字符串、startedAt / heartbeatAt 不是有限数字，也按坏的处理。
  */
+const wellFormed = (l) => typeof l === 'object' && l !== null && !Array.isArray(l)
+  && typeof l.token === 'string' && l.token !== '' && Number.isFinite(l.startedAt) && Number.isFinite(l.heartbeatAt);
+
 export function readLock(path) {
   const lock = readJson(path);
-  if (!lock) return null;
-  if (lock === CORRUPT) return { path, corrupt: true, token: null, pid: null, startedAt: null, heartbeatAt: Date.now(), stopped: false };
+  if (lock === undefined) return null;
+  if (lock === CORRUPT || !wellFormed(lock)) return { path, corrupt: true, token: null, pid: null, startedAt: null, heartbeatAt: Date.now(), stopped: false };
   const hb = lock.heartbeatFile ? readJson(lock.heartbeatFile) : null;
   if (hb === CORRUPT) return { ...lock, path, heartbeatAt: Date.now(), stopped: false };
   return { ...lock, path, heartbeatAt: Math.max(lock.heartbeatAt, hb?.at ?? 0), stopped: !!hb?.stopped };
