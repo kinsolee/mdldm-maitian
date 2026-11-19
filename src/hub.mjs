@@ -10,6 +10,7 @@
 //   hub adopt <工程目录>                         登记一期已发过的（不上传）
 //   hub metrics [id]                            采集流量并发日报
 //   hub daemon                                  常驻：到点自动取链接、提醒还没点发布的平台
+//   hub ops <accounts|login|tokens> ...         账号层（ops.db、登录检测与扫码、口令），用法见 src/ops/cli.mjs
 import fs from 'node:fs'; import path from 'node:path'; import os from 'node:os'; import crypto from 'node:crypto'; import { execFileSync, spawn } from 'node:child_process';
 import { db, NAMES, LOCKED, STATE_CN, upsertEpisode, getTask, getTasks, setTask, log, episodes, getEpisode, recentLogs, getMeta, setMeta, saveMetric, prevMetric, saveSnapshot } from './db.mjs';
 import { collectors } from './metrics.mjs';
@@ -23,6 +24,7 @@ import { xExisting, xSubmit, ytRows, ytSubmit, zszCourses, douyinTopics, igExist
 
 const args = process.argv.slice(2), cmd = args[0];
 const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
+if (cmd === 'ops') process.exit(await (await import('./ops/cli.mjs')).main(args.slice(1)));
 const ZSZ_LEAD = 30;   // 知识站建课提前量（分钟）：上传 + 转码约 10 分钟
 const strip = (s) => String(s || '').replace(/ *\d+%/, '');
 const mapState = (s) => s === '待你发布' || s === '已填写' ? 'filled' : s === '异常' || s === '上传超时' ? 'failed' : s === '未登录' ? 'not_logged_in' : s === '已停止' ? 'stopped' : s === '跳过' ? 'skipped' : 'running';
