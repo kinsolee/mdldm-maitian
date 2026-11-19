@@ -12,7 +12,7 @@ import { open, atLogin, bigJson, capCount, captured, clickMarked, dropSecrets, i
 import { clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
 export const FILE = 'xhs.mjs';
-export const LIMITS = { maxNotes: 8, maxMentionPages: 4, maxExpand: 20, maxScroll: 5, maxOpen: 10, loadMs: 60000 };
+export const LIMITS = { maxNotes: 8, maxMentionPages: 4, maxExpand: 20, maxScroll: 5, maxOpen: 10, loadMs: 60000, noteGapMs: 5000 };
 const MENTIONS = 'you/mentions';
 const PAGE_API = 'comment/page';
 const SUB_API = 'comment/sub/page';
@@ -54,7 +54,8 @@ async function rawComments(page, o) {
   const tokens = new Map();
   for (const m of list) if (m.time >= since && m.item_info?.id && !tokens.has(m.item_info.id)) tokens.set(m.item_info.id, m.item_info.xsec_token ?? '');
   const notes = [];
-  for (const [id, tok] of [...tokens].slice(0, o.maxNotes)) notes.push(await openNote(page, id, tok, o));
+  // 连着开笔记页会被限流（核对时连跑几轮后笔记页、通知页都不出数据），每篇之间停一下
+  for (const [id, tok] of [...tokens].slice(0, o.maxNotes)) { notes.push(await openNote(page, id, tok, o)); await sleep(o.noteGapMs); }
   return { kind: 'comments', mentions: mentions.map((m) => ({ code: m.json.code, data: { has_more: m.json.data?.has_more, message_list: dropSecrets(m.json.data?.message_list ?? []) } })), notes };
 }
 
