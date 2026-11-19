@@ -25,7 +25,7 @@ const CORRUPT = Symbol('corrupt');
 const readJson = (path) => {
   let text;
   try { text = readFileSync(path, 'utf8'); }
-  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  catch (e) { if (e.code === 'ENOENT') return undefined; throw e; }   // 跟内容是 JSON null 区分开
   try { return JSON.parse(text); } catch { return CORRUPT; }
 };
 
@@ -45,12 +45,20 @@ export function pidAlive(pid) {
 /**
  * 读锁：不存在返回 null；心跳时间合并心跳文件。
  * 锁文件或心跳文件读到坏 JSON 时心跳按「现在」算（不可接管）；坏的锁文件另带 corrupt:true，要人工删。
+ * 锁文件是合法 JSON 但不是对象、token / heartbeatFile 不是非空字符串、startedAt / heartbeatAt 不是 Date 范围内的数字、
+ * pid 不是正整数也不是 null，也按坏的处理。
  */
+const validTime = (x) => Number.isFinite(x) && Number.isFinite(new Date(x).getTime());   // 1e300 有限但超出 Date 范围
+const wellFormed = (l) => typeof l === 'object' && l !== null && !Array.isArray(l)
+  && typeof l.token === 'string' && l.token !== '' && validTime(l.startedAt) && validTime(l.heartbeatAt)
+  && typeof l.heartbeatFile === 'string' && l.heartbeatFile !== ''
+  && (l.pid === null || (Number.isInteger(l.pid) && l.pid > 0));   // orphanLock 写的 pid:null 是合法的
+
 export function readLock(path) {
   const lock = readJson(path);
-  if (!lock) return null;
-  if (lock === CORRUPT) return { path, corrupt: true, token: null, pid: null, startedAt: null, heartbeatAt: Date.now(), stopped: false };
-  const hb = lock.heartbeatFile ? readJson(lock.heartbeatFile) : null;
+  if (lock === undefined) return null;
+  if (lock === CORRUPT || !wellFormed(lock)) return { path, corrupt: true, token: null, pid: null, startedAt: null, heartbeatAt: Date.now(), stopped: false };
+  const hb = readJson(lock.heartbeatFile);
   if (hb === CORRUPT) return { ...lock, path, heartbeatAt: Date.now(), stopped: false };
   return { ...lock, path, heartbeatAt: Math.max(lock.heartbeatAt, hb?.at ?? 0), stopped: !!hb?.stopped };
 }
@@ -175,7 +183,10 @@ export async function waitLock(path, { timeoutMs, staleMs = 10_000, pollMs = 25,
       return { lock: r.lock, release: () => { clearInterval(timer); releaseLock(r.lock); } };
     }
     if (Date.now() >= until) {
-      const err = new Error(`等锁 ${path} 超过 ${timeoutMs}ms（持有者 pid ${r.holder?.pid ?? '?'}，开始于 ${r.holder ? new Date(r.holder.startedAt).toISOString() : '?'}）`);
+      const h = r.holder;
+      const err = new Error(h?.corrupt
+        ? `等锁 ${path} 超过 ${timeoutMs}ms：锁文件 ${h.path} 内容损坏，确认没有任务在跑后手动删掉它`
+        : `等锁 ${path} 超过 ${timeoutMs}ms（持有者 pid ${h?.pid ?? '?'}，开始于 ${h ? new Date(h.startedAt).toISOString() : '?'}）`);
       err.code = 'lock-timeout';
       throw err;
     }

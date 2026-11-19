@@ -9,8 +9,8 @@ hub ops accounts import [清单文件]              # 默认 src/ops/accounts.se
 hub ops accounts list [--json]
 hub ops accounts set-uid <platformCode> <uid>    # 给 pending 账号登记真实 uid
 hub ops accounts set-cap <账号id> <能力位> <true|false>
-hub ops login --check [--platform <code>] [--json]   # 只读
-hub ops login <platformCode|账号id>              # 打开登录页并 handOff() 给负责人扫码，交还后自动 check
+hub ops login --check [--platform <code>] [--json]   # 只读；--check 不接位置参数，平台用 --platform
+hub ops login <platformCode|账号id>              # 打开登录页并 handOff() 给负责人扫码，交还后自动 check；不接 --platform
 hub ops tokens init                              # 生成写入口令到 .env，不打印口令值
 ```
 
@@ -19,12 +19,14 @@ hub ops tokens init                              # 生成写入口令到 .env，
 ## 登录检测
 
 - 每个账号起一个 runner 任务，在 space 里打开后台首页（`waitUntil: "commit"` 再等 6 秒），按平台判断登录、读当前 uid。判断方法照搬 `spikes/platform/spaces.mjs`，代码在 `src/ops/space-check.mjs`。
-- uid 是 `pending` 的账号读到真实 uid 时登记进去（视频号 `finderUser.uniqId`、X handle 去掉 `@`、YouTube `UC…`、Instagram 用户名），space 名跟着改。
+- uid 是 `pending` 的账号读到真实 uid 时登记进去（视频号 `finderUser.uniqId`、X handle 去掉 `@`、YouTube `UC…`、Instagram 用户名），space 名跟着改，并关掉旧的 `kinso/<platformCode>/pending` space（关没关成不影响检测结果，只写进 message）。
+- 公众号：落地 URL 带 token 算登录，再读**实际登录的** gh_ id（`^gh_[0-9a-f]{12}$`），依次取 `window.wx.commonData(.data).user_name`、页面 HTML、同源设置页 `/cgi-bin/settingpage`（只读 GET），取到就停；只有一个不同值才当作 uid，多个就不认（证据写明个数）。证据写来源、个数和 gh_ id，不写 token 值。
 - **UID 和登记的不符**：不写 ok（记 `unknown`，证据写明两个 uid），发提醒，整条命令退出码 2。
-- 页面显示已登录但没读到 uid（例如公众号落地带 token 但页面里找不到 gh_ id）：不写 ok，记 `unknown`，算失败。
+- 页面显示已登录但没读到 uid（例如公众号三处都没找到 gh_ id，或找到多个不同的）：不写 ok，记 `unknown`，算失败。
 - runner 返回 `busy` / `user-controlled` / `profile-needed`：这个账号跳过，登录状态不改。
 - 知识站没配 `site.admin`：记 `unknown` 并说明，不起任务。
 - 输出和证据里不放 cookie、token（公众号只记「带 token」）。
+- `login` 参数不对时（`--check` 带位置参数、`--platform ""`、扫码登录带 `--platform`）打印说明和用法到 stderr，退出码 1，不起任务。
 
 退出码（多个账号时取最严重的：2 > 1 > 3 > 4 > 5 > 0）：
 

@@ -144,7 +144,7 @@ describe('登录检测 check', () => {
       Channels: okResult({ state: 'ok', evidence: 'auth_data', uidSeen: 'sph_real1' }),
       X: okResult({ state: 'ok', evidence: 'side', uidSeen: '@kinsolee79' }),
     });
-    const r = await checkLogins(db, { platforms: ['Channels', 'X'], runTask, notify: async () => {} });
+    const r = await checkLogins(db, { platforms: ['Channels', 'X'], runTask, notify: async () => {}, finishTask: async () => ({ ok: true }) });
     assert.equal(r.exitCode, 0);
     assert.equal(getAccount(db, 'Channels:pending'), null);
     const ch = getAccount(db, 'Channels:sph_real1');
@@ -220,6 +220,50 @@ describe('登录检测 check', () => {
   });
 });
 
+describe('pending 迁移后关掉旧的 pending space', () => {
+  const chOk = () => fakeRunner({ Channels: okResult({ state: 'ok', evidence: 'auth_data', uidSeen: 'sph_real1' }), Bili: okResult({ state: 'ok', evidence: 'nav', uidSeen: '478358005' }) });
+
+  test('pending 改成真实 uid 后调用一次 finishTask，参数是旧 space 名和 Profile 5', async () => {
+    const db = freshDb();
+    const calls = [];
+    const r = await checkLogins(db, { platform: 'Channels', runTask: chOk().runTask, notify: async () => {}, finishTask: async (space, o) => { calls.push([space, o?.profileId]); return { ok: true }; } });
+    assert.deepEqual(calls, [['kinso/Channels/pending', 'Profile 5']]);
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.rows[0].result, 'ok');
+    assert.match(r.rows[0].message, /kinso\/Channels\/pending 已关/);
+  });
+
+  test('非 pending 账号不调用 finishTask', async () => {
+    const db = freshDb();
+    let n = 0;
+    await checkLogins(db, { platform: 'Bili', runTask: chOk().runTask, notify: async () => {}, finishTask: async () => { n++; return { ok: true }; } });
+    assert.equal(n, 0);
+  });
+
+  for (const [label, finishTask, why] of [
+    ['返回 ok:false', async () => ({ ok: false, reason: 'user-controlled' }), /没关：user-controlled/],
+    ['抛错', async () => { throw new Error('ego 挂了'); }, /没关：ego 挂了/],
+  ]) {
+    test(`finishTask ${label}：检测结果仍是 ok、退出码 0，message 说明没关`, async () => {
+      const db = freshDb();
+      const r = await checkLogins(db, { platform: 'Channels', runTask: chOk().runTask, notify: async () => {}, finishTask });
+      assert.equal(r.exitCode, 0);
+      assert.equal(r.rows[0].result, 'ok');
+      assert.equal(getAccount(db, 'Channels:sph_real1').loginState, 'ok');
+      assert.match(r.rows[0].message, why);
+    });
+  }
+
+  test('scanLogin 把 finishTask 传给交还后的检测', async () => {
+    const db = freshDb();
+    const runTask = async (opts) => opts.params.mode === 'handoff' ? okResult({ handedOff: true }) : okResult({ state: 'ok', evidence: 'auth', uidSeen: 'sph_9' });
+    const calls = [];
+    const r = await scanLogin(db, 'Channels', { runTask, notify: async () => {}, sleep: async () => {}, pollMs: 1, maxWaitMs: 1000, finishTask: async (s) => { calls.push(s); return { ok: true }; } });
+    assert.equal(r.exitCode, 0);
+    assert.deepEqual(calls, ['kinso/Channels/pending']);
+  });
+});
+
 describe('掉线提醒节流', () => {
   test('同一账号 6 小时内最多一次，过了 6 小时再掉线再发', async () => {
     const db = freshDb();
@@ -254,7 +298,7 @@ describe('评审第 1 轮补发（Gemini）', () => {
     await checkLogins(db, { platform: 'Weibo', runTask: good.runTask, notify: async () => true });
     assert.equal(getAccount(db, 'Weibo:2272770294').nickname, '自己');
     const ch = fakeRunner({ Channels: okResult({ state: 'ok', evidence: 'auth', uidSeen: 'sph_1', nickname: '视频号昵称' }) });
-    await checkLogins(db, { platform: 'Channels', runTask: ch.runTask, notify: async () => true });
+    await checkLogins(db, { platform: 'Channels', runTask: ch.runTask, notify: async () => true, finishTask: async () => ({ ok: true }) });
     assert.equal(getAccount(db, 'Channels:sph_1').nickname, '视频号昵称');
   });
 
