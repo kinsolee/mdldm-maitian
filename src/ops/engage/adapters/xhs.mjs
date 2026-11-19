@@ -184,6 +184,7 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     const base = { workNativeId: noteId, text: ci.content ?? '', createdAt: isoOf(m.time), likeCount: numOrNull(ci.like_count), likedByMe: null, pinned: null, replyCount: null, ipLabel: null };
     if (tc?.id) {
       const root = String(tc.id);
+      // 被回复那条的发布时间通知里没有，先用这条通知的时间（只会更晚）；笔记页打开后会被整楼数据覆盖
       if (!byId.has(root)) byId.set(root, { nativeId: root, workNativeId: noteId, parentNativeId: null, rootNativeId: root, author: author(tc.user_info), replyTo: null,
         text: tc.content ?? '', createdAt: isoOf(m.time), likeCount: numOrNull(tc.like_count), likedByMe: null, pinned: null, replyCount: null, ipLabel: null });
       byId.set(String(ci.id), { ...base, nativeId: String(ci.id), parentNativeId: root, rootNativeId: root, author: author(m.user_info), replyTo: null });
