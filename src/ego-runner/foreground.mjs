@@ -11,30 +11,40 @@ export const FOREGROUND_STALE_MS = 15_000;
 
 /**
  * @param {string} file  锁文件路径（<OPS_DIR>/locks/_foreground.lock）
- * @returns {(fn: () => any) => Promise<any>}  withForegroundLock(fn)：拿到锁跑 fn，跑完（成功或抛错）放锁。
- *   同一个脚本里嵌套调用（withFocus 里再 tabs.update active）直接跑，不会自己等自己。
+ * @returns {((fn: () => any) => Promise<any>) & { dispose: () => void }}
+ *   withForegroundLock(fn)：拿到锁跑 fn，跑完（成功或抛错）放锁。同一个脚本里嵌套调用（withFocus 里再 tabs.update active）直接跑，不会自己等自己。
+ *   withForegroundLock.dispose()：幂等的收尾，停掉摸锁定时器、放掉自己持有的锁、移除 exit 监听器；前言在脚本结束、deadline、@@OPS 退出前都调。
  */
 export function createForegroundLock(file, { pollMs = 50, staleMs = FOREGROUND_STALE_MS, refreshMs = FOREGROUND_REFRESH_MS, info = {} } = {}) {
   const inside = new AsyncLocalStorage();
-  const held = new Set();
-  const releaseAll = () => { for (const t of held) removeIfOwned(file, t); held.clear(); };
-  process.on('exit', releaseAll);   // 脚本被 process.exit（截止时间）或崩掉时也放锁
+  const held = new Map();   // token → 摸锁定时器
+  const drop = (token) => { clearInterval(held.get(token)); held.delete(token); removeIfOwned(file, token); };
+  const dispose = () => { for (const t of [...held.keys()]) drop(t); process.off('exit', dispose); };
+  process.on('exit', dispose);   // 兜底：脚本崩掉、被 process.exit 时也放锁（Ego 里 process 按脚本隔离，exit 在本脚本结束时触发）
 
   async function acquire() {
     const token = newToken();
     for (;;) {
-      if (tryCreate(file, { ...info, token, pid: process.pid, at: Date.now() })) { held.add(token); return token; }
+      if (tryCreate(file, { ...info, token, pid: process.pid, at: Date.now() })) return token;
       const cur = readLock(file);
-      if (cur && Date.now() - cur.mtimeMs > staleMs) { reclaim(file, cur); continue; }
+      if (cur && Date.now() - cur.mtimeMs > staleMs && reclaim(file, cur)) continue;
       await sleep(pollMs);
     }
   }
 
-  return async function withForegroundLock(fn) {
+  // 只给自己的锁续期：锁文件已被回收、换成别人的，就停掉定时器
+  const touch = (token) => {
+    if (readLock(file)?.content?.token !== token) { clearInterval(held.get(token)); return; }
+    try { const t = new Date(); utimesSync(file, t, t); } catch { /* 刚被删 */ }
+  };
+
+  async function withForegroundLock(fn) {
     if (inside.getStore()) return fn();
     const token = await acquire();
-    const touch = setInterval(() => { try { const t = new Date(); utimesSync(file, t, t); } catch { /* 被回收了 */ } }, refreshMs);
+    held.set(token, setInterval(() => touch(token), refreshMs));
     try { return await inside.run(true, fn); }
-    finally { clearInterval(touch); held.delete(token); removeIfOwned(file, token); }
-  };
+    finally { drop(token); }
+  }
+  withForegroundLock.dispose = dispose;
+  return withForegroundLock;
 }

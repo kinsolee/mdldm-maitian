@@ -1,11 +1,11 @@
 import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { runEgoTask, runInSpace, runEgoScript, parseResult, finishSpace } from '../src/ego-runner/index.mjs';
+import { runInSpace, runEgoScript, parseResult, finishSpace } from '../src/ego-runner/index.mjs';
 import { opsPaths } from '../src/ego-runner/paths.mjs';
 import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EGO_SKIP, tempSpaceName } from './helpers/ego.mjs';
+import { EGO_SKIP, tempSpaceName, closeTestSpace } from './helpers/ego.mjs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -37,13 +37,13 @@ describe('parseResult（不需要 Ego Lite）', () => {
   });
 });
 
-describe('runEgoTask 参数检查（不需要 Ego Lite）', () => {
+describe('runInSpace 参数检查（不需要 Ego Lite）', () => {
   test('Profile 6 被拒绝，不起子进程', async () => {
-    const r = await runEgoTask({ space: 'kinso/test/x', profileId: 'Profile 6', script: 'return 1', egoBin: '/nonexistent/ego-browser' });
+    const r = await runInSpace({ space: 'kinso/test/x', profileId: 'Profile 6', script: 'return 1', egoBin: '/nonexistent/ego-browser' });
     assert.equal(r.ok, false); assert.equal(r.reason, 'profile-rejected');
   });
   test('space 名不符合 kinso/<平台>/<uid> 被拒绝', async () => {
-    const r = await runEgoTask({ space: 'someone-else', script: 'return 1', egoBin: '/nonexistent/ego-browser' });
+    const r = await runInSpace({ space: 'someone-else', script: 'return 1', egoBin: '/nonexistent/ego-browser' });
     assert.equal(r.ok, false); assert.equal(r.reason, 'bad-space-name');
   });
   test('ego-browser 起不来是失败', async () => {
@@ -64,12 +64,12 @@ describe('runEgoTask 参数检查（不需要 Ego Lite）', () => {
   });
 });
 
-describe('runEgoTask 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
+describe('runInSpace 基本行为 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
   const space = tempSpaceName('runner');
-  after(() => finishSpace(space));
+  after(() => closeTestSpace(space));
 
   test('脚本返回值经 @@RESULT 带回，space 在 Profile 5 上', async () => {
-    const r = await runEgoTask({ space, params: { n: 41 }, script: 'return { n: params.n + 1, spaceName: task.name, spaceId: task.spaceId }' });
+    const r = await runInSpace({ space, params: { n: 41 }, script: 'return { n: params.n + 1, spaceName: task.name, spaceId: task.spaceId }' });
     assert.equal(r.ok, true, r.error);
     assert.equal(r.result.n, 42);
     assert.equal(r.result.spaceName, space);
@@ -77,26 +77,26 @@ describe('runEgoTask 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
     assert.equal(spaces.result.profileId, 'Profile 5');
   });
   test('同名 space 第二次运行复用同一个', async () => {
-    const a = await runEgoTask({ space, script: 'return task.spaceId' });
-    const b = await runEgoTask({ space, script: 'return task.spaceId' });
+    const a = await runInSpace({ space, script: 'return task.spaceId' });
+    const b = await runInSpace({ space, script: 'return task.spaceId' });
     assert.equal(a.ok && b.ok, true);
     assert.equal(a.result, b.result);
   });
   test('脚本没返回值（缺 @@RESULT 行）是失败', async () => {
-    const r = await runEgoTask({ space, script: 'console.log("done")' });
+    const r = await runInSpace({ space, script: 'console.log("done")' });
     assert.equal(r.ok, false); assert.equal(r.reason, 'no-result');
   });
   test('脚本抛错（退出码非零）是失败', async () => {
-    const r = await runEgoTask({ space, script: 'throw new Error("boom")' });
+    const r = await runInSpace({ space, script: 'throw new Error("boom")' });
     assert.equal(r.ok, false); assert.equal(r.reason, 'exit-code');
     assert.match(r.stderr + r.stdout, /boom/);
   });
   test('process.exit(3) 是失败', async () => {
-    const r = await runEgoTask({ space, script: 'console.log("@@RESULT 1"); process.exit(3)' });
+    const r = await runInSpace({ space, script: 'console.log("@@RESULT 1"); process.exit(3)' });
     assert.equal(r.ok, false); assert.equal(r.reason, 'exit-code'); assert.equal(r.code, 3);
   });
   test('脚本里能加载插件 lib', async () => {
-    const r = await runEgoTask({ space, script: 'const cdp = await loadPlugin("lib/cdp.js"); const pub = await loadPlugin("lib/publish.js"); return { evaluate: typeof cdp.evaluate, preflight: typeof pub.preflight }' });
+    const r = await runInSpace({ space, script: 'const cdp = await loadPlugin("lib/cdp.js"); const pub = await loadPlugin("lib/publish.js"); return { evaluate: typeof cdp.evaluate, preflight: typeof pub.preflight }' });
     assert.equal(r.ok, true, r.error);
     assert.deepEqual(r.result, { evaluate: 'function', preflight: 'function' });
   });
@@ -106,7 +106,7 @@ describe('runInSpace 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
   const opsDir = mkdtempSync(join(tmpdir(), 'maitian-ops-'));
   const spaces = [];
   const space = (tag) => { const s = tempSpaceName(tag); spaces.push(s); return s; };
-  after(async () => { for (const s of spaces) await finishSpace(s); });
+  after(async () => { for (const s of spaces) await closeTestSpace(s); });
   const ownershipOf = async (s) => (await runEgoScript(`console.log("@@RESULT " + JSON.stringify((await listTaskSpaces()).find((x) => x.name === ${JSON.stringify(s)})?.ownership ?? null))`)).result;
 
   test('运行中有心跳、能用 withForegroundLock；结束后心跳、space 锁、前台锁都删掉', async () => {
@@ -125,10 +125,12 @@ describe('runInSpace 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
   test('到截止时间脚本自己退出（不靠杀 CLI），心跳停下并删掉', async () => {
     const s = space('deadline');
     const t0 = Date.now();
-    const r = await runInSpace({ space: s, opsDir, timeoutMs: 12_000, script: 'await new Promise((r) => setTimeout(r, 60_000)); return 1;' });
+    // G-B9：到点时正持着前台锁，前言退出前也要放掉
+    const r = await runInSpace({ space: s, opsDir, timeoutMs: 12_000, script: 'await withForegroundLock(() => new Promise((r) => setTimeout(r, 60_000))); return 1;' });
     assert.equal(r.reason, 'deadline', `${r.error} ${r.stderr}`); assert.equal(r.exitCode, 1);
     assert.ok(Date.now() - t0 < 12_000, '应在 runner 超时前结束');
     assert.equal(existsSync(opsPaths(s, opsDir).heartbeat), false);
+    assert.equal(existsSync(opsPaths(s, opsDir).foregroundLock), false, '前台锁应已放掉');
   });
 
   test('上次 finish 保留了页面（ownership=user）：返回 user-owned、退出码 4，不认领', async () => {
@@ -140,6 +142,10 @@ describe('runInSpace 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
     assert.equal(r.reason, 'user-owned', `${r.error} ${r.stderr}`); assert.equal(r.exitCode, 4);
     assert.equal(r.ownership, 'user');
     assert.equal(await ownershipOf(s), 'user', '没有被认领');
+    // X-B3：finishSpace 也不认领、不关
+    const f = await finishSpace(s, { opsDir });
+    assert.equal(f.reason, 'user-owned', `${f.error} ${f.stderr}`); assert.equal(f.exitCode, 4);
+    assert.equal(await ownershipOf(s), 'user', 'finishSpace 没有认领');
   });
 });
 

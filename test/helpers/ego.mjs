@@ -16,5 +16,23 @@ export async function egoUnavailableReason() {
   return null;
 }
 
+/**
+ * 测试收尾：关掉一个 kinso/test/ 临时 space，留在用户手里的（测 user-owned 时故意造的）也认领后关掉。
+ * 只给测试用：runner 的 finishSpace 按 spec 不碰用户的 space。
+ */
+export async function closeTestSpace(name) {
+  // 关不掉就抛错（让测试失败），不悄悄留下临时 space
+  if (!/^kinso\/test\//.test(name)) throw new Error(`只关 kinso/test/ 的临时 space：${name}`);
+  return runEgoScript(`const s = (await listTaskSpaces()).find((x) => x.name === ${JSON.stringify(name)} && x.profileId === "Profile 5");
+let r = { existed: !!s };
+if (s) {
+  const t = s.ownership === "agent" ? await taskSpace(s.id) : s.ownership === "user" ? await claimTaskSpace(s.id) : await takeOverTaskSpace(s.id);
+  r = { existed: true, ...(await t.finish({ keep: [] })) };
+}
+console.log("@@RESULT " + JSON.stringify(r));`, { timeoutMs: 60_000 });
+  if (!r.ok || (r.result.existed && !r.result.closedSpace)) throw new Error(`没关掉临时 space ${name}：${r.reason ?? ''} ${r.error ?? JSON.stringify(r.result)} ${(r.stderr ?? '').slice(-300)}`);
+  return r;
+}
+
 export const EGO_SKIP = await egoUnavailableReason();
 if (EGO_SKIP) console.log(`# SKIP Ego Lite 行为测试：${EGO_SKIP}`);

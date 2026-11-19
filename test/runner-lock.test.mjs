@@ -144,7 +144,8 @@ describe('runInSpace space 锁（不需要 Ego Lite）', () => {
     assert.equal(r.reason, 'previous-still-running'); assert.equal(r.exitCode, 5);
   });
 
-  test('SIGTERM / SIGINT：放锁、杀掉 CLI，进程按原信号退出', async () => {
+  test('SIGTERM / SIGINT（X-B5）：杀掉 CLI、进程按原信号退出，但不放锁，标成 abandoned；心跳过期前新任务 previous-still-running', async () => {
+    const STALE = 1000;
     for (const sig of ['SIGTERM', 'SIGINT']) {
       const p = runnerProcess({ script: 'return 1', egoBin: HANG_BIN, timeoutMs: 60_000 });
       await waitFor(() => existsSync(lockFile()));
@@ -152,7 +153,13 @@ describe('runInSpace space 锁（不需要 Ego Lite）', () => {
       p.child.kill(sig);
       const { signal, out } = await p.exited;
       assert.equal(signal, sig, out);
-      assert.equal(existsSync(lockFile()), false, `${sig} 后锁应已释放`);
+      assert.ok(existsSync(lockFile()), `${sig} 后锁不该释放（Ego 里的脚本可能还在跑）`);
+      assert.ok(JSON.parse(readFileSync(lockFile(), 'utf8')).abandonedAt > 0, '锁里应记下放弃时刻');
+      const busy = await run({ script: 'return 1', egoBin: NOWHERE, heartbeatStaleMs: STALE });
+      assert.equal(busy.reason, 'previous-still-running'); assert.equal(busy.exitCode, 5);
+      await sleep(STALE + 100);
+      const ok = await run({ script: 'return 1', heartbeatStaleMs: STALE });
+      assert.equal(ok.ok, true, ok.error);
     }
   });
 
@@ -269,7 +276,7 @@ describe('cli 退出码（不需要 Ego Lite）', () => {
     c.stdin.end(input);
   });
 
-  test('成功 0；user-owned 4；--lock skip 被占 5；--lock 值不对 1', async () => {
+  test('成功 0；user-owned 4；--lock skip 被占 5；--lock 值不对 2', async () => {
     useSpaces([{ id: 9, name: SPACE, profileId: 'Profile 5', ownership: 'agent' }]);
     assert.deepEqual(await cli([], 'return 6 * 7').then((r) => [r.code, r.json.result]), [0, 42]);
     useSpaces([{ id: 9, name: SPACE, profileId: 'Profile 5', ownership: 'user' }]);
@@ -284,7 +291,7 @@ describe('cli 退出码（不需要 Ego Lite）', () => {
     assert.equal(lw.code, 5); assert.equal(lw.json.reason, 'locked');
     await first;
     const bad = await cli(['--lock', 'maybe']);
-    assert.equal(bad.code, 1); assert.equal(bad.json.reason, 'bad-args');
+    assert.equal(bad.code, 2); assert.equal(bad.json.reason, 'bad-args');
   });
 
   test('--finish：user-owned 时不去关那个 space', async () => {

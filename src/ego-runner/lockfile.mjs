@@ -42,8 +42,11 @@ export function rewriteIfOwned(file, token, content) {
   finally { try { unlinkSync(tmp); } catch { /* rename 过了就不在了 */ } }
 }
 
+const tokenOf = (r) => (typeof r?.content?.token === 'string' && r.content.token ? r.content.token : null);
+
 /**
- * 回收一把判定为失效的锁：只在锁文件还是 seen 那一份（token 相同，或都读不出内容且 mtime 相同）时删。
+ * 回收一把判定为失效的锁：只在锁文件还是 seen 那一份（token 相同，或都没有 token 且 mtime 相同）时删。
+ * 「没有 token」包括读不出 JSON 和合法 JSON 但缺 token（如 {}）。
  * 用一个排他创建的守卫文件把「再读一次、删掉」做成一步，免得两个回收方一个删了旧锁、新建，另一个又把新锁删了。
  * 返回是否删了（没删也不要紧，调用方重试创建即可）。
  */
@@ -57,7 +60,7 @@ export function reclaim(file, seen) {
   try {
     const cur = readLock(file);
     if (!cur) return false;
-    const same = seen.content?.token ? cur.content?.token === seen.content.token : !cur.content && cur.mtimeMs === seen.mtimeMs;
+    const same = tokenOf(seen) ? tokenOf(cur) === tokenOf(seen) : !tokenOf(cur) && cur.mtimeMs === seen.mtimeMs;
     if (!same) return false;
     unlinkSync(file);
     return true;
