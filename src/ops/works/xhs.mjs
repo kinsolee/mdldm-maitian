@@ -2,7 +2,7 @@
 // 请求、签名、翻页照搬 spikes/platform/06-works-xhs.mjs（2026-11-19 实测）。
 // 两个作品列表接口直接 fetch 会 406，要带 X-s/X-t：用页面自己的 window._webmsxyw 在 page.evaluate 里现算、在页面里 fetch，
 // 签名不出页面。粉丝三个接口不用签名。fetchRaw 在 Ego space 里跑；map 是宿主侧纯函数。
-import { DAY, cst, cstMs, cstDate, cstDay0, num, pick, pageProblem, httpOk } from './fmt.mjs';
+import { DAY, cst, cstMs, cstDate, cstDay0, num, pick, pageProblem, httpOk, idOf, missingIdProblem } from './fmt.mjs';
 
 export const PLATFORM = 'XiaoHongShu';
 export const START_URL = 'https://creator.xiaohongshu.com/new/note-manager';
@@ -110,11 +110,12 @@ export function map(raw, { days, nowMs }) {
   const postedById = new Map((raw.posted ?? []).flatMap((x) => x.data?.notes ?? []).map((x) => [x.id, x]));
 
   const posts = notes.filter((x) => x.post_time >= begin).map((x) => {
-    const p = postedById.get(x.id);
+    const postId = idOf(x.id);
+    const p = postId ? postedById.get(postId) : undefined;
     const published = x.audit_status === 1;
     const isVideo = x.type === 2;
     return {
-      postId: x.id, uid, platform: PLATFORM, account: name,
+      postId, uid, platform: PLATFORM, account: name,
       // 两个列表接口都没有正文
       title: x.title ?? null, desc: null, cover: x.cover_url ?? null,
       postType: isVideo ? '视频' : '图文', postTypeCode: isVideo ? '1' : '2',
@@ -122,7 +123,7 @@ export function map(raw, { days, nowMs }) {
       status: x.audit_status == null ? null : String(x.audit_status),
       // 小红书是毫秒
       postTime: cstMs(x.post_time), timing: p?.schedule_post_time ? cstMs(p.schedule_post_time) : null,
-      url: `https://www.xiaohongshu.com/explore/${x.id}`,
+      url: postId && `https://www.xiaohongshu.com/explore/${postId}`,
       show: num(x.imp_count), view: num(x.read_count), like: num(x.like_count), comment: num(x.comment_count),
       favorite: num(x.fav_count), forward: num(x.share_count), fansAdd: num(x.increase_fans_count), viewTime: num(x.view_time_avg),
       // 数据看板没有完播率
@@ -141,7 +142,8 @@ export function map(raw, { days, nowMs }) {
     : !loggedIn ? '没登录，没读作品列表'
     : !an.length ? 'analyze/list 没读'
     : an.map((x, i) => pageProblem('analyze/list', i, x, Array.isArray(x.data?.note_infos) && x.data.total != null)).find(Boolean)
-      ?? (notes.length < total ? `analyze/list 只拿到 ${notes.length} 条，total=${total}` : null);
+      ?? (notes.length < total ? `analyze/list 只拿到 ${notes.length} 条，total=${total}` : null)
+      ?? missingIdProblem('analyze/list', 'id', posts);
 
   const t30 = raw.fans?.data?.thirty ?? {};
   const rise = new Map((t30.rise_fans_list ?? []).map((x) => [x.date, num(x.count)]));

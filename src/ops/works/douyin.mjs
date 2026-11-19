@@ -1,7 +1,7 @@
 // 抖音：近 N 天作品 + 指标、粉丝总数和分日粉丝。读法和字段对照见 spikes/results/06-works.md「抖音」，
 // 请求、翻页、停止条件照搬 spikes/platform/06-works-douyin.mjs（2026-11-19 实测）。
 // fetchRaw 在 Ego space 里跑（只读 GET，不点任何东西）；map 是宿主侧纯函数。
-import { DAY, cst, num, pct, parseBigIds, pick, pageProblem } from './fmt.mjs';
+import { DAY, cst, num, pct, parseBigIds, pick, pageProblem, idOf, missingIdProblem, FANS_DAILY_DAYS } from './fmt.mjs';
 
 export const PLATFORM = 'Douyin';
 export const START_URL = 'https://creator.douyin.com/creator-micro/content/manage';
@@ -31,7 +31,7 @@ const trimPage = ({ http, json: j }) => ({
     ...pick(a, AWEME_KEYS), statistics: pick(a.statistics, STAT_KEYS),
     video: { cover: { url_list: (a.video?.cover?.url_list ?? []).slice(0, 1) } },
   })),
-  items: (j?.items ?? []).map((x) => ({ id: String(x.id), metrics: pick(x.metrics, METRIC_KEYS) })),
+  items: (j?.items ?? []).map((x) => ({ id: idOf(x.id), metrics: pick(x.metrics, METRIC_KEYS) })),
 });
 
 export async function fetchRaw(page, { days, nowMs, sleep }) {
@@ -59,7 +59,7 @@ export async function fetchRaw(page, { days, nowMs, sleep }) {
   }
 
   await sleep(PAGE_GAP_MS);
-  const fans = await get(page, `/janus/douyin/creator/data/overview/dashboard/fans?recent_days=${days}`);
+  const fans = await get(page, `/janus/douyin/creator/data/overview/dashboard/fans?recent_days=${FANS_DAILY_DAYS}`);
   raw.fans = {
     http: fans.http, status_code: fans.json?.status_code ?? null,
     metrics: (fans.json?.metrics ?? []).map((m) => pick(m, ['english_metric_name', 'metric_value', 'trends'])),
@@ -79,22 +79,23 @@ export function map(raw, { days, nowMs }) {
   const uid = user.uid != null ? String(user.uid) : null;
   const pages = raw.pages ?? [];
   const aweme = pages.flatMap((p) => p.aweme_list ?? []);
-  const items = new Map(pages.flatMap((p) => p.items ?? []).map((x) => [String(x.id), x]));
+  const items = new Map(pages.flatMap((p) => p.items ?? []).filter((x) => x.id != null).map((x) => [String(x.id), x]));
 
   // 置顶的老作品靠窗口过滤自然排除
   const posts = aweme.filter((a) => a.create_time >= since).map((a) => {
-    const m = items.get(a.aweme_id)?.metrics ?? {};
+    const postId = idOf(a.aweme_id);
+    const m = (postId && items.get(postId)?.metrics) ?? {};
     const st = a.statistics ?? {};
     const [publishStatus, statusText] = STATUS[a.status_value] ?? ['unknown', '状态未知'];
     const isImage = a.aweme_type === 68;
     return {
-      postId: a.aweme_id, uid, platform: PLATFORM, account: user.nickname ?? null,
+      postId, uid, platform: PLATFORM, account: user.nickname ?? null,
       title: a.item_title || (a.desc || '').split(/\s#/)[0], desc: a.desc ?? null,
       cover: a.video?.cover?.url_list?.[0] ?? null,
       postType: isImage ? '图文' : '视频', postTypeCode: isImage ? '2' : '1',
       publishStatus, statusText, status: a.status_value == null ? null : String(a.status_value),
       postTime: cst(a.create_time), timing: a.create_time > now ? cst(a.create_time) : null,
-      url: `https://www.douyin.com/video/${a.aweme_id}`,
+      url: postId && `https://www.douyin.com/video/${postId}`,
       view: num(st.play_count), like: num(st.digg_count), comment: num(st.comment_count), favorite: num(st.collect_count),
       // 小V猫的 forward 就是 share_count（11 条逐条对上）；forward_count 恒为 0
       forward: num(st.share_count),
@@ -110,6 +111,7 @@ export function map(raw, { days, nowMs }) {
   const incomplete = !loggedIn ? '没登录，没读作品列表'
     : !raw.pages?.length ? 'work_list 没读'
     : pages.map((p, i) => pageProblem('work_list', i, { http: p.http, code: p.status_code }, Array.isArray(p.aweme_list))).find(Boolean)
+      ?? missingIdProblem('work_list', 'aweme_id', posts)
       ?? (raw.hitMaxPages ? `work_list 翻到 ${MAX_PAGES} 页上限还没到窗口起点` : null);
 
   const metric = (name) => (raw.fans?.metrics ?? []).find((x) => x.english_metric_name === name);
