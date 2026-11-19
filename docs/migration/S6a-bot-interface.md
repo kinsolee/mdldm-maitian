@@ -251,3 +251,49 @@ hub ops engage status                                         # 每个平台每�
 ### 日志
 
 每个任务在 `data/daemon.log` 里写一行：时间、平台、kind、结果，以及条数或跳过原因。日志里不写评论正文、昵称、密钥、cookie、token，也不写订阅地址的 query。能力位关着这类原因只在第一次出现或原因变化时写一行。
+
+## 9. OpenBot 接法（KIN-324）
+
+代码在 `integrations/openbot/`，不改麦田 `src/`。链路：
+
+```
+麦田守护进程 ──POST（X-Maitian-Signature）──▶ 接收端 127.0.0.1:8790/maitian/hook
+  验签 → 按事件 id 去重入队（integrations/openbot/data/receiver.db）→ 马上回 200
+  └─后台逐批▶ openbot-cli run 数据小管家 - --id maitian-<批次键>
+                └─▶ 数据小管家：挂麦田 MCP read 组，按 persona「麦田事件处理」分类登记，每条 ack_event
+```
+
+### 为什么没用 OpenBot 原生 webhook routine
+
+1. 原生 webhook 地址不在本机。OpenBot 用账号的 Signal 票据生成 `https://<OpenBot 云端>/v1/webhooks/<routeId>`，请求经云端中转回本机，评论私信内容会出本机，还依赖 OpenBot 账号在线。
+2. 原生 webhook 的签名格式和麦田不同（`X-OpenBot-Signature` 覆盖 `<unix 秒>.<deliveryId>.<body>`，或 Standard Webhooks），而且签名密钥只在 OpenBot 界面里显示，要负责人手动建 routine 再复制密钥，没法自动完成，也没法复现。
+
+本机 CLI 两个问题都没有：`--id` 是 OpenBot 的消息重试键（同一个键不重复投递），同一个 bot 在跑时新消息排队、不并发。
+
+### 去重和批次键
+
+- 接收端按 `events[].id` 去重，状态存盘，重启不丢。
+- 批次键是**排序后的事件 id 列表**的 sha256 前 32 位，不含时间戳和随机数。同一批重试一直用同一个键，`--id maitian-<键>`。
+- 投给 OpenBot 的消息里只有事件 id，没有评论私信正文。正文由 agent 用 MCP 读。
+
+### 投递失败
+
+CLI 非零退出或 60 秒超时算失败，同一批按 30 秒、2 分钟、10 分钟重试。4 次都失败就不再投，这批事件**不回执**，留给 agent 每轮开头的 `list_events({ unhandled: true })` 补漏。日志只写条数、批次键前缀、deliveryId 和错误摘要。
+
+### 配置（`integrations/openbot/.env`，权限 0600，不进仓库）
+
+见 `.env.example`。`OPENBOT_CLI` 默认是 app 内路径，启动时找不到文件就报错退出。`MAITIAN_SECRET` 由首次登记自动写入，不打印。
+
+### 启动和查看
+
+```sh
+node integrations/openbot/receiver.mjs                    # 启动：先 subscribe_events（openbot-engage），再监听
+curl -s http://127.0.0.1:8790/health                      # 收到、已投、待投、放弃的条数
+node /Applications/OpenBot.app/Contents/Resources/cli/openbot-cli.mjs status 数据小管家 <deliveryId>   # 查一批的处理结果
+```
+
+`<deliveryId>` 在接收端日志「投递成功 … delivery <id>」里。launchd 模板：`integrations/openbot/com.maitian.openbot-receiver.plist`。
+
+### 给数据小管家挂麦田 MCP
+
+在 OpenBot「Marketplace → Apps」里加 stdio 服务（只有负责人能把服务分给 bot）：命令 `node`，参数 `<检出>/src/mcp/server.mjs --scope read`，环境变量只放 `MAITIAN_OPS_DB`。不要放 `MAITIAN_ENGAGE_TOKEN` 等写入口令。

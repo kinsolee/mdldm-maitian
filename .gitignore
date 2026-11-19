@@ -9,3 +9,5 @@ scripts-*.sh
 MAINTENANCE.md
 demo/
 .env
+integrations/openbot/.env
+integrations/openbot/data/
