@@ -46,7 +46,7 @@ MCP 客户端配置示例（JSON 形式，各平台字段名可能不同）：
 | `get_comment_thread` | `commentId` | `{ work: { id, title, url }, partial, root }`。`root` 是整楼的嵌套树，每个节点有 `children` |
 | `list_conversations` | `platforms?`、`unread?`、`lastBy?`（`me` 或 `peer`）、`since?`、`cursor?`、`limit?` | Conversation[]，最近的在前 |
 | `get_conversation` | `conversationId`、`limit?` | `{ conversation, messages }`。`messages` 是最近 `limit` 条，旧的在前 |
-| `refresh_now` | `kind`（`comments` 或 `dms`）、`platform` | `{ jobId, deduped, status }`。同一平台同一 kind 已经有在排队或在跑的任务，或者 5 分钟内刚成功过一次时，不新建任务，返回那条任务（`deduped: true`）。守护进程崩溃时留下的任务，开始 30 分钟后还没收尾就会记成失败（`error` 写「遗留的 running 任务已回收」），之后再调 `refresh_now` 会新建任务 |
+| `refresh_now` | `kind`（`comments` 或 `dms`）、`platform`（只接受 `Douyin`、`Channels`、`XiaoHongShu`、`Bili`，其他平台报错） | `{ jobId, deduped, status }`。同一平台同一 kind 已经有在排队或在跑的任务，或者 5 分钟内刚结束过一次（成功、跳过、失败都算）时，不新建任务，返回那条任务（`deduped: true`）。守护进程崩溃时留下的任务，开始 30 分钟后还没收尾就会记成失败（`error` 写「遗留的 running 任务已回收」），之后再调 `refresh_now` 会新建任务 |
 
 评论字段的含义：
 

@@ -9,6 +9,7 @@ import * as bili from './bili.mjs';
 import * as douyin from './douyin.mjs';
 import * as channels from './channels.mjs';
 import * as xhs from './xhs.mjs';
+import { redact } from '../redact.mjs';
 
 export const ADAPTERS = { Bili: bili, Douyin: douyin, Channels: channels, XiaoHongShu: xhs };
 const SKIPS = ['busy', 'user-controlled', 'profile-needed'];
@@ -17,13 +18,8 @@ const SCRIPT = 'const m = await import(params.moduleUrl);\nreturn m.runInSpace(t
 const moduleUrl = (code) => pathToFileURL(path.join(import.meta.dirname, `${ADAPTERS[code].FILE}`)).href;
 
 /** 错误文本脱敏：去掉 URL 查询串、cookie 和各种 token 的值，截到 300 字。 */
-export function safeError(e) {
-  return String(e?.message ?? e ?? '')
-    .replace(/(https?:\/\/[^\s"'?]+)\?[^\s"']*/g, '$1?<去掉>')
-    .replace(/\b(cookie|set-cookie)\s*[:=]\s*[^\n]*/gi, '$1: <去掉>')
-    .replace(/\b([\w-]*(?:token|bogus|sessdata|bili_jct|sign|ticket|csrf|a1|web_session)[\w-]*)\s*[=:]\s*["']?[^\s&;"',]+/gi, '$1=<去掉>')
-    .slice(0, 300);
-}
+// 脱敏规则统一在 ../redact.mjs（和 sync.mjs 共用）
+export const safeError = (e) => redact(String(e?.message ?? e ?? ''));
 
 const fail = (reason, error) => ({ ok: false, reason, error: safeError(error) });
 
