@@ -159,3 +159,48 @@ s3test('ops.db 里已有 S3 的 works 表：评论入库照常，S3 的 works �
   if (!cols.includes('postId') || cols.includes('nativeId')) throw new Error('S3 works 表结构被改了');
   db.close();
 });
+
+describe('评审第 1 轮回归', () => {
+  test('X-B2：空的首轮成功快照也建立基线，第二轮新增评论、新会话照常出事件', () => {
+    const db = freshDb();
+    const a = douyin(db);
+    assert.deepEqual(ingestSnapshot(db, a, commentsSnap([], { works: [], scanned: [] }), { now: at(T0) }).events, []);
+    assert.deepEqual(ingestSnapshot(db, a, commentsSnap([comment('c1')]), { now: at(T0 + MIN) }).events, ['comment.created:Douyin:c1']);
+    assert.deepEqual(ingestSnapshot(db, a, dmsSnap([]), { now: at(T0) }).events, []);
+    assert.deepEqual(ingestSnapshot(db, a, dmsSnap([conv('k1')]), { now: at(T0 + MIN) }).events, ['dm.received:Douyin:k1:2026-11-19T01:00:00.000Z']);
+  });
+
+  test('X-B2：评论的基线不算私信的基线（按 accountId + kind 分开）', () => {
+    const db = freshDb();
+    const a = douyin(db);
+    ingestSnapshot(db, a, commentsSnap([comment('c1')]), { now: at(T0) });
+    assert.deepEqual(ingestSnapshot(db, a, dmsSnap([conv('k1')]), { now: at(T0 + MIN) }).events, []);
+  });
+
+  test('X-B2：升级前已有业务行的库，迁移时补上基线，不会再吞一轮', () => {
+    const file = tmpDbFile();
+    let db = freshDb(file);
+    ingestSnapshot(db, douyin(db), commentsSnap([comment('c1')]), { now: at(T0) });
+    db.exec('DELETE FROM engage_baselines');   // 模拟升级前的库：有评论行、没有基线表的记录
+    db.close();
+    db = openOpsDb(file);
+    assert.deepEqual(ingestSnapshot(db, douyin(db), commentsSnap([comment('c1'), comment('c2')]), { now: at(T0 + MIN) }).events, ['comment.created:Douyin:c2']);
+  });
+
+  test('X-B6：parent 本轮和库里都没有时，作品 thread_partial 置 true（覆盖适配器给的 false）', () => {
+    const db = freshDb();
+    ingestSnapshot(db, douyin(db), commentsSnap([comment('r1'), comment('x2', { parent: 'deleted', root: 'r1' })]), { now: at(T0) });
+    assert.equal(one(db, "SELECT partial FROM thread_partial WHERE workId = 'Douyin:w1'").partial, 1);
+  });
+
+  test('X-B7：会话 last 为 null 时保留库里已有的最后一句', () => {
+    const db = freshDb();
+    const a = douyin(db);
+    ingestSnapshot(db, a, dmsSnap([conv('k1', { at: '2026-11-19T01:00:00.000Z', text: '你好' })]), { now: at(T0) });
+    ingestSnapshot(db, a, dmsSnap([conv('k1', { last: null, unread: 0 })]), { now: at(T0 + MIN) });
+    const k = one(db, "SELECT lastBy, lastAt, lastText, lastType, unread FROM conversations WHERE id = 'Douyin:k1'");
+    assert.deepEqual({ ...k }, { lastBy: 'peer', lastAt: '2026-11-19T01:00:00.000Z', lastText: '你好', lastType: 'text', unread: 0 });
+    // 之后对方又说了同一句的时间：不重复出事件
+    assert.deepEqual(ingestSnapshot(db, a, dmsSnap([conv('k1', { at: '2026-11-19T01:00:00.000Z' })]), { now: at(T0 + 2 * MIN) }).events, []);
+  });
+});

@@ -6,6 +6,9 @@ import { joinId, splitId } from './ids.mjs';
 export const REFRESH_DEDUPE_MS = 5 * 60_000;
 export const LOGIN_LOST_INTERVAL_MS = 6 * 3600_000;
 export const SYNC_KINDS = ['comments', 'dms'];
+// running 超过这么久还没收尾，就当是进程崩了留下的（runner 单次最长约 2 分钟，一轮几个账号串行）
+export const STALE_RUNNING_MS = 30 * 60_000;
+export const RECLAIMED_ERROR = '遗留的 running 任务已回收（上一个进程没收尾）';
 const SNIPPET = 200;
 
 const iso = (ms) => new Date(ms).toISOString();
@@ -24,7 +27,9 @@ export function insertEvent(db, { id, type, platformCode, accountId, subjectId, 
   return r.changes > 0;
 }
 
-const hasRows = (db, table, accountId) => !!db.prepare(`SELECT 1 FROM ${table} WHERE accountId = ? LIMIT 1`).get(accountId);
+// 基线：这个账号这种 kind 成功入库过一次（哪怕是空的）。在 ingestSnapshot 的事务里写，和当前 job 有没有 finishJob 无关
+const hasBaseline = (db, accountId, kind) => !!db.prepare('SELECT 1 FROM engage_baselines WHERE accountId = ? AND kind = ?').get(accountId, kind);
+const setBaseline = (db, accountId, kind, at) => db.prepare('INSERT OR IGNORE INTO engage_baselines (accountId, kind, establishedAt) VALUES (?, ?, ?)').run(accountId, kind, at);
 
 function upsertWorks(db, ctx, works) {
   const exists = db.prepare('SELECT 1 FROM engage_works WHERE id = ?');
@@ -39,9 +44,9 @@ function upsertWorks(db, ctx, works) {
 
 /**
  * 每条评论的 parentId / rootId / depth：沿 parent 链算（先找本轮，再找库里）。
- * parent 本轮和库里都没有：按适配器给的 rootNativeId 挂，depth 记 1。
+ * parent 本轮和库里都没有：按适配器给的 rootNativeId 挂，depth 记 1，并把作品记进 unresolved（楼中楼不全）。
  */
-function placeComments(db, code, comments) {
+function placeComments(db, code, comments, unresolved) {
   const round = new Map(comments.map((c) => [String(c.nativeId), c]));
   const inDb = db.prepare('SELECT rootId, depth FROM comments WHERE id = ?');
   const placed = new Map();
@@ -58,6 +63,7 @@ function placeComments(db, code, comments) {
       const up = round.has(parentNative) && !seen.has(parentNative) ? place(parentNative, seen) : inDb.get(parentId);
       const fallbackRoot = c.rootNativeId != null && String(c.rootNativeId) !== nativeId ? joinId(code, c.rootNativeId) : parentId;
       p = up ? { parentId, rootId: up.rootId, depth: up.depth + 1 } : { parentId, rootId: fallbackRoot, depth: 1 };
+      if (!up) unresolved.add(joinId(code, c.workNativeId));
     }
     placed.set(nativeId, p);
     return p;
@@ -68,7 +74,8 @@ function placeComments(db, code, comments) {
 
 function upsertComments(db, ctx, snap) {
   const { code } = ctx;
-  const placed = placeComments(db, code, snap.comments);
+  const unresolved = new Set();
+  const placed = placeComments(db, code, snap.comments, unresolved);
   const workTitles = new Map(snap.works.map((w) => [joinId(code, w.nativeId), w]));
   const workOf = db.prepare('SELECT title, url FROM engage_works WHERE id = ?');
   const exists = db.prepare('SELECT 1 FROM comments WHERE id = ?');
@@ -93,20 +100,22 @@ function upsertComments(db, ctx, snap) {
     emit(db, ctx, { id: `comment.created:${id}`, type: 'comment.created', subjectId: id,
       payload: { workId, workTitle: w.title ?? null, workUrl: w.url ?? null, commentId: id, rootId: p.rootId, parentId: p.parentId, nickname: c.author?.nickname ?? null, text: snippet(c.text) } });
   }
-  markGone(db, ctx, snap.scannedWorks, seen);
+  markGone(db, ctx, snap.scannedWorks, seen, unresolved);
 }
 
 // complete 的作品：这一轮没出现、还没 gone 的评论标 goneAt（不删行）。顺手记楼中楼拿不全的作品。
-function markGone(db, ctx, scannedWorks, seen) {
+function markGone(db, ctx, scannedWorks, seen, unresolved) {
   const ofWork = db.prepare('SELECT id FROM comments WHERE workId = ? AND goneAt IS NULL');
   const gone = db.prepare('UPDATE comments SET goneAt = ? WHERE id = ?');
   const partial = db.prepare('INSERT INTO thread_partial (workId, partial, updatedAt) VALUES (?, ?, ?) ON CONFLICT(workId) DO UPDATE SET partial = excluded.partial, updatedAt = excluded.updatedAt');
   for (const s of scannedWorks) {
     const workId = joinId(ctx.code, s.workNativeId);
-    partial.run(workId, s.threadsPartial ? 1 : 0, ctx.at);
+    partial.run(workId, s.threadsPartial || unresolved.has(workId) ? 1 : 0, ctx.at);
+    unresolved.delete(workId);
     if (s.complete !== true) continue;
     for (const { id } of ofWork.all(workId)) if (!seen.has(id)) { gone.run(ctx.at, id); ctx.stats.gone++; }
   }
+  for (const workId of unresolved) partial.run(workId, 1, ctx.at);   // 没在 scannedWorks 里的作品
 }
 
 function upsertConversations(db, ctx, snap) {
@@ -115,13 +124,16 @@ function upsertConversations(db, ctx, snap) {
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
+  // last 为 null 是「这一轮没读到」（例如小红书没打开的会话），不是「没有最后一句」：库里已有的不动
+  const updKeepLast = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, canSend = ?, updatedAt = ? WHERE id = ?');
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
     const last = k.last ?? null;
     const vals = [ctx.accountId, code, k.peer?.uid ?? null, k.peer?.nickname ?? null, k.peer?.kind ?? null, k.unread ?? 0,
       last?.by ?? null, last?.at ?? null, last?.text ?? null, last?.type ?? null, bool(k.canSend)];
     const before = prev.get(id);
-    if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; } else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
+    if (before && !last) { updKeepLast.run(...vals.slice(0, 6), vals[10], ctx.at, id); ctx.stats.updated++; }
+    else if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; } else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
     const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !ctx.firstSync;
     if (last?.by !== 'peer' || !last.at || !isNewer) continue;
     emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id,
@@ -140,7 +152,8 @@ function emit(db, ctx, e) {
 
 /**
  * 吃适配器输出（见 kin323-contract.md），一个事务里入库并出事件。
- * 账号第一次同步（库里这个账号这种 kind 还没有任何行）只入库、不出事件，免得上线第一轮把历史全推一遍。
+ * 账号第一次同步（这个账号这种 kind 还没有成功入库过，见 engage_baselines；空的成功快照也算一次）只入库、不出事件，
+ * 免得上线第一轮把历史全推一遍。
  * 返回 { inserted, updated, gone, events: [eventId...] }（events 只含本次新写的）。
  */
 export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
@@ -150,10 +163,11 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
   const snap = { works: [], comments: [], scannedWorks: [], conversations: [], messages: [], ...snapshot };
   const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats: { inserted: 0, updated: 0, gone: 0 } };
   return tx(db, () => {
-    ctx.firstSync = !hasRows(db, kind === 'comments' ? 'comments' : 'conversations', ctx.accountId);
+    ctx.firstSync = !hasBaseline(db, ctx.accountId, kind);
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);
     else upsertConversations(db, ctx, snap);
+    setBaseline(db, ctx.accountId, kind, ctx.at);
     return { ...ctx.stats, events: ctx.events };
   });
 }
@@ -191,21 +205,34 @@ export function finishJob(db, id, { status, error = null, stats = null, now = Da
   if (!r.changes) throw new Error(`任务不存在：${id}`);
 }
 
+/**
+ * 回收进程崩了留下的 running 任务：startedAt 超过 STALE_RUNNING_MS 还是 running 的记成 failed。
+ * 守护进程每轮开头（拿到轮锁之后、pendingRefreshes 之前）调。返回回收了的 job id。
+ */
+export function reclaimStaleJobs(db, { now = Date.now, maxRunningMs = STALE_RUNNING_MS } = {}) {
+  const cutoff = iso(now() - maxRunningMs);
+  const ids = db.prepare("SELECT id FROM sync_jobs WHERE status = 'running' AND startedAt < ? ORDER BY startedAt, id").all(cutoff).map((r) => r.id);
+  const upd = db.prepare("UPDATE sync_jobs SET status = 'failed', finishedAt = ?, error = ? WHERE id = ? AND status = 'running'");
+  for (const id of ids) upd.run(iso(now()), RECLAIMED_ERROR, id);
+  return ids;
+}
+
 /** 等着跑的 refresh_now（旧的在前）。调度每轮先拿这些，startJob 后跑。 */
 export const pendingRefreshes = (db) =>
   db.prepare("SELECT * FROM sync_jobs WHERE trigger = 'refresh_now' AND status = 'requested' ORDER BY requestedAt, id").all();
 
 /**
- * refresh_now：同一平台同一 kind 已有排着/在跑的，或 5 分钟内刚成功的 refresh，就返回那条（deduped: true），不新建。
+ * refresh_now：同一平台同一 kind 已有排着的、还活着的 running（开始不到 STALE_RUNNING_MS），或 5 分钟内刚成功的 refresh，
+ * 就返回那条（deduped: true），不新建。
  * 返回 { jobId, deduped, status }。
  */
 export function requestRefresh(db, { kind, platform, now = Date.now }) {
   checkKind(kind);
   const acc = accountOfPlatform(db, platform);
   if (!acc) throw new Error(`没有 ${platform} 的账号`);
-  const since = iso(now() - REFRESH_DEDUPE_MS);
+  const since = iso(now() - REFRESH_DEDUPE_MS), alive = iso(now() - STALE_RUNNING_MS);
   const hit = db.prepare(`SELECT id, status FROM sync_jobs WHERE trigger = 'refresh_now' AND platformCode = ? AND kind = ?
-    AND (status IN ('requested', 'running') OR (status = 'ok' AND finishedAt >= ?)) ORDER BY requestedAt DESC LIMIT 1`).get(platform, kind, since);
+    AND (status = 'requested' OR (status = 'running' AND startedAt >= ?) OR (status = 'ok' AND finishedAt >= ?)) ORDER BY requestedAt DESC LIMIT 1`).get(platform, kind, alive, since);
   if (hit) return { jobId: hit.id, deduped: true, status: hit.status };
   const jobId = createJob(db, { platformCode: platform, accountId: joinId(acc.platformCode, acc.uid), kind, trigger: 'refresh_now', now });
   return { jobId, deduped: false, status: 'requested' };

@@ -11,7 +11,7 @@ import { openOpsDb } from '../ops/db.mjs';
 import { listAccounts, getAccount, PENDING, PLATFORM_NAMES } from '../ops/accounts.mjs';
 import { opsDbPath, engageLockPath } from '../ops/paths.mjs';
 import { defaultNotify } from '../ops/login.mjs';
-import { ingestSnapshot, createJob, startJob, finishJob, getJob, pendingRefreshes, recordSyncFailure, recordLoginLost, SYNC_KINDS } from '../ops/engage/store.mjs';
+import { ingestSnapshot, createJob, startJob, finishJob, getJob, pendingRefreshes, reclaimStaleJobs, recordSyncFailure, recordLoginLost, SYNC_KINDS } from '../ops/engage/store.mjs';
 import { deliverPending } from './outbox.mjs';
 import { ENGAGE_PLATFORMS, isDue } from './schedule.mjs';
 import { acquireRoundLock, heldLock } from './round-lock.mjs';
@@ -136,6 +136,7 @@ export async function runRound(db, {
   };
   try {
     ensureScheduleTable(db);
+    for (const id of reclaimStaleJobs(db, { now })) log(`${localTime(now())} [engage] 回收了遗留的 running 任务 ${id}`);
     const refreshed = new Set();
     // 1. refresh_now：用那条 job，不新建
     for (const job of pendingRefreshes(db)) {

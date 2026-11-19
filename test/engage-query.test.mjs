@@ -1,7 +1,7 @@
 // 查询（MCP / CLI 共用）、订阅登记、抓取任务和守护进程事件。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { ingestSnapshot, createJob, startJob, finishJob, requestRefresh, pendingRefreshes, recordSyncFailure, recordLoginLost } from '../src/ops/engage/store.mjs';
+import { ingestSnapshot, createJob, startJob, finishJob, requestRefresh, pendingRefreshes, recordSyncFailure, recordLoginLost, reclaimStaleJobs, STALE_RUNNING_MS } from '../src/ops/engage/store.mjs';
 import * as q from '../src/ops/engage/query.mjs';
 import { subscribe, unsubscribe } from '../src/ops/engage/subscribers.mjs';
 import { freshDb, douyin, comment, commentsSnap, conv, dmsSnap, T0, MIN, at } from './helpers/engage-fixtures.mjs';
@@ -216,5 +216,34 @@ describe('抓取任务与守护进程事件', () => {
     assert.equal(recordLoginLost(db, { accountId: 'Douyin:106707338905', jobId: 'j1', now: at(T0) }), 'account.login_lost:Douyin:106707338905:j1');
     assert.equal(recordLoginLost(db, { accountId: 'Douyin:106707338905', jobId: 'j2', now: at(T0 + 3600_000) }), null);
     assert.ok(recordLoginLost(db, { accountId: 'Douyin:106707338905', jobId: 'j3', now: at(T0 + 6 * 3600_000 + 1) }));
+  });
+});
+
+describe('评审第 1 轮回归（查询）', () => {
+  test('X-B6：楼里有 parent 缺失的评论时 get_comment_thread 返回 partial: true（后来一轮适配器说 threadsPartial=false 也一样）', () => {
+    const db = freshDb();
+    const a = douyin(db);
+    ingestSnapshot(db, a, commentsSnap([comment('r1'), comment('x2', { parent: 'deleted', root: 'r1' }), comment('r9')]), { now: at(T0) });
+    ingestSnapshot(db, a, commentsSnap([comment('r1'), comment('r9')], { scanned: [{ workNativeId: 'w1', complete: false, threadsPartial: false }] }), { now: at(T0 + MIN) });
+    const t = q.getCommentThread(db, 'Douyin:x2');
+    assert.equal(t.partial, true);
+    assert.deepEqual(t.root.children.map((n) => n.id), ['Douyin:x2']);
+    assert.equal(q.getCommentThread(db, 'Douyin:r9').partial, false);   // 别的楼不受影响
+  });
+
+  test('X-B9：遗留的 running refresh 超过上限后回收为 failed，requestRefresh 不再认它', () => {
+    const db = freshDb();
+    const r1 = requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: at(T0) });
+    startJob(db, r1.jobId, { now: at(T0) });
+    // 进程崩了：一直是 running
+    assert.equal(requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: at(T0 + 10 * MIN) }).deduped, true);
+    assert.deepEqual(reclaimStaleJobs(db, { now: at(T0 + 10 * MIN) }), []);   // 还没到上限
+    const r2 = requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: at(T0 + STALE_RUNNING_MS + MIN) });
+    assert.equal(r2.deduped, false);   // 超过上限的 running 不算活着
+    assert.deepEqual(reclaimStaleJobs(db, { now: at(T0 + STALE_RUNNING_MS + MIN) }), [r1.jobId]);
+    const j = db.prepare('SELECT status, error, finishedAt FROM sync_jobs WHERE id = ?').get(r1.jobId);
+    assert.equal(j.status, 'failed');
+    assert.match(j.error, /遗留的 running 任务已回收/);
+    assert.deepEqual(pendingRefreshes(db).map((x) => x.id), [r2.jobId]);
   });
 });

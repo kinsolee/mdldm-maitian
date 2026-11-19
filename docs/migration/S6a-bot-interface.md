@@ -46,7 +46,7 @@ MCP 客户端配置示例（JSON 形式，各平台字段名可能不同）：
 | `get_comment_thread` | `commentId` | `{ work: { id, title, url }, partial, root }`。`root` 是整楼的嵌套树，每个节点有 `children` |
 | `list_conversations` | `platforms?`、`unread?`、`lastBy?`（`me` 或 `peer`）、`since?`、`cursor?`、`limit?` | Conversation[]，最近的在前 |
 | `get_conversation` | `conversationId`、`limit?` | `{ conversation, messages }`。`messages` 是最近 `limit` 条，旧的在前 |
-| `refresh_now` | `kind`（`comments` 或 `dms`）、`platform` | `{ jobId, deduped, status }`。同一平台同一 kind 已经有在排队或在跑的任务，或者 5 分钟内刚成功过一次时，不新建任务，返回那条任务（`deduped: true`） |
+| `refresh_now` | `kind`（`comments` 或 `dms`）、`platform` | `{ jobId, deduped, status }`。同一平台同一 kind 已经有在排队或在跑的任务，或者 5 分钟内刚成功过一次时，不新建任务，返回那条任务（`deduped: true`）。守护进程崩溃时留下的任务，开始 30 分钟后还没收尾就会记成失败（`error` 写「遗留的 running 任务已回收」），之后再调 `refresh_now` 会新建任务 |
 
 评论字段的含义：
 
@@ -54,7 +54,8 @@ MCP 客户端配置示例（JSON 形式，各平台字段名可能不同）：
 - `replied`：这条评论的子树里有我写的、还没被删的回复。
 - `list_comments({ replied: false })` 只返回别人写的、还没回的评论，和 `inbox` 里的未回复数一致。
 - 平台上被删掉的评论不删行，只标 `goneAt`。`list_comments` 默认不返回这些评论，传 `includeGone: true` 才返回。
-- `partial: true` 表示这个作品的楼中楼麦田拿不全（平台接口核实不了），树里可能缺回复。所在楼的一楼不在库里时，`root` 是占位节点 `{ id, missing: true, children }`，这时 `partial` 也是 `true`。
+- `partial: true` 表示这个作品的楼中楼麦田拿不全（平台接口核实不了），树里可能缺回复。楼里有评论的 parent 不在库里时（例如被回复的那条已经被删），这条评论挂在一楼下面，这时 `partial` 也是 `true`。所在楼的一楼不在库里时，`root` 是占位节点 `{ id, missing: true, children }`，这时 `partial` 也是 `true`。
+- 会话的 `last`：平台这一轮没读到最后一句时（例如小红书没打开过的会话），麦田保留上次记下的 `last`，不会清空。
 
 ## 2. 登记订阅
 
@@ -148,7 +149,7 @@ function verify(secret, rawBody, header) {
 
 ## 5. 首轮不出事件
 
-一个账号**第一次同步**某类数据（库里还没有这个账号的评论，或者还没有它的会话）时，麦田只入库、不出事件。不然上线第一轮会把历史评论、历史私信全推一遍。从第二轮起，只对新出现的内容出事件。
+一个账号**第一次成功同步**某类数据（评论、私信分开算）时，麦田只入库、不出事件。这一轮哪怕什么都没抓到（例如账号还没有评论），也算同步过一次。不然上线第一轮会把历史评论、历史私信全推一遍。从第二轮起，只对新出现的内容出事件。
 
 守护进程停过一段时间再启动时，会照常和库里比对。停机期间的新评论会在启动后第一轮一次出成事件，不会丢，也不会重复。
 
