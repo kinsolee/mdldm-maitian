@@ -113,7 +113,7 @@ export function listComments(db, { workId, platforms, since, replied, includeGon
 }
 
 const workBrief = (db, workId) => {
-  const w = db.prepare('SELECT id, title, url FROM works WHERE id = ?').get(workId);
+  const w = db.prepare('SELECT id, title, url FROM engage_works WHERE id = ?').get(workId);
   return w ? { id: w.id, title: w.title, url: w.url } : { id: workId, title: null, url: null };
 };
 
@@ -227,12 +227,12 @@ export function listWorks(db, { platforms, since, until, cursor, limit } = {}) {
   const s = checkTime(since, 'since'), u = checkTime(until, 'until');
   if (s) { where.push('postTime >= ?'); params.push(s); }
   if (u) { where.push('postTime < ?'); params.push(u); }
-  return page(db, { prefix: REPLIED_CTE, cols: WORK_COLS, from: 'works w', where, params, key: "coalesce(w.postTime, w.firstSeenAt)", desc: true, limit, cursor, map: toWork });
+  return page(db, { prefix: REPLIED_CTE, cols: WORK_COLS, from: 'engage_works w', where, params, key: "coalesce(w.postTime, w.firstSeenAt)", desc: true, limit, cursor, map: toWork });
 }
 
 function workRow(db, workId) {
   splitId(workId, 'workId');
-  const r = db.prepare(`${REPLIED_CTE} SELECT ${WORK_COLS} FROM works w WHERE w.id = ?`).get(workId);
+  const r = db.prepare(`${REPLIED_CTE} SELECT ${WORK_COLS} FROM engage_works w WHERE w.id = ?`).get(workId);
   if (!r) throw new Error(`没有这个作品：${workId}`);
   return r;
 }

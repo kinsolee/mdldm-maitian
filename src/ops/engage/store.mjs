@@ -27,9 +27,9 @@ export function insertEvent(db, { id, type, platformCode, accountId, subjectId, 
 const hasRows = (db, table, accountId) => !!db.prepare(`SELECT 1 FROM ${table} WHERE accountId = ? LIMIT 1`).get(accountId);
 
 function upsertWorks(db, ctx, works) {
-  const exists = db.prepare('SELECT 1 FROM works WHERE id = ?');
-  const ins = db.prepare('INSERT INTO works (id, accountId, platformCode, nativeId, title, url, postTime, firstSeenAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
-  const upd = db.prepare('UPDATE works SET title = coalesce(?, title), url = coalesce(?, url), postTime = coalesce(?, postTime), updatedAt = ? WHERE id = ?');
+  const exists = db.prepare('SELECT 1 FROM engage_works WHERE id = ?');
+  const ins = db.prepare('INSERT INTO engage_works (id, accountId, platformCode, nativeId, title, url, postTime, firstSeenAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const upd = db.prepare('UPDATE engage_works SET title = coalesce(?, title), url = coalesce(?, url), postTime = coalesce(?, postTime), updatedAt = ? WHERE id = ?');
   for (const w of works) {
     const id = joinId(ctx.code, w.nativeId);
     if (exists.get(id)) { upd.run(w.title ?? null, w.url ?? null, w.postTime ?? null, ctx.at, id); ctx.stats.updated++; }
@@ -70,7 +70,7 @@ function upsertComments(db, ctx, snap) {
   const { code } = ctx;
   const placed = placeComments(db, code, snap.comments);
   const workTitles = new Map(snap.works.map((w) => [joinId(code, w.nativeId), w]));
-  const workOf = db.prepare('SELECT title, url FROM works WHERE id = ?');
+  const workOf = db.prepare('SELECT title, url FROM engage_works WHERE id = ?');
   const exists = db.prepare('SELECT 1 FROM comments WHERE id = ?');
   const cols = 'parentId = ?, rootId = ?, depth = ?, authorUid = ?, authorNickname = ?, authorIsMe = ?, replyToUid = ?, replyToNickname = ?, text = ?, createdAt = ?, likeCount = ?, likedByMe = ?, pinned = ?, replyCount = ?, ipLabel = ?';
   const ins = db.prepare(`INSERT INTO comments (workId, accountId, platformCode, parentId, rootId, depth, authorUid, authorNickname, authorIsMe, replyToUid, replyToNickname, text, createdAt, likeCount, likedByMe, pinned, replyCount, ipLabel, id, firstSeenAt, lastSeenAt)

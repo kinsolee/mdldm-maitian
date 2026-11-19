@@ -125,3 +125,37 @@ describe('私信与 dm.received', () => {
     assert.deepEqual(ingestSnapshot(db, a, dmsSnap([conv('k1', { by: 'me', at: '2026-11-19T01:40:00.000Z' })]), { now: at(T0 + 3 * MIN) }).events, []);
   });
 });
+
+// S3（KIN-328）的 works 表先建好的库（生产 ops.db 就是这样）：评论入库照常，S3 的 works 不被改动
+import { test as s3test } from 'node:test';
+s3test('ops.db 里已有 S3 的 works 表：评论入库照常，S3 的 works 不受影响', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const { ensureWorksTables } = await import('../src/ops/works-db.mjs');
+  const { openOpsDb } = await import('../src/ops/db.mjs');
+  const { ingestSnapshot: ingest } = await import('../src/ops/engage/store.mjs');
+  const { listComments, getCommentThread } = await import('../src/ops/engage/query.mjs');
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kin323-s3-')), 'ops.db');
+  const pre = new DatabaseSync(file); ensureWorksTables(pre);
+  pre.prepare("INSERT INTO works (platformCode, uid, postId, record, postTime, firstSeenAt, lastSeenAt, lastRunId) VALUES ('Bili','1','BV1','{}',NULL,'t','t','r')").run(); pre.close();
+  const db = openOpsDb(file);
+  db.prepare("INSERT OR IGNORE INTO accounts (platformCode, platformName, uid, spaceName, capabilities) VALUES ('Bili','B站','1','kinso/Bili/1','{}')").run();
+  const { getAccount } = await import('../src/ops/accounts.mjs');
+  const account = getAccount(db, 'Bili:1');
+  const snap = { ok: true, platformCode: 'Bili', accountUid: '1', kind: 'comments', fetchedAt: '2026-11-19T00:00:00.000Z',
+    works: [{ nativeId: 'BV1', title: '作品', url: null, postTime: null }],
+    comments: [{ nativeId: 'c1', workNativeId: 'BV1', parentNativeId: null, rootNativeId: 'c1', author: { uid: '9', nickname: 'x', isMe: false }, replyTo: null,
+      text: 't', createdAt: '2026-11-19T00:00:00.000Z', likeCount: 0, likedByMe: null, pinned: null, replyCount: 0, ipLabel: null }],
+    scannedWorks: [{ workNativeId: 'BV1', complete: true, threadsPartial: false }], conversations: [], messages: [] };
+  ingest(db, account, snap, { now: () => Date.parse('2026-11-19T00:00:00Z') });
+  const rows = listComments(db, {}).items ?? listComments(db, {});
+  const list = Array.isArray(rows) ? rows : rows.comments;
+  if (!list?.length) throw new Error('评论没入库');
+  const t = getCommentThread(db, 'Bili:c1');
+  if (!t) throw new Error('取不到楼');
+  const s3 = db.prepare('SELECT count(*) n FROM works').get().n;
+  if (s3 !== 1) throw new Error(`S3 works 行数变了：${s3}`);
+  const cols = db.prepare('PRAGMA table_info(works)').all().map((c) => c.name);
+  if (!cols.includes('postId') || cols.includes('nativeId')) throw new Error('S3 works 表结构被改了');
+  db.close();
+});

@@ -1,9 +1,9 @@
 // S6a 评论私信、事件发件箱、订阅、抓取任务的表。都是 IF NOT EXISTS，重复跑不动已有数据。
 // 主键一律存拼好的 <platformCode>:<原生 id>；时间一律 ISO 字符串（UTC）。
-// works 只填基本信息，指标列（metrics、metricsAt）留给 S3。
+// engage_works：评论所属作品的基本信息（S6a 自己的表）。S3（KIN-328）的作品和指标在 works 表（src/ops/works-db.mjs），两张表同库不同名，互不覆盖。
 export function migrateEngage(db) {
   db.exec(`
-CREATE TABLE IF NOT EXISTS works (
+CREATE TABLE IF NOT EXISTS engage_works (
   id TEXT PRIMARY KEY, accountId TEXT NOT NULL, platformCode TEXT NOT NULL, nativeId TEXT NOT NULL,
   title TEXT, url TEXT, postTime TEXT,
   status TEXT NOT NULL DEFAULT 'unknown', visibility TEXT NOT NULL DEFAULT 'unknown',
