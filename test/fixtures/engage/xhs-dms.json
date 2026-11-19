@@ -1,0 +1,421 @@
+{
+ "kind": "dms",
+ "chats": [
+  {
+   "chat_user_id": "user_534e71a8",
+   "user_id": "user_de0cde99",
+   "last_msg_time": 1795070459000,
+   "last_msg_content": "<已脱敏>",
+   "info": {
+    "nickname": "user_a62522a3",
+    "is_official": false,
+    "is_brand": false
+   }
+  },
+  {
+   "chat_user_id": "user_86e62543",
+   "user_id": "user_de0cde99",
+   "last_msg_time": 1794975110000,
+   "last_msg_content": "<已脱敏>",
+   "info": {
+    "nickname": "user_67ea7965",
+    "is_official": false,
+    "is_brand": false
+   }
+  },
+  {
+   "chat_user_id": "user_cf72d7bd",
+   "user_id": "user_de0cde99",
+   "last_msg_time": 1792724820000,
+   "last_msg_content": "<已脱敏>",
+   "info": {
+    "nickname": "user_7243b6e2",
+    "is_official": false,
+    "is_brand": true
+   }
+  },
+  {
+   "chat_user_id": "user_f4800048",
+   "user_id": "user_de0cde99",
+   "last_msg_time": 1790937488000,
+   "last_msg_content": "<已脱敏>",
+   "info": {
+    "nickname": "user_0aa7beaf",
+    "is_official": false,
+    "is_brand": false
+   }
+  },
+  {
+   "chat_user_id": "user_f05d5380",
+   "user_id": "user_de0cde99",
+   "last_msg_time": 1789824938000,
+   "last_msg_content": "<已脱敏>",
+   "info": {
+    "nickname": "user_d76bf911",
+    "is_official": false,
+    "is_brand": false
+   }
+  },
+  {
+   "chat_user_id": "user_b262e4ea",
+   "user_id": "user_de0cde99",
+   "last_msg_time": 1788231021000,
+   "last_msg_content": "<已脱敏>",
+   "info": {
+    "nickname": "user_e6caee46",
+    "is_official": false,
+    "is_brand": false
+   }
+  },
+  {
+   "chat_user_id": "user_c77c3a7b",
+   "user_id": "user_de0cde99",
+   "last_msg_time": 1786160038000,
+   "last_msg_content": "<已脱敏>",
+   "info": {
+    "nickname": "user_18ff407c",
+    "is_official": false,
+    "is_brand": false
+   }
+  }
+ ],
+ "unread": {
+  "user_86e62543": 0,
+  "user_f4800048": 0,
+  "user_534e71a8": 1,
+  "user_b262e4ea": 0,
+  "user_f05d5380": 0,
+  "user_cf72d7bd": 0,
+  "user_c77c3a7b": 0
+ },
+ "histories": [
+  {
+   "chat_user_id": "user_534e71a8",
+   "messages": [
+    {
+     "id": "user_de0cde99.user_534e71a8.1eafe99fb06b9a8",
+     "sender_id": "user_534e71a8",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1795070459341,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    }
+   ]
+  },
+  {
+   "chat_user_id": "user_86e62543",
+   "messages": [
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd258506ab8f",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794975109707,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":25,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd25824143f1",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_86e62543",
+     "created_at": 1794975106880,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd1e450cf40e",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794973253612,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd1df00cebfd",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794973168861,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd1ded536ee9",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794973165564,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd1de541a0b1",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794973157898,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd1de4536757",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794973156470,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd178345910f",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_86e62543",
+     "created_at": 1794971522474,
+     "content": "{\"content\":\"\",\"content_type\":0,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd178241734b",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_86e62543",
+     "created_at": 1794971522472,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd0db5537409",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794969013389,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_86e62543.1eafd0db00cee3c",
+     "sender_id": "user_86e62543",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1794969008439,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    }
+   ]
+  },
+  {
+   "chat_user_id": "user_cf72d7bd",
+   "messages": [
+    {
+     "id": "user_de0cde99.user_cf72d7bd.1eadacf5355c3ff",
+     "sender_id": "user_cf72d7bd",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1792724819561,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_cf72d7bd.1eadacf5355c3f1",
+     "sender_id": "user_cf72d7bd",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1792724819474,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    }
+   ]
+  },
+  {
+   "chat_user_id": "user_f4800048",
+   "messages": [
+    {
+     "id": "user_de0cde99.user_f4800048.1eabf898f2967fd",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1790937487707,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea59fb622a930f",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1784281954846,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea5227992bf395",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1783768985078,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea3cc41c0ba9af",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1782367260543,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea36452d381bf7",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1781941549576,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea3536e83f7bdc",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1781872360699,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea3536e52cac16",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1781872357823,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea3536e22ca9e7",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1781872354374,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea353607383187",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1781872135712,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea3535fc4303b2",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1781872124528,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea351fe5346092",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1781866469361,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea351fdf2b18e2",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1781866463347,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea34ed04431c97",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1781853444939,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea2502fb279a68",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1780810491487,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea24cde7382f53",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1780796903116,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea17c8cf2aa6eb",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1779943631435,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea15d2e54f6fbb",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1779815141856,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea12f7b14bc0f9",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1779627953744,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1ea10028a2ae853",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1779434121997,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":3,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feaff02ae8c8",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1778298864641,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":2,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feaea53463c6",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1778298533444,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feaea10905db",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1778298529658,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feae914c6d95",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1778298513043,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feae280e6469",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1778298408011,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feae1a4ccf18",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1778298394859,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feae104bea17",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1778298384139,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9fead752aaba2",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1778298229943,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9fead6109a6fd",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1778298209234,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9fead5627aa3b",
+     "sender_id": "user_de0cde99",
+     "receiver_id": "user_f4800048",
+     "created_at": 1778298198023,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":1,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    },
+    {
+     "id": "user_de0cde99.user_f4800048.1e9feac88383790",
+     "sender_id": "user_f4800048",
+     "receiver_id": "user_de0cde99",
+     "created_at": 1778297992704,
+     "content": "{\"content\":\"<已脱敏>\",\"content_type\":2,\"not_front_chain\":false,\"not_unread_count\":false,\"front_chain\":\"<已脱敏>\"}"
+    }
+   ]
+  }
+ ]
+}

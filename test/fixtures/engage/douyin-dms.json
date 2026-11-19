@@ -1,0 +1,141 @@
+{
+ "kind": "dms",
+ "conversations": [
+  {
+   "id": "0:1:user_68f33f7a:user_bc36c1cb",
+   "shortId": "user_66b6de76",
+   "toParticipantUserId": "user_bc36c1cb",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 1,
+   "name": "user_13f4b479",
+   "lastMessage": {
+    "serverId": "7709792174729070130",
+    "clientMessageId": null,
+    "type": 8,
+    "isFromMe": false,
+    "createdAt": "1795075878978",
+    "content": "{\"ai_ext\":\"<已脱敏>\",\"anchor_info\":{},\"aweType\":800,\"awemeType\":0,\"content_name\":\"<已脱敏>\",\"content_thumb\":{\"uri\":\"<已脱敏>\",\"url_list\":[\"<已脱敏>\"]},\"content_title\":\"<已脱敏>\",\"cover_height\":1280,\"cover_url\":{\"uri\":\"<已脱敏>\",\"url_list\":[\"<已脱敏>\",\"<已脱敏>\",\"<已脱敏>\",\"<已脱敏>\",\"<已脱敏>\"]},\"cover_width\":720,\"create_id\":\"\",\"ecom_share_track_params\":\"\",\"hot_spot_create_time\":1795075878,\"is_aigc\":false,\"is_hot_spot_video\":false,\"is_live_photo\":0,\"is_slides\":false,\"is_story\":false,\"is_text\":0,\"itemId\":\"<已脱敏>\",\"long_video_info\":{},\"pineapple\":\"<已脱敏>\",\"poi_track_params\":{\"poi_backend_type\":\"\",\"poi_city\":\"\",\"poi_device_samecity\":\"<已脱敏>\",\"poi_id\":\"\",\"product_backend_type\":\"\"},\"profile_uid\":\"\",\"publish_way\":0,\"scene_type\":0,\"secUID\":\"<已脱敏>\",\"send_source\":\"\",\"share_id\":\"<已脱敏>\",\"share_info\":[],\"share_with_timestamp\":0,\"uid\":\"<已脱敏>\"}"
+   }
+  },
+  {
+   "id": "0:1:user_68f33f7a:user_2051ce09",
+   "shortId": "user_a965bb5c",
+   "toParticipantUserId": "user_2051ce09",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 0,
+   "name": "user_eb0d5884",
+   "lastMessage": {
+    "serverId": "7709023275355063866",
+    "clientMessageId": null,
+    "type": 7,
+    "isFromMe": false,
+    "createdAt": "1794896857024",
+    "content": "{\"ai_ext\":\"<已脱敏>\",\"scene\":\"\",\"aweType\":0,\"related_share_video\":{},\"mention_users\":[],\"text\":\"<已脱敏>\",\"richTextInfos\":[]}"
+   }
+  },
+  {
+   "id": "0:1:user_87293d55:user_68f33f7a",
+   "shortId": "user_d03a751d",
+   "toParticipantUserId": "user_87293d55",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 0,
+   "name": "user_286bcc0a",
+   "lastMessage": {
+    "serverId": "7708673509300700687",
+    "clientMessageId": null,
+    "type": 7,
+    "isFromMe": true,
+    "createdAt": "1794815420971",
+    "content": "{\"text\":\"<已脱敏>\",\"aweType\":700,\"mention_users\":[],\"richTextInfos\":[],\"type\":0}"
+   }
+  },
+  {
+   "id": "0:1:user_68f33f7a:user_7fa8f7b3",
+   "shortId": "user_8e6d9281",
+   "toParticipantUserId": "user_7fa8f7b3",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 0,
+   "name": "user_01715a7b",
+   "lastMessage": {
+    "serverId": "7708673492166526522",
+    "clientMessageId": null,
+    "type": 7,
+    "isFromMe": true,
+    "createdAt": "1794815418049",
+    "content": "{\"text\":\"<已脱敏>\",\"aweType\":700,\"mention_users\":[],\"richTextInfos\":[],\"type\":0}"
+   }
+  },
+  {
+   "id": "0:1:user_12f6a395:user_68f33f7a",
+   "shortId": "user_4fe90008",
+   "toParticipantUserId": "user_12f6a395",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 0,
+   "name": "user_30ba313b",
+   "lastMessage": {
+    "serverId": "7708673491398968890",
+    "clientMessageId": null,
+    "type": 7,
+    "isFromMe": true,
+    "createdAt": "1794815416175",
+    "content": "{\"text\":\"<已脱敏>\",\"aweType\":700,\"mention_users\":[],\"richTextInfos\":[],\"type\":0}"
+   }
+  },
+  {
+   "id": "0:1:user_3c69c5c7:user_68f33f7a",
+   "shortId": "user_27384b7a",
+   "toParticipantUserId": "user_3c69c5c7",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 0,
+   "name": "user_62f79721",
+   "lastMessage": {
+    "serverId": "7707897173699806769",
+    "clientMessageId": null,
+    "type": 7,
+    "isFromMe": false,
+    "createdAt": "1794634664490",
+    "content": "{\"ai_ext\":\"<已脱敏>\",\"scene\":\"\",\"aweType\":0,\"related_share_video\":{},\"mention_users\":[],\"text\":\"<已脱敏>\",\"richTextInfos\":[]}"
+   }
+  },
+  {
+   "id": "0:1:user_68f33f7a:user_2fcbed65",
+   "shortId": "user_2c8bfc24",
+   "toParticipantUserId": "user_2fcbed65",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 0,
+   "name": "user_3b0b845f",
+   "lastMessage": {
+    "serverId": "7707196268715886137",
+    "clientMessageId": null,
+    "type": 7,
+    "isFromMe": true,
+    "createdAt": "1794471474725",
+    "content": "{\"text\":\"<已脱敏>\",\"aweType\":700,\"mention_users\":[],\"richTextInfos\":[],\"type\":0}"
+   }
+  },
+  {
+   "id": "0:1:user_872a60ee:user_68f33f7a",
+   "shortId": "user_e8f73017",
+   "toParticipantUserId": "user_872a60ee",
+   "isStrangerChat": false,
+   "isGroupChat": false,
+   "unreadCount": 0,
+   "name": "user_1f762561",
+   "lastMessage": {
+    "serverId": "7707166106884916793",
+    "clientMessageId": null,
+    "type": 7,
+    "isFromMe": false,
+    "createdAt": "1794464453359",
+    "content": "{\"ai_ext\":\"<已脱敏>\",\"scene\":\"\",\"aweType\":0,\"related_share_video\":{},\"mention_users\":[],\"text\":\"<已脱敏>\",\"richTextInfos\":[]}"
+   }
+  }
+ ]
+}
