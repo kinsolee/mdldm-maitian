@@ -13,8 +13,8 @@ export const USAGE = `用法：hub ops <子命令>
   accounts list [--json]                       列出账号、登录状态、能力位
   accounts set-uid <platformCode> <uid>        给 uid 还是 pending 的账号登记真实 uid（space 名跟着改）
   accounts set-cap <账号id> <能力位> <true|false>   开关能力位（账号 id 写 <platformCode>:<uid>）
-  login --check [--platform <code>] [--json]   只读检测登录、核对 uid
-  login <platformCode|账号id>                  打开登录页交给负责人扫码，交还后自动检测一次
+  login --check [--platform <code>] [--json]   只读检测登录、核对 uid（--check 不接位置参数，平台用 --platform）
+  login <platformCode|账号id>                  打开登录页交给负责人扫码，交还后自动检测一次（不接 --platform）
   tokens init                                  生成写入口令到仓库根目录 .env（已有的不动，不打印口令值）
 
 login 的退出码：0 全部检测完（含 out、unknown）；2 有账号 UID 不符（硬停）；1 有检测失败（runner 失败、结果结构不对、已登录但没读到 uid）；
@@ -56,6 +56,10 @@ export async function main(argv = process.argv.slice(2)) {
     }
   }
   if (group === 'login') {
+    const bad = values.check
+      ? (positionals.length ? `--check 不接位置参数（收到 ${positionals.map((p) => JSON.stringify(p)).join(' ')}），平台用 --platform` : values.platform === '' ? '--platform 不能是空串' : null)
+      : values.platform !== undefined ? '扫码登录不接 --platform，写 hub ops login <platformCode|账号id>' : null;
+    if (bad) { console.error(`${bad}\n${USAGE}`); return 1; }
     const r = values.check
       ? await checkLogins(db, values.platform ? { platform: values.platform } : {})
       : positionals[0] ? await scanLogin(db, positionals[0]) : null;

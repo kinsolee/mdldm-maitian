@@ -68,6 +68,36 @@ describe('hub ops 命令行（没有 config.json）', () => {
   });
 });
 
+describe('hub ops login 参数校验（空库，不应走到 runner）', () => {
+  for (const [label, args, why] of [
+    ['--check 带位置参数', ['login', '--check', 'Douyin', '--json'], /--check 不接位置参数/],
+    ['--check --platform 空串', ['login', '--check', '--platform', '', '--json'], /--platform/],
+    ['扫码登录带 --platform', ['login', 'Douyin', '--platform', 'X', '--json'], /--platform/],
+  ]) {
+    test(`${label}：退出码 1，stderr 有说明和用法，没调用 checkLogins/scanLogin`, () => {
+      const { hub } = sandbox();
+      const r = hub(...args);
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      assert.match(r.stderr, why);
+      assert.match(r.stderr, /用法/);
+      assert.equal(r.stdout, '', '走到 checkLogins 时 --json 会在 stdout 打出结果');
+      assert.doesNotMatch(r.stderr, /没有这个账号|出错/, '走到 scanLogin 会报没有这个账号');
+    });
+  }
+
+  test('用法写明 --check 不接位置参数，平台用 --platform', () => {
+    const { hub } = sandbox();
+    assert.match(hub('help').stdout, /--check 不接位置参数，平台用 --platform/);
+  });
+
+  test('合法写法 login --check 在空库上照常跑完（退出码 0）', () => {
+    const { hub } = sandbox();
+    const r = hub('login', '--check', '--json');
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout).rows, []);
+  });
+});
+
 describe('默认飞书提醒（defaultNotify）', () => {
   const LOGIN = pathToFileURL(path.join(ROOT, 'src', 'ops', 'login.mjs')).href;
   const run = (env) => promisify(execFile)(process.execPath, ['--input-type=module', '-e',

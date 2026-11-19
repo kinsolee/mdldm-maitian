@@ -40,6 +40,7 @@ export function exitCodeOf(rows) {
 }
 
 const loadRunner = async () => (await import('../ego-runner/index.mjs')).runEgoTask;
+const lazyFinish = async (...args) => (await import('../ego-runner/index.mjs')).finishSpace(...args);
 
 // 默认通知：feishu.mjs 在没有 config.json 时会 process.exit，所以先看配置在不在，再动态 import。
 // 不用 feishu.mjs 的 notify：它吞掉失败、不返回结果。这里照它的消息体自己发（先卡片，飞书返回 code 非 0 时退回纯文字），
@@ -91,7 +92,15 @@ async function alert(db, a, text, { notify, now }) {
   return true;
 }
 
-async function checkOne(db, a, { runTask, notify, now, siteAdmin }) {
+// pending 登记成真实 uid 后，旧的 kinso/<平台>/pending space 没人用了，关掉；关没关成只写进 message
+async function closeOld(finishTask, a) {
+  try {
+    const f = await finishTask(a.spaceName, { profileId: a.profileId });
+    return f?.ok ? `旧 space ${a.spaceName} 已关` : `旧 space ${a.spaceName} 没关：${f?.reason ?? '没返回原因'}`;
+  } catch (e) { return `旧 space ${a.spaceName} 没关：${e.message}`; }
+}
+
+async function checkOne(db, a, { runTask, finishTask, notify, now, siteAdmin }) {
   const row = { id: a.id, platformCode: a.platformCode, platformName: a.platformName };
   const at = new Date(now()).toISOString();
   const home = homeOf(a, siteAdmin);
@@ -131,7 +140,7 @@ async function checkOne(db, a, { runTask, notify, now, siteAdmin }) {
   let id = a.id, message = evidence;
   if (state === 'ok' && a.uid === PENDING) {
     id = migrateUid(db, a.platformCode, PENDING, seen);
-    message = `登记了真实 uid ${seen}（space 改为 kinso/${a.platformCode}/${seen}）；${evidence}`;
+    message = `登记了真实 uid ${seen}（space 改为 kinso/${a.platformCode}/${seen}，${await closeOld(finishTask, a)}）；${evidence}`;
   }
   let cur = getAccount(db, id);
   save(db, cur, { loginState: state, evidence, at });
@@ -146,11 +155,11 @@ async function checkOne(db, a, { runTask, notify, now, siteAdmin }) {
 
 /**
  * hub ops login --check：逐个账号检测（只读）。返回 { rows, exitCode }。
- * opts: platform | platforms | ids；runTask（默认 runEgoTask）；notify（默认飞书）；now；siteAdmin（默认读 config.json）。
+ * opts: platform | platforms | ids；runTask（默认 runEgoTask）；finishTask（默认 finishSpace，pending 迁移后关旧 space）；notify（默认飞书）；now；siteAdmin（默认读 config.json）。
  */
 export async function checkLogins(db, opts = {}) {
   const runTask = opts.runTask ?? (await loadRunner());
-  const ctx = { runTask, notify: opts.notify ?? defaultNotify, now: opts.now ?? Date.now, siteAdmin: 'siteAdmin' in opts ? opts.siteAdmin : configuredSiteAdmin() };
+  const ctx = { runTask, finishTask: opts.finishTask ?? lazyFinish, notify: opts.notify ?? defaultNotify, now: opts.now ?? Date.now, siteAdmin: 'siteAdmin' in opts ? opts.siteAdmin : configuredSiteAdmin() };
   const rows = [];
   for (const a of selectAccounts(db, opts)) rows.push(await checkOne(db, a, ctx));
   return { rows, exitCode: exitCodeOf(rows) };
@@ -184,7 +193,7 @@ export async function scanLogin(db, target, opts = {}) {
   const start = now();
   for (;;) {
     await sleep(pollMs);
-    const r = await checkLogins(db, { ids: [a.id], runTask, notify: opts.notify, now, siteAdmin });
+    const r = await checkLogins(db, { ids: [a.id], runTask, finishTask: opts.finishTask, notify: opts.notify, now, siteAdmin });
     const waiting = r.rows[0]?.skipped === 'user-controlled' || r.rows[0]?.skipped === 'busy';
     if (!waiting) return r;
     if (now() - start >= maxWaitMs) return { exitCode: 4, rows: [{ ...r.rows[0], message: `等了 ${Math.round(maxWaitMs / 60000)} 分钟，space 还在负责人手里；交还后跑 hub ops login --check --platform ${a.platformCode}` }] };
