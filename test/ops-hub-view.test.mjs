@@ -76,7 +76,9 @@ describe('旧采集（saveFollowers）不覆盖 ops 行', () => {
       const t = today();
       const ins = db.prepare("INSERT INTO followers (day, platform, total, gain, loss, source, collected_at) VALUES (?, 'douyin', ?, null, null, ?, 'x')");
       ins.run(t, 500, 'ops'); ins.run('2026-01-02', 300, 'ops'); ins.run('2026-01-03', 1, 'backfill');
-      saveFollowers('douyin', { total: 1, history: [{ day: '2026-01-02', total: 2 }, { day: '2026-01-03', total: 3 }, { day: '2026-01-04', total: 4 }] });
+      const n = saveFollowers('douyin', { total: 1, history: [{ day: '2026-01-02', total: 2 }, { day: '2026-01-03', total: 3 }, { day: '2026-01-04', total: 4 }] });
+      // saveFollowers 不再预查 ops，只靠 upsert 的 WHERE：ops 的 2026-01-02 不算进补写条数
+      if (n !== 2) throw new Error('补写条数应为 2，实际 ' + n);
       saveFollowers('bilibili', { total: 8, history: [] });
       console.log(JSON.stringify(db.prepare('SELECT day, platform, total, source FROM followers ORDER BY platform, day').all().map((r) => ({ ...r, day: r.day === t ? 'today' : r.day }))));`;
     const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8',

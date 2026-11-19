@@ -61,19 +61,19 @@ export const followerCollectors = {
 };
 
 const up = db.prepare(`INSERT INTO followers (day, platform, total, gain, loss, source, collected_at) VALUES (?,?,?,?,?,?,?)
-  ON CONFLICT(day, platform) DO UPDATE SET total=excluded.total, gain=COALESCE(excluded.gain, gain), loss=COALESCE(excluded.loss, loss), source=excluded.source, collected_at=excluded.collected_at`);
+  ON CONFLICT(day, platform) DO UPDATE SET total=excluded.total, gain=COALESCE(excluded.gain, gain), loss=COALESCE(excluded.loss, loss), source=excluded.source, collected_at=excluded.collected_at
+  WHERE followers.source IS NOT 'ops'`);   // hub ops 同步来的行（KIN-330）旧采集一律不覆盖：保护写在 upsert 里，不靠先查再写（中间可能被同步改成 ops）
 const has = db.prepare(`SELECT source FROM followers WHERE day=? AND platform=?`);
 
-// 存今天的实测值；历史只补还没有实测值的日子。hub ops 同步来的（source=ops，KIN-330）一律不覆盖
-const src = (day, platform) => (has.get(day, platform) || {}).source;
+// 存今天的实测值；历史只补还没有实测值的日子（source=ops 的行由 up 的 WHERE 挡住）
 export function saveFollowers(platform, r) {
   const now = new Date().toISOString(), t = today();
-  if (src(t, platform) !== 'ops') up.run(t, platform, r.total, null, null, 'live', now);
+  up.run(t, platform, r.total, null, null, 'live', now);
   let hist = (r.history || []).filter(h => h.day < t).sort((a, b) => a.day < b.day ? 1 : -1), n = 0;
   if (hist.length && hist[0].total == null) {   // 只有每日净增：从今天的总数往回推每天结束时的总数（今天的净增取平台给的当日数，没有就按 0 算）
     let run = r.total - (r.todayNet || 0); for (const h of hist) { h.total = run; run -= h.net || 0; }
   }
-  for (const h of hist) { if (h.total == null || ['live', 'ops'].includes(src(h.day, platform))) continue; up.run(h.day, platform, h.total, h.gain ?? (h.net > 0 ? h.net : null), h.loss ?? null, 'backfill', now); n++; }
+  for (const h of hist) { if (h.total == null || (has.get(h.day, platform) || {}).source === 'live') continue; n += Number(up.run(h.day, platform, h.total, h.gain ?? (h.net > 0 ? h.net : null), h.loss ?? null, 'backfill', now).changes); }
   return n;
 }
 export async function collectFollowers(only, skip = []) {
