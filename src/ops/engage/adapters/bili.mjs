@@ -29,8 +29,9 @@ export async function runInSpace(task, params) {
   const nav = await get(`${API}/x/web-interface/nav`);
   if (nav.code === -101 || !nav.data?.isLogin) return { loginLost: true, evidence: `x/web-interface/nav code=${nav.code} isLogin=${nav.data?.isLogin}` };
   const me = { mid: String(nav.data.mid) };
-  if (params.kind === 'dms') return { kind: 'dms', me, ...(await rawDms(get, o)) };
-  return { kind: 'comments', me, ...(await rawComments(get, o)) };
+  const uidSeen = me.mid;
+  if (params.kind === 'dms') return { kind: 'dms', uidSeen, me, ...(await rawDms(get, o)) };
+  return { kind: 'comments', uidSeen, me, ...(await rawComments(get, o)) };
 }
 
 const slimMember = (m) => (m ? { mid: String(m.mid), uname: m.uname } : null);
@@ -42,7 +43,7 @@ function slimReply(x) {
     ...(parent_info ? { parent_info: { rpid: parent_info.rpid, member: slimMember(parent_info.member) } } : {}) };
 }
 
-async function rawComments(get, o) {
+export async function rawComments(get, o) {
   const since = (o.since ? Date.parse(o.since) : o.now - 7 * 86400_000) / 1000;
   const pages = [];
   let reachedEnd = false;
@@ -51,7 +52,9 @@ async function rawComments(get, o) {
     if (j.code !== 0) throw new Error(`up/fulllist code=${j.code} ${j.message ?? ''}`);
     const list = j.data?.list ?? [];
     pages.push({ code: j.code, data: { page: j.data?.page, list: list.map(slimReply) } });
-    if (list.length < 20 || pn * 20 >= (j.data?.page?.total ?? 0)) { reachedEnd = true; break; }
+    // G-B6a：total 缺失时不能拿 0 比，只有不满一页、或 total 是数字且已翻够才算到底
+    const total = j.data?.page?.total;
+    if (list.length < 20 || (Number.isFinite(total) && pn * 20 >= total)) { reachedEnd = true; break; }
     await sleep(o.gapMs);
   }
   const all = pages.flatMap((p) => p.data.list);
@@ -61,14 +64,19 @@ async function rawComments(get, o) {
   const threads = [];
   for (const [root, oid] of [...roots].slice(0, o.maxThreads)) {
     const t = { oid, root, pages: [], ok: true };
+    let done = false;
     for (let pn = 1; pn <= 10; pn++) {
       const j = await get(`${API}/x/v2/reply/reply?oid=${oid}&type=1&root=${root}&ps=20&pn=${pn}`);
-      if (j.code !== 0) { t.ok = false; t.error = `reply/reply code=${j.code}`; break; }
+      if (j.code !== 0) { t.ok = false; t.error = `reply/reply code=${j.code}`; done = true; break; }
       const rs = j.data?.replies ?? [];
+      const count = j.data?.page?.count;
+      if (rs.length < 20 || (Number.isFinite(count) && pn * 20 >= count)) done = true;
       t.pages.push({ code: 0, data: { page: j.data?.page, root: slimReply(j.data?.root), replies: rs.map(slimReply), upper: j.data?.upper ? { mid: j.data.upper.mid, top: j.data.upper.top ? { rpid: j.data.upper.top.rpid } : null } : null } });
-      if (rs.length < 20) break;
+      if (done) break;
       await sleep(o.gapMs);
     }
+    // G-B6b：翻满 10 页还没到底，这一楼拿不全
+    if (!done) { t.ok = false; t.error = 'reply/reply 翻满 10 页还没到底'; }
     threads.push(t);
     await sleep(o.gapMs);
   }
@@ -132,11 +140,13 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
   };
   for (const p of raw.fulllist) for (const x of p.data.list) add(x);
   const oidToBvid = new Map([...byId.values()].map((x) => [String(x.oid), x.bvid]));
-  let threadsPartial = !!raw.threadsCut;
+  // 拉不全的楼只影响它所在的作品；楼数超上限（threadsCut）时不知道砍掉的是哪个作品的，全部算拿不全
+  const allPartial = !!raw.threadsCut;
+  const badWorks = new Set();
   const pinnedIds = new Set();
   for (const t of raw.threads) {
-    if (!t.ok) threadsPartial = true;
     const bvid = oidToBvid.get(String(t.oid));
+    if (!t.ok) badWorks.add(bvid ?? String(t.oid));
     for (const p of t.pages) {
       add(p.data.root, bvid);
       for (const r of p.data.replies) add(r, bvid);
@@ -167,7 +177,7 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     const any = [...byId.values()].find((x) => x.bvid === b);
     return { nativeId: b, title: v?.title ?? any?.title ?? null, url: /^BV/.test(b) ? `https://www.bilibili.com/video/${b}` : null, postTime: isoOf(v?.pubdate) };
   });
-  const scannedWorks = bvids.map((b) => ({ workNativeId: b, complete: !!raw.reachedEnd && !threadsPartial, threadsPartial }));
+  const scannedWorks = bvids.map((b) => { const threadsPartial = allPartial || badWorks.has(b); return { workNativeId: b, complete: !!raw.reachedEnd && !threadsPartial, threadsPartial }; });
   return okResult({ platformCode: 'Bili', accountUid: me, kind: 'comments', fetchedAt, works, comments, scannedWorks });
 }
 

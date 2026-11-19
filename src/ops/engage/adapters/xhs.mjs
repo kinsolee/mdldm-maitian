@@ -26,7 +26,19 @@ export async function runInSpace(task, params) {
   await sleep(5000);
   const login = await atLogin(page);
   if (login) return { loginLost: true, evidence: `页面在 ${login}` };
-  return params.kind === 'dms' ? rawDms(page, o) : rawComments(page, o);
+  const raw = await (params.kind === 'dms' ? rawDms(page, o) : rawComments(page, o));
+  return raw.kind ? { ...raw, uidSeen: await selfUid(page, raw) } : raw;
+}
+
+// G-B7：当前登录用户 id。只用页面自己已经发的请求或页面状态，不另外调接口：
+// user/me 响应（主站加载时自己发）→ 页面 __INITIAL_STATE__.user.userInfo → 私信会话列表里的 user_id（自己）
+async function selfUid(page, raw) {
+  const me = (await jsons(page, 'user/me')).map((c) => c.json?.data).find((d) => d && (d.user_id || d.userId));
+  if (me) return String(me.user_id ?? me.userId);
+  const st = await page.evaluate(() => { try { const v = (x) => (x && typeof x === 'object' && ('_value' in x || '_rawValue' in x) ? x._value ?? x._rawValue : x); const u = v(window.__INITIAL_STATE__?.user?.userInfo); return u?.user_id ?? u?.userId ?? null; } catch { return null; } });
+  if (st) return String(st);
+  const self = [...new Set((raw.chats ?? []).map((c) => c.user_id).filter(Boolean))];
+  return self.length === 1 ? String(self[0]) : null;
 }
 
 const jsons = async (page, re, from = 0) => (await captured(page, re, from)).map((c) => ({ url: c.url, json: bigJson(c.body) })).filter((c) => c.json);
@@ -117,9 +129,9 @@ async function rawDms(page, o) {
     let h = null;
     for (const end = Date.now() + 15000; !h && Date.now() < end; await sleep(1000)) h = (await jsons(page, re)).find((x) => urlParam(x.url, 'chat_user_id') === c.chat_user_id) ?? null;
     if (!h) { tried.push('no-history'); continue; }
-    tried.push('ok');
+    tried.push(h.json.code === 0 ? 'ok' : `code=${h.json.code}`);
     const msgs = h.json.data?.out_message_list ?? h.json.data?.message_list ?? [];
-    histories.push({ chat_user_id: c.chat_user_id, messages: msgs.map((m) => ({ id: m.id, sender_id: m.sender_id, receiver_id: m.receiver_id, created_at: m.created_at, content: m.content })) });
+    histories.push({ chat_user_id: c.chat_user_id, code: h.json.code ?? null, messages: msgs.map((m) => ({ id: m.id, sender_id: m.sender_id, receiver_id: m.receiver_id, created_at: m.created_at, content: m.content })) });
     await sleep(800);
   }
   const slim = [...chats.values()].map((c) => ({ chat_user_id: c.chat_user_id, user_id: c.user_id, last_msg_time: c.last_msg_time, last_msg_content: c.last_msg_content,
@@ -218,13 +230,14 @@ export function parseDms(raw, { accountUid, fetchedAt, since = null }) {
   if (!codes.length) adapterFail('no-data', '没抓到 api/im/web/v3/chats');
   if (!codes.includes(0)) adapterFail('api-error', `api/im/web/v3/chats code=${[...new Set(codes)].join(',')}`);
   if (!Array.isArray(raw.chats)) adapterFail('parse', 'api/im/web/v3/chats 的 chats 不是数组');
-  const hist = new Map(raw.histories.filter((h) => h.chat_user_id).map((h) => [h.chat_user_id, h.messages]));
+  // G-B3c：messages/history 只采信 code===0 且带消息数组的；打开了但失败的会话照常报，不给 messages、last 为 null
+  const opened = new Map(raw.histories.filter((h) => h.chat_user_id).map((h) => [h.chat_user_id, h.code === 0 && Array.isArray(h.messages) ? h.messages : null]));
   const conversations = [], messages = [];
   for (const c of raw.chats) {
     const id = String(c.chat_user_id);
-    const ms = hist.get(id);
+    const ms = opened.get(id) ?? null;
     // 没打开的会话判不出最后一句是谁说的：有 since 时它在 since 之后没有新消息，不报；没有 since 时 last 记 null
-    if (!ms && since) continue;
+    if (!opened.has(id) && since) continue;
     const official = !!c.info?.is_official;
     const sorted = [...(ms ?? [])].sort((a, b) => Number(b.created_at) - Number(a.created_at));
     const lm = sorted[0];

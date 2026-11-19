@@ -23,9 +23,13 @@ export async function runInSpace(task, params) {
   const auth = await page.fetch('/cgi-bin/mmfinderassistant-bin/auth/auth_data', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', timeout: 15000 }).catch(() => null);
   let a = null; try { a = JSON.parse(auth?.body ?? 'null'); } catch {}
   const login = await atLogin(page);
-  if (login || (a && a.errCode !== 0)) return { loginLost: true, evidence: `auth/auth_data errCode=${a?.errCode}；${login ? `页面在 ${login}` : '页面没跳登录'}` };
-  const me = { nickname: a?.data?.finderUser?.nickname ?? null };
-  return params.kind === 'dms' ? { kind: 'dms', me, ...(await rawDms(page, o)) } : { kind: 'comments', me, ...(await rawComments(page, o)) };
+  if (login || (a && a.errCode != null && a.errCode !== 0)) return { loginLost: true, evidence: `auth/auth_data errCode=${a?.errCode}；${login ? `页面在 ${login}` : '页面没跳登录'}` };
+  // G-B4b：没拿到自己的昵称就没法判 isMe（自己的回复会被当成新评论），不往下采
+  const fu = a?.data?.finderUser;
+  if (!a || !fu?.nickname) return { failed: 'auth-failed', error: `auth/auth_data ${!auth ? '请求失败或超时' : !a ? '不是 JSON' : `errCode=${a.errCode} 缺 finderUser.nickname`}` };
+  const me = { nickname: fu.nickname };
+  const uidSeen = fu.uniqId ?? null;
+  return params.kind === 'dms' ? { kind: 'dms', uidSeen, me, ...(await rawDms(page, o)) } : { kind: 'comments', uidSeen, me, ...(await rawComments(page, o)) };
 }
 
 const inShadow = (page, fnSrc, arg) => page.evaluate(new Function('arg', `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null; ${fnSrc}`), arg ?? null);
@@ -52,6 +56,7 @@ async function rawComments(page, o) {
   // X-B5：列表没出来时，只有页面明确显示空状态才算「没有作品」；否则 feeds=null，解析按 no-data 失败
   if (!(await waitShadow(page, '.comment-feed-wrap', o.waitMs))) return { feeds: (await emptyShown(page)) ? [] : null, emptyState: await emptyShown(page), works: [], note: '作品列表没出来' };
   const sinceSec = o.now / 1000 - o.maxAgeDays * 86400;
+  const windowStartSec = Math.floor(sinceSec);
   // 作品列表滚动懒加载：滚到最后一个，直到最早的早于窗口或不再变多
   let feeds = await inShadow(page, FEEDS_SRC);
   if (!Array.isArray(feeds)) return { feeds: null, works: [], note: '作品列表组件（commentFeeds）没找到' };
@@ -75,7 +80,7 @@ async function rawComments(page, o) {
     const left = await inShadow(page, `return [...sr.querySelectorAll('*')].filter((e) => e.children.length === 0 && /^展开更多回复$/.test(e.textContent.trim()) && e.getBoundingClientRect().height > 0).length;`);
     works.push({ objectNonce: f.objectNonce, opened: true, clicks, expandLeft: left ?? 0, items: await inShadow(page, ITEMS_SRC) });
   }
-  return { feeds, works };
+  return { windowStartSec, feeds, works };
 }
 
 async function rawDms(page, o) {
@@ -137,9 +142,19 @@ export function parseComments(raw, { accountUid, nickname, fetchedAt }) {
     });
     for (const x of thread) if (x.parentNativeId === null) x.replyCount = thread.filter((y) => y.rootNativeId === x.nativeId && y !== x).length;
     comments.push(...thread);
-    const seen = all;
-    const f2 = feeds.get(w.objectNonce);
-    scannedWorks.push({ workNativeId: String(w.objectNonce), complete: !more && seen.size >= (f2?.commentCount ?? 0), threadsPartial: more });
+    // G-B4c：commentCount 含二楼（S0 实测每个作品去重后的条数等于它）。不是数字不算拿全；读到的少于它算楼中楼拿不全
+    const count = f?.commentCount;
+    const known = typeof count === 'number' && Number.isFinite(count);
+    const short = known && all.size < count;
+    scannedWorks.push({ workNativeId: String(w.objectNonce), complete: known && !more && !short, threadsPartial: more || short });
+  }
+  // G-B11a：窗口内评论数为 0 的作品（列表本身读成功了）也算扫过、拿全，库里这个作品已删的评论才能标 goneAt
+  const scannedIds = new Set(scannedWorks.map((x) => x.workNativeId));
+  for (const f of raw.feeds) {
+    const id = String(f.objectNonce);
+    if (f.commentCount !== 0 || scannedIds.has(id) || raw.windowStartSec == null || !(Number(f.createTime) >= raw.windowStartSec)) continue;
+    works.push({ nativeId: id, title: titleOf(f), url: null, postTime: isoOf(f.createTime) });
+    scannedWorks.push({ workNativeId: id, complete: true, threadsPartial: false });
   }
   return okResult({ platformCode: 'Channels', accountUid, kind: 'comments', fetchedAt, works, comments, scannedWorks });
 }

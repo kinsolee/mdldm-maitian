@@ -168,6 +168,6 @@ test('U1 小红书私信：v3/chats 没有一页 code=0 → api-error；成功�
   const r = await run('XiaoHongShu', 'dms', { ...fixture('xhs-dms'), chatsCodes: [-1, 300013] });
   assert.deepEqual([r.ok, r.reason], [false, 'api-error']);
   assert.match(r.error, /v3\/chats/);
-  const empty = await run('XiaoHongShu', 'dms', { kind: 'dms', chatsCodes: [0], chats: [], unread: {}, histories: [] });
+  const empty = await run('XiaoHongShu', 'dms', { kind: 'dms', uidSeen: 'user_de0cde99', chatsCodes: [0], chats: [], unread: {}, histories: [] });
   assert.deepEqual([empty.ok, empty.conversations], [true, []]);
 });

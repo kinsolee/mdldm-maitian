@@ -26,7 +26,10 @@ export async function runInSpace(task, params) {
   const info = bigJson(String((await page.fetch('/web/api/media/user/info/', { timeout: 15000 }).catch(() => ({ body: '' }))).body));
   const login = await atLogin(page);
   if (login || info?.status_code === 8) return { loginLost: true, evidence: `GET /web/api/media/user/info/ status_code=${info?.status_code}；${login ? `页面在 ${login}` : '页面没跳登录'}` };
-  return params.kind === 'dms' ? { kind: 'dms', ...(await rawDms(page, o)) } : { kind: 'comments', ...(await rawComments(page, o)) };
+  // G-B5b/G-B7：user/info 读不到或非 0（又不是掉线）时不往下采；uid 交给 collect 核对账号
+  if (info?.status_code !== 0) return { failed: 'auth-failed', error: `GET /web/api/media/user/info/ ${info ? `status_code=${info.status_code}` : '请求失败或不是 JSON'}` };
+  const uidSeen = str(info.user?.uid ?? info.user_info?.uid);
+  return params.kind === 'dms' ? { kind: 'dms', uidSeen, ...(await rawDms(page, o)) } : { kind: 'comments', uidSeen, ...(await rawComments(page, o)) };
 }
 
 const slimUser = (u) => (u ? { uid: str(u.uid), nickname: u.nickname ?? '' } : null);
@@ -45,7 +48,8 @@ async function rawComments(page, o) {
     .map((x) => ({ item_id_plain: str(x.item_id_plain), title: x.title ?? null, create_time: x.create_time ?? null, comment_count: x.comment_count ?? 0 }));
   // 页面渲染很慢（实测 30 秒以上才出「选择作品」按钮）
   for (const end = Date.now() + o.loadMs; Date.now() < end; await sleep(1500)) if (await page.evaluate(new Function(`return !!(${PICKER_SRC})()`))) break;
-  const recent = items.filter((x) => x.comment_count > 0 && (publishedAt(x.create_time) ?? o.now) >= o.now - o.maxAgeDays * 86400_000).slice(0, o.maxWorks);
+  const windowStartMs = o.now - o.maxAgeDays * 86400_000;
+  const recent = items.filter((x) => x.comment_count > 0 && (publishedAt(x.create_time) ?? o.now) >= windowStartMs).slice(0, o.maxWorks);
   const works = [];
   for (const it of recent) {
     const from = await capCount(page);
@@ -73,7 +77,7 @@ async function rawComments(page, o) {
     const selectErrors = (await bodies(page, SELECT, from)).filter((j) => j.status_code !== 0).map((j) => ({ status_code: j.status_code ?? null }));
     works.push({ item_id_plain: it.item_id_plain, opened: true, clicks, expandLeft: left.length, expandLeftTexts: left, select, replies, selectErrors });
   }
-  return { itemListCodes, items, works };
+  return { itemListCodes, windowStartMs, items, works };
 }
 
 export const EXPAND_SRC = `() => { const re = /^(查看\\s*\\d+\\s*条回复|展开\\s*\\d*\\s*条?更多回复|展开更多)$/; return [...document.querySelectorAll('div, span, button')].filter((e) => re.test(e.textContent.trim()) && ![...e.children].some((c) => re.test(c.textContent.trim()))); }`;
@@ -136,6 +140,8 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
   const codes = raw.itemListCodes ?? [];
   if (!codes.length) adapterFail('no-data', '没抓到 /aweme/v1/creator/item/list');
   if (!codes.includes(0)) adapterFail('api-error', `/aweme/v1/creator/item/list status_code=${codes.join(',')}`);
+  // G-B5a：有近期作品要扫，却一个都没切过去（「选择作品」改版之类），不能报成功
+  if (raw.works.length && !raw.works.some((w) => w.opened)) adapterFail('no-data', `${raw.works.length} 个近期作品一个都没能切过去（「选择作品」或作品列表没找到）`);
   const items = new Map(raw.items.map((x) => [x.item_id_plain, x]));
   const works = [], comments = [], scannedWorks = [];
   const author = (u) => ({ uid: str(u?.uid), nickname: u?.nickname ?? '', isMe: str(u?.uid) === me });
@@ -169,6 +175,14 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     // has_more 必须明确是 0/false 才算翻到底
     const lastPage = lastSelect.has_more === 0 || lastSelect.has_more === false;
     scannedWorks.push({ workNativeId: wid, complete: lastPage && !partial, threadsPartial: partial });
+  }
+  // G-B11a：窗口内评论数为 0 的作品（作品列表接口成功）也算扫过、拿全，库里这个作品已删的评论才能标 goneAt
+  const scannedIds = new Set(scannedWorks.map((x) => x.workNativeId));
+  for (const it of raw.items) {
+    const id = String(it.item_id_plain), t = publishedAt(it.create_time);
+    if (Number(it.comment_count) !== 0 || scannedIds.has(id) || raw.windowStartMs == null || t == null || t < raw.windowStartMs) continue;
+    works.push({ nativeId: id, title: it.title ?? null, url: `https://www.douyin.com/video/${id}`, postTime: new Date(t).toISOString() });
+    scannedWorks.push({ workNativeId: id, complete: true, threadsPartial: false });
   }
   return okResult({ platformCode: 'Douyin', accountUid: me, kind: 'comments', fetchedAt, works, comments, scannedWorks });
 }

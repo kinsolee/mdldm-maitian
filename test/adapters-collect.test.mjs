@@ -36,7 +36,7 @@ test('其余异常：reason + error，error 里不带 cookie/token', async () =>
 });
 
 test('页面脚本抛错的结果结构不对：reason=parse', async () => {
-  const r = await collect({ account, kind: 'comments', runner: fakeRunner({ ok: true, result: { nothing: true } }) });
+  const r = await collect({ account, kind: 'comments', runner: fakeRunner({ ok: true, result: { nothing: true, uidSeen: '478358005' } }) });
   assert.deepEqual({ ok: r.ok, reason: r.reason }, { ok: false, reason: 'parse' });
 });
 

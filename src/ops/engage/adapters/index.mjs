@@ -4,6 +4,7 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { shapeErrors } from './shape.mjs';
+import { normalizeUid } from '../../accounts.mjs';
 import * as bili from './bili.mjs';
 import * as douyin from './douyin.mjs';
 import * as channels from './channels.mjs';
@@ -53,6 +54,10 @@ export async function collect({ account, kind, runner, now = Date.now, since = n
   const raw = r.result;
   if (raw?.loginLost) return fail('login-lost', raw.evidence || '页面落到了登录页');
   if (raw?.failed) return fail(raw.failed, raw.error);
+  // G-B7：页面上实际登录的必须是这个账号（同 src/ops/collect.mjs），不符或读不到都不入库
+  const seen = normalizeUid(raw?.uidSeen);
+  if (!seen) return fail('no-uid', `页面上没读到登录账号的 uid，没法核对（登记的是 ${account.uid}），没入库`);
+  if (seen !== String(account.uid)) return { ok: false, reason: 'uid-mismatch', uidSeen: seen, error: `UID 不符：登记的是 ${account.uid}，space ${account.spaceName} 里登录的是 ${seen}，没入库` };
   let out;
   try {
     out = adapter.parse(kind, raw, { accountUid: String(account.uid), nickname: account.nickname ?? null, fetchedAt: new Date(now()).toISOString(), since });
