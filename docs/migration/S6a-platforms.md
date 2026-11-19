@@ -70,7 +70,7 @@ KIN-323 dev-2。代码在 `src/ops/engage/adapters/`，入口 `collect({ account
 - runner 返回 `profile-rejected`（不是 Profile 5）：返回 `{ ok:false, reason:'profile-rejected' }`，按失败处理，不算跳过。
 - 页面脚本判断掉线：返回 `{ ok:false, reason:'login-lost' }`。页面脚本自己报的失败（如小红书 60 秒内没抓到接口）：返回 `{ ok:false, reason:'no-data' }`。解析出错或输出形状不对：返回 `{ ok:false, reason:'parse' }`。
 - 接口出错、数据读不到（评审第 1 轮 X-B3/X-B4/X-B5/X-B10/X-B11）：
-  - 整个 kind 失败（`reason:'api-error'` 或 `'no-data'`，error 带接口名和返回码）：抖音 `creator/item/list` 没抓到或全部 `status_code` 非 0；小红书 `you/mentions` 没有一页 `code=0`；视频号作品列表或私信会话列表的 Vue 数据读不到，或者为空但页面没显示「暂无…」空状态；B站 `fetch_session_msgs` 或 `account/v1/user/cards` 全部失败。
+  - 整个 kind 失败（`reason:'api-error'` 或 `'no-data'`，error 带接口名和返回码）：抖音 `creator/item/list` 没抓到或全部 `status_code` 非 0；小红书 `you/mentions` 没有一页 `code=0`；视频号作品列表或私信会话列表的 Vue 数据读不到，或者为空但页面没显示「暂无…」空状态；B站 `fetch_session_msgs` 或 `account/v1/user/cards` 全部失败；抖音私信 0 个会话且页面没显示空状态（`no-data`）；小红书私信 `api/im/web/v3/chats` 没有一页 `code=0`（`api-error`）。
   - 只这一个作品不算拿全（`complete:false, threadsPartial:true`，别的作品照常）：抖音这个作品的 `comment/list/select` 或 `comment/list/reply` 有任何一条 `status_code` 非 0，或最后一页没有明确的 `has_more=0`；小红书这篇笔记的 `comment/page` 有一页 `code` 非 0 或缺 `comments`（整楼数据不用，只用通知兜底），或 `comment/sub/page` 出错，或最后一页没有明确的 `has_more=false`；视频号打开的作品读不到评论组件。
   - B站单个会话的 `fetch_session_msgs` 失败：会话照常报，这个会话不给 messages（不拿空数组冒充「没有消息」）。
   - 小红书通知兜底只收抓取窗口内的通知：窗口是 `since`，没有就用页面脚本记下的 `windowStart`（默认近 7 天），通知最后一页带出的更早的通知不入库。

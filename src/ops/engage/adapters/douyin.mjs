@@ -109,7 +109,9 @@ async function rawDms(page, o) {
       lastMessage: lm ? { serverId: lm.serverId != null ? String(lm.serverId) : null, clientMessageId: lm.clientMessageId ?? null, type: lm.type, isFromMe: !!lm.isFromMe, createdAt: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null, content: lm.content ?? null } : null };
   }).filter(Boolean));
   const diag = conversations.length ? null : await page.evaluate(() => ({ path: location.pathname, txt: document.body?.innerText.length ?? 0, li: document.querySelectorAll('li').length, semi: document.querySelectorAll('[class*=semi-list]').length }));
-  return { conversations, ...(diag ? { diag } : {}) };
+  // U1：0 个会话时只有页面明确显示空状态才算「没有私信」
+  const emptyState = conversations.length ? false : await page.evaluate(() => /暂无(私信|消息|会话)|没有(私信|消息|会话)/.test(document.body?.innerText ?? ''));
+  return { conversations, emptyState, ...(diag ? { diag } : {}) };
 }
 
 // —— 解析 ——
@@ -179,6 +181,8 @@ function textOf(m) {
 }
 
 export function parseDms(raw, { accountUid, fetchedAt }) {
+  if (!Array.isArray(raw.conversations)) adapterFail('no-data', '抖音私信会话列表读不到');
+  if (!raw.conversations.length && !raw.emptyState) adapterFail('no-data', `抖音私信 0 个会话，但页面没显示空状态${raw.diag ? `：${JSON.stringify(raw.diag)}` : ''}`);
   const conversations = [], messages = [];
   for (const c of raw.conversations) {
     const id = String(c.id);

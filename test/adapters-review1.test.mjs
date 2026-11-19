@@ -155,3 +155,19 @@ test('X-B10 B站：fetch_session_msgs 全部失败 → api-error；user/cards �
   assert.deepEqual([r2.ok, r2.reason], [false, 'api-error']);
   assert.match(r2.error, /user\/cards/);
 });
+
+// —— U1（协调者升级）：私信列表读不到不能报 ok ——
+test('U1 抖音私信：0 个会话且页面没显示空状态 → no-data；明确为空才 ok', async () => {
+  const r = await run('Douyin', 'dms', { ...fixture('douyin-dms'), conversations: [] });
+  assert.deepEqual([r.ok, r.reason], [false, 'no-data']);
+  const empty = await run('Douyin', 'dms', { ...fixture('douyin-dms'), conversations: [], emptyState: true });
+  assert.deepEqual([empty.ok, empty.conversations], [true, []]);
+});
+
+test('U1 小红书私信：v3/chats 没有一页 code=0 → api-error；成功且为空才 ok', async () => {
+  const r = await run('XiaoHongShu', 'dms', { ...fixture('xhs-dms'), chatsCodes: [-1, 300013] });
+  assert.deepEqual([r.ok, r.reason], [false, 'api-error']);
+  assert.match(r.error, /v3\/chats/);
+  const empty = await run('XiaoHongShu', 'dms', { kind: 'dms', chatsCodes: [0], chats: [], unread: {}, histories: [] });
+  assert.deepEqual([empty.ok, empty.conversations], [true, []]);
+});

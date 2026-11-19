@@ -1,5 +1,8 @@
 {
  "kind": "dms",
+ "chatsCodes": [
+  0
+ ],
  "chats": [
   {
    "chat_user_id": "user_534e71a8",

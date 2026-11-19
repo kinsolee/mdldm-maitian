@@ -103,7 +103,8 @@ async function rawDms(page, o) {
   if (!chatsCap.length) return { failed: 'no-data', error: `${o.loadMs}ms 内没抓到 im/web/v3/chats` };
   if (notLoggedIn(chatsCap[0].json)) return { loginLost: true, evidence: `v3/chats code=${chatsCap[0].json.code}` };
   const chats = new Map();
-  for (const c of chatsCap) for (const x of c.json.data?.chats ?? []) chats.set(x.chat_user_id, x);
+  const chatsCodes = chatsCap.map((c) => c.json.code ?? null);
+  for (const c of chatsCap) if (c.json.code === 0) for (const x of c.json.data?.chats ?? []) chats.set(x.chat_user_id, x);
   const unread = Object.assign({}, ...(await jsons(page, 'chat/get_unread')).map((c) => c.json.data?.user_chat_unread_counts ?? {}));
   const since = o.since ? Date.parse(o.since) : null;
   // 点开会话后列表会重新渲染（行数变了），按行号点不稳；直接打开 /chat/<chat_user_id>（地址里只有对方 uid）
@@ -123,7 +124,7 @@ async function rawDms(page, o) {
   }
   const slim = [...chats.values()].map((c) => ({ chat_user_id: c.chat_user_id, user_id: c.user_id, last_msg_time: c.last_msg_time, last_msg_content: c.last_msg_content,
     info: { nickname: c.info?.nickname ?? null, is_official: !!c.info?.is_official, is_brand: !!c.info?.is_brand } }));
-  return { kind: 'dms', chats: slim, unread, histories, tried };
+  return { kind: 'dms', chatsCodes, chats: slim, unread, histories, tried };
 }
 
 // —— 解析 ——
@@ -212,6 +213,11 @@ function body(m) { try { const c = JSON.parse(m.content); return { type: TYPE(c.
 
 export function parseDms(raw, { accountUid, fetchedAt, since = null }) {
   const me = String(accountUid);
+  // U1：会话列表接口没有一页成功，整个 kind 失败（不能当成「没有私信」）
+  const codes = raw.chatsCodes ?? [];
+  if (!codes.length) adapterFail('no-data', '没抓到 api/im/web/v3/chats');
+  if (!codes.includes(0)) adapterFail('api-error', `api/im/web/v3/chats code=${[...new Set(codes)].join(',')}`);
+  if (!Array.isArray(raw.chats)) adapterFail('parse', 'api/im/web/v3/chats 的 chats 不是数组');
   const hist = new Map(raw.histories.filter((h) => h.chat_user_id).map((h) => [h.chat_user_id, h.messages]));
   const conversations = [], messages = [];
   for (const c of raw.chats) {
