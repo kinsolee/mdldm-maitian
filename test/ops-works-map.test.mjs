@@ -849,3 +849,89 @@ test('四个平台的 map 都返回 complete 和 incomplete', async () => {
     assert.equal(typeof r.incomplete, 'string', code);
   }
 });
+
+// Ego 的 page.fetch 对 POST 会给 201（KIN-328 第二次真实采集视频号 post_list 实测），2xx 都算 http 成功
+describe('http 2xx（不只是 200）都算成功', () => {
+  test('fmt.pageProblem：200–299 算成功，其余判失败', () => {
+    for (const http of [200, 201, 204, 299]) assert.equal(fmt.pageProblem('x', 0, { http, code: 0 }, true), null, String(http));
+    for (const http of [199, 300, 302, 406, 500, null, undefined]) assert.match(fmt.pageProblem('x', 0, { http, code: 0 }, true), /http 不是 2xx/, String(http));
+  });
+
+  test('视频号 post_list http=201 + errCode=0 → complete=true；http=500 → complete=false', async () => {
+    const ch = await import('../src/ops/works/channels.mjs');
+    const fx = fixture('channels-account');
+    const list = structuredClone(sample('channels').raw.postList);
+    list.data.totalCount = 1;
+    const opts = { days: 30, nowMs: cstMs('2026-11-19 15:36:47') };
+    const run = (http) => ch.map({ auth: { ...fx.auth, http: 201 }, postList: [{ ...list, http }], fansTrend: { ...fx.fansTrend, http: 201 } }, opts);
+    const r = run(201);
+    assert.equal(r.complete, true);
+    assert.equal(r.incomplete, null);
+    assert.equal(r.posts.length, 1);
+    assert.deepEqual(r.stats.fansProblems, []);
+    assert.equal(run(500).complete, false);
+    assert.match(run(500).incomplete, /http=500/);
+  });
+
+  test('视频号 fetchRaw：page.fetch 对 POST 回 201 → complete=true', async () => {
+    const ch = await import('../src/ops/works/channels.mjs');
+    const nowMs = cstMs('2026-11-19 15:36:47');
+    const item = { objectId: '1', objectNonce: '2', createTime: Math.floor(nowMs / 1000) - 3600, desc: {} };
+    const page = fakePage({ routes: [
+      [/auth\/auth_data/, { status: 201, body: { errCode: 0, data: { finderUser: { finderUsername: 'f', uniqId: 'sph', nickname: 'n', fansCount: 1 } } } }],
+      [/post_list/, { status: 201, body: { errCode: 0, data: { totalCount: 1, list: [item] } } }],
+      [/fans_trend/, { status: 201, body: { errCode: 0, data: { total: [1], netAdd: [0] } } }],
+    ] });
+    const r = ch.map(await ch.fetchRaw(page, { days: 30, nowMs, ...fakeSleep() }), { days: 30, nowMs });
+    assert.equal(r.complete, true);
+    assert.equal(r.posts.length, 1);
+  });
+
+  test('抖音 work_list http=204 → 不判失败', async () => {
+    const dy = await import('../src/ops/works/douyin.mjs');
+    const fx = fixture('douyin-account');
+    const r = dy.map({ info: fx.info, pages: [{ ...sample('douyin').raw.work_list, http: 204 }], fans: { ...fx.fans, http: 204 } }, { days: 30, nowMs: cstMs('2026-11-19 14:50:13') });
+    assert.equal(r.complete, true);
+    assert.deepEqual(r.stats.fansProblems, []);
+  });
+
+  test('B站 archives / compare / 粉丝接口 http=201 → 不判失败', async () => {
+    const bili = await import('../src/ops/works/bili.mjs');
+    const S = sample('bili');
+    const fx = fixture('bili-account');
+    const r = bili.map({ nav: fx.nav, archives: [{ ...S.raw.archives, http: 201 }], compare: { ...S.raw.compare, http: 201 }, fansGraph: { ...fx.fansGraph, http: 201 }, fansNum: { ...S.raw.fansNum, http: 201 } }, { days: 30, nowMs: cstMs('2026-11-19 14:26:35') });
+    assert.equal(r.complete, true);
+    assert.equal(r.stats.compareProblem, null);
+    assert.deepEqual(r.stats.fansProblems, []);
+  });
+
+  test('小红书 analyze 第一页 http=201：不重试、complete=true', async () => {
+    const xhs = await import('../src/ops/works/xhs.mjs');
+    const nowMs = cstMs('2026-11-19 14:26:09');
+    let analyzeCalls = 0;
+    const page = fakePage({
+      url: 'https://creator.xiaohongshu.com/new/note-manager',
+      routes: [
+        [/user\/info/, { status: 201, body: { code: 0, data: { userId: 'u1' } } }],
+        [/personal_info/, { status: 201, body: { code: 0, data: { name: 'n', fans_count: 3 } } }],
+        [/overall_new/, { status: 201, body: { code: 0, data: { thirty: { fans_list: [] } } } }],
+      ],
+      evaluate: async (arg, fn) => {
+        const saved = { window: globalThis.window, fetch: globalThis.fetch };
+        globalThis.window = { _webmsxyw: () => ({ 'X-s': 's', 'X-t': 1 }) };
+        globalThis.fetch = async (u) => {
+          const body = /analyze\/list/.test(u) ? (analyzeCalls++, { code: 0, data: { total: 1, note_infos: [{ id: 'n1', audit_status: 1, type: 2, post_time: nowMs - 3600_000 }] } }) : { code: 0, data: { notes: [] } };
+          return { status: 201, text: async () => JSON.stringify(body) };
+        };
+        try { return await fn(arg); } finally { globalThis.window = saved.window; globalThis.fetch = saved.fetch; }
+      },
+    });
+    const raw = await xhs.fetchRaw(page, { days: 30, nowMs, ...fakeSleep() });
+    const r = xhs.map(raw, { days: 30, nowMs });
+    assert.equal(analyzeCalls, 1);
+    assert.equal(raw.analyzeRetries, undefined);
+    assert.equal(r.complete, true);
+    assert.deepEqual(r.stats.postedProblems, []);
+    assert.deepEqual(r.stats.fansProblems, []);
+  });
+});

@@ -35,7 +35,9 @@ export const pick = (o, keys) => {
 
 // 作品列表某一页没读成功的说明（成功返回 null）。没读成功的页不能当成「这页 0 条」：
 // 调用方会按 map 的 posts 覆盖整个平台，把失败当 0 条就会把导出写空（KIN-328 小红书实测过一次）
+// Ego 的 page.fetch 对 POST 会给 201（视频号 post_list 实测），所以 2xx 都算 http 成功
+export const httpOk = (http) => Number.isInteger(http) && http >= 200 && http <= 299;
 export function pageProblem(api, index, { http, code, error }, dataOk) {
-  const why = error ? `error=${error}` : http !== 200 ? 'http 不是 200' : code !== 0 ? 'code 不是 0' : !dataOk ? 'data 缺失' : null;
+  const why = error ? `error=${error}` : !httpOk(http) ? 'http 不是 2xx' : code !== 0 ? 'code 不是 0' : !dataOk ? 'data 缺失' : null;
   return why && `${api} 第 ${index + 1} 页没读成功：${why}（http=${http ?? null} code=${code ?? null}）`;
 }
