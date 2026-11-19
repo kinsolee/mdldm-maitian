@@ -19,8 +19,8 @@ platform 只收 `Douyin`、`XiaoHongShu`、`Bili`、`Channels`。其他平台直
 - 四个平台并行；同一 space 的互斥由 runner 的 space 锁保证。
 - 跳过、不起 runner：uid 还是 `pending`（先跑 `hub ops login --check`）；能力位 `readWorks` 没开（`hub ops accounts set-cap <id> readWorks true`）。
 - runner 返回 `busy`、`user-controlled`、`profile-needed` 时跳过。space 在负责人手里时不抢，不 takeOver。其他 runner 失败记 failed。
-- map 结果：没登录记 `out`，不写作品、粉丝，提示 `hub ops login <platformCode>`；页面上的 uid 和登记的不一致记 `uid-mismatch`，不写库；没读到 uid、记录不合格（规则同导出校验）、写库出错都记 failed，不写库。一个账号的写入在一个事务里，出错整段回滚。
-- stdout 和库里不放 cookie、token、finderUsername、签名：raw 只在内存里给 map 用，不存、不打印。
+- map 结果：没登录记 `out`，不写作品、粉丝，提示 `hub ops login <platformCode>`；页面上的 uid 和登记的不一致记 `uid-mismatch`，不写库；`complete` 不是 `true`（平台模块判断这次没读全，例如某个接口没拿到数据、翻页没翻完；缺这个字段也算）记 failed、reason `incomplete`，message 带 `incomplete` 的说明，不写作品、粉丝、快照，导出自动回退到上一次完整的采集；没读到 uid、记录不合格（规则同导出校验）、写库出错都记 failed，不写库。一个账号的写入在一个事务里，出错整段回滚。
+- stdout 和库里不放 cookie、token、finderUsername、签名：raw 只在内存里给 map 用，不存、不打印；`--json` 每行带 map 的 `stats`，平台模块保证里面没有凭据。
 
 | 退出码 | 含义 |
 |---|---|
@@ -35,7 +35,7 @@ platform 只收 `Douyin`、`XiaoHongShu`、`Bili`、`Channels`。其他平台直
 
 | 表 | 一行是 | 说明 |
 |---|---|---|
-| `collect_runs` | 一次采集里的一个账号 | runId、platformCode、uid、startedAt、finishedAt、result（ok / out / skipped / failed / uid-mismatch）、reason、message、postCount |
+| `collect_runs` | 一次采集里的一个账号 | runId、platformCode、uid、startedAt、finishedAt、result（ok / out / skipped / failed / uid-mismatch）、reason、message、postCount、stats（map 给的诊断 JSON，不含凭据；没跑到 map 时为空。早期建的表由 `ensureWorksTables` 补这一列） |
 | `works` | 一条作品（主键 platformCode, uid, postId） | 最近一次的记录 JSON、postTime、firstSeenAt、lastSeenAt、lastRunId |
 | `work_snapshots` | 一次采集里的一条作品（主键 runId, platformCode, uid, postId） | collectedAt、记录 JSON，每次采集都留 |
 | `account_snapshots` | 一次采集里的一个账号 | collectedAt、fans、loginStatus、记录 JSON |

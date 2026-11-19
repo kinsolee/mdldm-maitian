@@ -32,8 +32,9 @@ async function collectOne(db, a, ctx) {
   const { runId, now, days, nowMs } = ctx;
   const code = a.platformCode;
   const startedAt = iso(now());
+  let stats = null;   // map 之后才有：平台模块给的诊断（不含凭据），每行都带上，落库、--json 输出
   const finish = (result, extra = {}) => {
-    const row = { runId, id: a.id, platformCode: code, uid: a.uid, startedAt, finishedAt: iso(now()), result, ...extra };
+    const row = { runId, id: a.id, platformCode: code, uid: a.uid, startedAt, finishedAt: iso(now()), result, ...extra, ...(stats != null ? { stats } : {}) };
     recordRun(db, row);
     console.error(`[collect] ${a.id} ${result}${row.reason ? `(${row.reason})` : ''} ${row.message ?? ''}`);
     return row;
@@ -50,10 +51,14 @@ async function collectOne(db, a, ctx) {
   try { m = (await ctx.loadPlatform(code)).map(r.result, { days, nowMs }); }
   catch (e) { return finish('failed', { reason: 'map-failed', message: `映射失败：${String(e?.message ?? e).slice(0, 160)}` }); }
   if (!m || typeof m !== 'object' || typeof m.loggedIn !== 'boolean') return finish('failed', { reason: 'bad-map', message: 'map 结果结构不对（要有 loggedIn 布尔值），没写库' });
+  stats = m.stats ?? null;
   if (!m.loggedIn) return finish('out', { reason: 'logged-out', message: `没登录，作品和粉丝都没写。扫码登录：hub ops login ${code}` });
   const seen = normalizeUid(m.uidSeen);
   if (!seen) return finish('failed', { reason: 'no-uid', message: `登录了但没读到 uid，没法核对（登记的是 ${a.uid}），没写库` });
   if (seen !== a.uid) return finish('uid-mismatch', { reason: 'uid-mismatch', uidSeen: seen, message: `UID 不符：登记的是 ${a.uid}，页面上看到的是 ${seen}。没写库，这个账号先别用，请核对 space ${a.spaceName} 登的是哪个号` });
+  // 采集不完整（例如某个接口这次没拿到数据，map 只给了 0 条）不能记 ok：否则导出会把残缺的这次当最近一次成功。
+  // 记 failed、不写库，导出自动回退到上一次完整的采集。缺 complete 字段也按不完整算。
+  if (m.complete !== true) return finish('failed', { reason: 'incomplete', message: `采集不完整，没写库：${m.incomplete ?? (m.complete === undefined ? 'map 结果没有 complete 字段' : `complete=${JSON.stringify(m.complete)}`)}` });
   if (!Array.isArray(m.posts) || !m.account) return finish('failed', { reason: 'bad-map', message: 'map 结果结构不对（要有 posts 数组和 account），没写库' });
 
   // 不合格的记录不进库：否则之后每天的导出都会因为它整份不写；这次算失败，导出用上一次成功的

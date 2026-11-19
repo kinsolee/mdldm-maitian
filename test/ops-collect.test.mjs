@@ -164,6 +164,55 @@ describe('采集写库', () => {
     assert.deepEqual(daily, { '2026-11-17': [98, 1], '2026-11-18': [101, 3], '2026-11-19': [null, 1] });
   });
 
+  for (const [label, extra, want] of [
+    ['complete=false', { complete: false, incomplete: '作品列表第 1 页没拿到数据（code=-1）', posts: [] }, /作品列表第 1 页没拿到数据/],
+    ['缺 complete 字段', { complete: undefined, incomplete: undefined }, /没有 complete 字段/],
+  ]) {
+    test(`${label}：failed（incomplete），不写作品、粉丝、快照，stats 照样落库`, async () => {
+      const db = freshDb();
+      const m = mapped('XiaoHongShu', { ...extra, stats: { pages: 0, listCode: -1 } });
+      if (extra.complete === undefined) delete m.complete;
+      const r = await collectWorks(db, { ...fakes({ XiaoHongShu: m }) });
+      assert.equal(r.exitCode, 3);
+      const x = byCode(r.rows).XiaoHongShu;
+      assert.equal(x.result, 'failed');
+      assert.equal(x.reason, 'incomplete');
+      assert.match(x.message, want);
+      assert.deepEqual(x.stats, { pages: 0, listCode: -1 });
+      for (const t of ['works', 'work_snapshots', 'account_snapshots', 'fans_daily']) assert.equal(count(db, t, "platformCode = 'XiaoHongShu'"), 0, t);
+      const run = db.prepare("SELECT result, stats FROM collect_runs WHERE platformCode = 'XiaoHongShu'").get();
+      assert.equal(run.result, 'failed');
+      assert.deepEqual(JSON.parse(run.stats), { pages: 0, listCode: -1 });
+    });
+  }
+
+  test('全部不完整：退出码 1', async () => {
+    const db = freshDb();
+    const r = await collectWorks(db, { ...fakes(Object.fromEntries(PLATFORMS.map((p) => [p, mapped(p, { complete: false, incomplete: '没拿到' })]))) });
+    assert.equal(r.exitCode, 1);
+  });
+
+  test('ok 的行也带 stats 落库；没到 map 的行 stats 为空', async () => {
+    const db = freshDb();
+    const r = await collectWorks(db, { ...fakes({ Bili: { ok: false, reason: 'busy' } }) });
+    assert.deepEqual(byCode(r.rows).Douyin.stats, { pages: 1 });
+    assert.equal(byCode(r.rows).Bili.stats, undefined);
+    const rows = Object.fromEntries(db.prepare('SELECT platformCode, stats FROM collect_runs').all().map((x) => [x.platformCode, x.stats]));
+    assert.equal(rows.Douyin, '{"pages":1}');
+    assert.equal(rows.Bili, null);
+  });
+
+  test('旧库的 collect_runs 没有 stats 列：自动补列，旧行保留', async () => {
+    const db = freshDb();
+    db.exec(`CREATE TABLE collect_runs (runId TEXT NOT NULL, platformCode TEXT NOT NULL, uid TEXT, startedAt TEXT NOT NULL, finishedAt TEXT NOT NULL,
+      result TEXT NOT NULL CHECK (result IN ('ok', 'out', 'skipped', 'failed', 'uid-mismatch')), reason TEXT, message TEXT, postCount INTEGER)`);
+    db.prepare("INSERT INTO collect_runs (runId, platformCode, uid, startedAt, finishedAt, result) VALUES ('old', 'Bili', '478358005', 'a', 'b', 'ok')").run();
+    const r = await collectWorks(db, { ...fakes(), platforms: ['Douyin'] });
+    assert.equal(r.exitCode, 0, JSON.stringify(r.rows));
+    assert.equal(db.prepare("SELECT stats FROM collect_runs WHERE platformCode = 'Douyin'").get().stats, '{"pages":1}');
+    assert.equal(db.prepare("SELECT stats FROM collect_runs WHERE runId = 'old'").get().stats, null);
+  });
+
   test('不在范围的平台直接拒绝；Instagram 写明账号被锁', async () => {
     const db = freshDb();
     const f = fakes();

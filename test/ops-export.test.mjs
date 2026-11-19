@@ -60,6 +60,19 @@ describe('导出', () => {
     assert.equal(exportPosts(db, { out, now: () => T0 + 30 * H, maxAgeHours: 48 }).exitCode, 0);
   });
 
+  test('采集不完整的一次不算 ok：导出回退到上一次完整的；上一次也过期就排除', async () => {
+    const db = await collected();
+    await collected({ XiaoHongShu: mapped('XiaoHongShu', { posts: [], complete: false, incomplete: '作品列表没拿到数据' }) }, { db, now: T0 + 2 * H });
+    const out = tmp();
+    const r = exportPosts(db, { out, now: () => T0 + 2 * H });
+    assert.equal(r.exitCode, 0, JSON.stringify(r));
+    assert.equal(read(r.file).filter((p) => p.platform === 'XiaoHongShu').length, 1);
+    assert.equal(r.exported.find((x) => x.platformCode === 'XiaoHongShu').finishedAt, new Date(T0).toISOString());
+    await collected({ XiaoHongShu: mapped('XiaoHongShu', { complete: false, incomplete: '又没拿到' }) }, { db, now: T0 + 27 * H });
+    const later = exportPosts(db, { out, now: () => T0 + 27 * H, maxAgeHours: 26 });
+    assert.ok(later.excluded.some((x) => x.platformCode === 'XiaoHongShu'));
+  });
+
   test('从没成功过的平台写明，退出码 3', async () => {
     const db = await collected({ Channels: { ok: false, reason: 'busy' } });
     const r = exportAccounts(db, { out: tmp(), now: () => T0 });
