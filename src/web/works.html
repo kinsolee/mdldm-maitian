@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f5f5f7">
+<title>麦田 · 作品</title>
+<link rel="icon" href="/static/icon-180.png">
+<link rel="stylesheet" href="/static/mt.css">
+</head>
+<body>
+<div class="bgfx"><i></i><i></i><i></i></div>
+<div class="page" id="app"><div class="empty" style="height:60vh">加载中…</div></div>
+<script src="/static/mt.js"></script>
+<script>
+// KIN-330：hub ops collect 采进 ops.db 的四个平台近 30 天作品（GET /api/ops/works）。只读。
+const NAV = [['/', '大屏'], ['/p#/traffic', '流量'], ['/p#/calendar', '日历'], ['/p#/archive', '档案'], ['/works', '作品'], ['/p#/system', '系统']];
+const RESULT = { ok: ['published', '成功'], skipped: ['awaiting_user', '跳过'], out: ['not_logged_in', '掉线'], failed: ['failed', '失败'], 'uid-mismatch': ['failed', 'UID 不符'] };
+const n = (v) => v == null ? '—' : fmt(v);
+let D = null, on = new URLSearchParams(location.search).get('platform') || '';
+
+function runLine(p) {
+  const r = p.lastRun;
+  if (!r) return `<div class="prow">${logo(p.platform)}${esc(p.name)}<span class="d">还没采集过</span></div>`;
+  const [st, cn] = RESULT[r.result] || ['planned', r.result];
+  const why = [r.reason, r.message].filter(Boolean).map(esc).join('：');
+  return `<div class="prow">${logo(p.platform)}${esc(p.name)}<span class="st-chip ${st}"><i>${st === 'published' ? '✓' : st === 'awaiting_user' ? '!' : '✕'}</i>${cn}</span><span class="d">${why}</span><span title="${esc(r.finishedAt)}">${when(r.finishedAt)} · ${ago(r.finishedAt)}</span></div>`;
+}
+
+function render() {
+  const works = D.works.filter((w) => !on || w.platform === on);
+  const tabs = [['', '全部'], ...D.platforms.map((p) => [p.platform, p.name])];
+  $('#app').innerHTML = `
+  <div class="top"><a class="logo" href="/">麦<i>田</i></a><div class="tag">内容与粉丝监控</div><div class="nav">${NAV.map(([u, t]) => `<a class="${u === '/works' ? 'on' : ''}" href="${u}">${t}</a>`).join('')}</div></div>
+  <div class="sec"><h2>最近一次采集</h2><span class="note">hub ops collect</span></div>
+  <div class="panel">${D.platforms.map(runLine).join('')}</div>
+  <div class="sec"><h2>作品</h2><span class="note">近 30 天发布，${works.length} 条</span></div>
+  <div class="panel"><div class="btns" style="margin-bottom:10px">${tabs.map(([k, t]) => `<button class="btn ${k === on ? 'pri' : ''}" data-p="${esc(k)}">${esc(t)}</button>`).join('')}</div>
+    <div class="tw"><table><thead><tr><th>平台</th><th>标题</th><th>发布时间</th><th>状态</th><th class="n">播放</th><th class="n">点赞</th><th class="n">评论</th><th class="n">收藏</th><th class="n">转发</th><th class="n">涨粉</th></tr></thead><tbody>
+    ${works.map((w) => { const u = safeUrl(w.url); const t = esc(w.title || '（无标题）'); return `<tr><td>${logo(w.platform)}${esc(w.name)}</td><td style="max-width:360px;overflow:hidden;text-overflow:ellipsis" title="${t}">${u ? `<a href="${u}" target="_blank" rel="noopener">${t}</a>` : t}</td><td>${esc(w.postTime ?? '—')}</td><td>${esc(w.statusText ?? '—')}</td>${['view', 'like', 'comment', 'favorite', 'forward', 'fansAdd'].map((k) => `<td class="n">${n(w[k])}</td>`).join('')}</tr>`; }).join('') || '<tr><td colspan="10" style="color:var(--t3)">没有作品</td></tr>'}
+    </tbody></table></div></div>`;
+  for (const b of document.querySelectorAll('[data-p]')) b.onclick = () => { on = b.dataset.p; history.replaceState(null, '', on ? `?platform=${encodeURIComponent(on)}` : '/works'); render(); };
+}
+
+api('/api/ops/works').then((d) => { D = d; render(); }, (e) => { $('#app').innerHTML = `<div class="empty">读不到作品数据：${esc(e.message)}</div>`; });
+</script>
+</body>
+</html>

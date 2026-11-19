@@ -8,6 +8,7 @@ import { checkLogins, scanLogin } from './login.mjs';
 import { collectWorks } from './collect.mjs';
 import { exportPosts, exportAccounts } from './export.mjs';
 import { initTokens } from './tokens.mjs';
+import { syncFollowersToHub } from './hub-followers.mjs';
 import { opsDbPath, envPath, seedPath } from './paths.mjs';
 
 export const USAGE = `用法：hub ops <子命令>
@@ -21,6 +22,7 @@ export const USAGE = `用法：hub ops <子命令>
   engage sync --once [--platform <code>] [--kind comments|dms] [--force] [--json]   跑一轮评论私信抓取（退出码 0 跑完、1 参数错、5 已有一轮在跑）
   engage status [--json]                       评论私信：每个平台每个 kind 最近一次抓取、未处理事件数
   collect [--days N] [platform ...] [--export] [--json]   只读采集近 N 天（默认 30）作品和粉丝（Douyin、XiaoHongShu、Bili、Channels）；--export 接着导出
+  sync-followers [--json]                      把 ops.db 已有的粉丝分日同步进 hub.db 的 followers（不采集；collect 有平台 ok 后也会自动同步一次）
   export posts|accounts [--out 目录] [--date YYYYMMDD] [--max-age-hours N] [--json]   导出给下游的 posts-/accounts-YYYYMMDD.json
 
 login 的退出码：0 全部检测完（含 out、unknown）；2 有账号 UID 不符（硬停）；1 有检测失败（runner 失败、结果结构不对、已登录但没读到 uid）；
@@ -29,7 +31,8 @@ login 的退出码：0 全部检测完（含 out、unknown）；2 有账号 UID 
 collect 的退出码：0 全部 ok；2 有账号 UID 不符（硬停，没写库）；3 部分成功（有跳过、未登录或失败的）；1 一个 ok 都没有，或平台不在范围。
 export 的退出码：0 四个平台都导出；3 有平台没导出（最近一次成功采集超过 --max-age-hours，默认 26，或从没成功过）；
   1 一个平台都没有、或有记录不合格（这两种都不写文件）。collect --export 取三者最严重的：2 > 1 > 3 > 0。
-文件：ops.db 默认 data/ops.db（MAITIAN_OPS_DB 可改）；导出默认 data/ops-shadow/（MAITIAN_OPS_SHADOW_DIR 可改）；口令 .env 默认仓库根目录（MAITIAN_ENV_FILE 可改）。`;
+sync-followers 的退出码：0 已同步；1 hub.db 不存在或同步失败。collect 后的自动同步失败不改 collect 的退出码，只在输出里说。
+文件：ops.db 默认 data/ops.db（MAITIAN_OPS_DB 可改）；hub.db 默认 data/hub.db（MAITIAN_DB 可改，不存在时不新建）；导出默认 data/ops-shadow/（MAITIAN_OPS_SHADOW_DIR 可改）；口令 .env 默认仓库根目录（MAITIAN_ENV_FILE 可改）。`;
 
 const pad = (s, n) => String(s ?? '').padEnd(n);
 
@@ -51,7 +54,7 @@ function printRows(rows) {
 export async function main(argv = process.argv.slice(2), deps = {}) {
   const [group, sub, ...rest] = argv;
   if (group === 'engage') return (await import('../daemon/sync.mjs')).main(argv.slice(1));
-  const { values, positionals } = parseArgs({ args: ['login', 'collect'].includes(group) ? argv.slice(1) : rest, allowPositionals: true, options: {
+  const { values, positionals } = parseArgs({ args: ['login', 'collect', 'sync-followers'].includes(group) ? argv.slice(1) : rest, allowPositionals: true, options: {
     json: { type: 'boolean', default: false }, check: { type: 'boolean', default: false }, platform: { type: 'string' }, help: { type: 'boolean', short: 'h', default: false },
     days: { type: 'string' }, export: { type: 'boolean', default: false }, out: { type: 'string' }, date: { type: 'string' }, 'max-age-hours': { type: 'string' },
   } });
@@ -89,11 +92,21 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   }
   if (group === 'collect') {
     const r = await collectWorks(db, { ...deps, platforms: positionals, days: values.days == null ? undefined : Number(values.days) });
+    // 粉丝同步进 hub.db（工作台粉丝曲线）：失败不影响 collect 的结果，只在输出里说
+    let sync = null;
+    if (r.rows.some((x) => x.result === 'ok')) { try { sync = syncFollowersToHub(db); } catch (e) { sync = { ok: false, message: `粉丝同步出错：${e.message}` }; } }
+    if (sync && !values.json) console.log(sync.ok ? `粉丝已同步进 hub.db（${sync.written} 行）` : sync.message);
     const ex = values.export ? [exportPosts(db, { now: deps.now }), exportAccounts(db, { now: deps.now })] : [];
     const exitCode = values.export ? worst([r.exitCode, ...ex.map((e) => e.exitCode)]) : r.exitCode;
-    if (values.json) console.log(JSON.stringify({ exitCode, runId: r.runId, rows: r.rows, ...(values.export ? { export: { posts: ex[0], accounts: ex[1] } } : {}) }, null, 1));
+    if (values.json) console.log(JSON.stringify({ exitCode, runId: r.runId, rows: r.rows, followersSync: sync, ...(values.export ? { export: { posts: ex[0], accounts: ex[1] } } : {}) }, null, 1));
     else { printRows(r.rows); ex.forEach(printExport); }
     return exitCode;
+  }
+  if (group === 'sync-followers' && !positionals.length) {
+    let r;
+    try { r = syncFollowersToHub(db); } catch (e) { r = { ok: false, message: `粉丝同步出错：${e.message}` }; }
+    console.log(values.json ? JSON.stringify(r, null, 1) : r.ok ? `粉丝已同步进 hub.db（${r.written} 行）：${Object.entries(r.platforms).map(([k, n]) => `${k} ${n}`).join('，')}` : r.message);
+    return r.ok ? 0 : 1;
   }
   if (group === 'export' && ['posts', 'accounts'].includes(sub) && !positionals.length) {
     const opts = { now: deps.now, out: values.out, date: values.date, ...(values['max-age-hours'] != null ? { maxAgeHours: Number(values['max-age-hours']) } : {}) };
