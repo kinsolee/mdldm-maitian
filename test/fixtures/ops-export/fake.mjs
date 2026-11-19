@@ -27,7 +27,7 @@ export const account = (platform, extra = {}) => ({
   uid: UIDS[platform], loginStatus: '登录有效', fans: 100, updateTime: '2026-11-19 09:00:00',
   daily: [{ date: '2026-11-17', fansTotal: 98, fansNet: 1 }, { date: '2026-11-18', fansTotal: 100, fansNet: 2 }], ...extra,
 });
-export const mapped = (platform, o = {}) => ({ loggedIn: true, uidSeen: UIDS[platform], posts: [post(platform, `${platform}-1`)], account: account(platform), stats: { pages: 1 }, ...o });
+export const mapped = (platform, o = {}) => ({ loggedIn: true, uidSeen: UIDS[platform], posts: [post(platform, `${platform}-1`)], account: account(platform), stats: { pages: 1 }, complete: true, incomplete: null, ...o });
 
 /**
  * byPlatform[code]：map 结果（默认 mapped(code)），或 {ok:false, reason} 表示 runner 失败；也可以是函数 (opts) => 二者之一。
