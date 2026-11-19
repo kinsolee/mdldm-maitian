@@ -38,14 +38,22 @@ function slimComment(c) {
   return { ...rest, user: slimUser(user) };
 }
 const bodies = async (page, re, from) => (await captured(page, re, from)).map((c) => bigJson(c.body)).filter(Boolean);
-const slimList = (j) => ({ status_code: j.status_code, has_more: j.has_more, cursor: j.cursor, total: j.total, comments: (j.comments ?? []).map(slimComment) });
+// 页面脚本里的归一化（导出给测试）：缺失的列表字段保留成 null，不当成功的空列表（X2-B5、X2-S4）
+export const slimList = (j) => ({ status_code: j.status_code, has_more: j.has_more, cursor: j.cursor, total: j.total, comments: Array.isArray(j.comments) ? j.comments.map(slimComment) : null });
+export const itemListCodeOf = (j) => (j.status_code === 0 && !Array.isArray(j.item_info_list) ? 'no-list' : j.status_code ?? null);
+export const slimItem = (x) => ({ item_id_plain: str(x.item_id_plain), title: x.title ?? null, create_time: x.create_time ?? null, comment_count: Number.isFinite(x.comment_count) ? x.comment_count : null });
+/** 一楼列表：all 是整页抓到的（按 aweme_id 归到这个作品），fresh 是切到这个作品之后抓到的；fresh 里出错或缺 comments 的记成 selectErrors。 */
+export function splitSelect(all, itemId, fresh) {
+  const select = all.filter((j) => j.status_code === 0 && Array.isArray(j.comments) && j.comments.length && j.comments.every((c) => String(c.aweme_id) === itemId));
+  const selectErrors = fresh.filter((j) => j.status_code !== 0 || !Array.isArray(j.comments)).map((j) => ({ status_code: j.status_code ?? null, comments: Array.isArray(j.comments) ? 'array' : 'missing' }));
+  return { select, selectErrors };
+}
 
 async function rawComments(page, o) {
   await waitCaptured(page, 'creator/item/list', { timeoutMs: o.loadMs });
   const itemLists = await bodies(page, 'creator/item/list', 0);
-  const itemListCodes = itemLists.map((j) => j.status_code ?? null);
-  const items = itemLists.filter((j) => j.status_code === 0).flatMap((j) => j.item_info_list ?? [])
-    .map((x) => ({ item_id_plain: str(x.item_id_plain), title: x.title ?? null, create_time: x.create_time ?? null, comment_count: x.comment_count ?? 0 }));
+  const itemListCodes = itemLists.map(itemListCodeOf);
+  const items = itemLists.filter((j) => itemListCodeOf(j) === 0).flatMap((j) => j.item_info_list).map(slimItem);
   // 页面渲染很慢（实测 30 秒以上才出「选择作品」按钮）
   for (const end = Date.now() + o.loadMs; Date.now() < end; await sleep(1500)) if (await page.evaluate(new Function(`return !!(${PICKER_SRC})()`))) break;
   const windowStartMs = o.now - o.maxAgeDays * 86400_000;
@@ -71,10 +79,8 @@ async function rawComments(page, o) {
     }
     const left = await page.evaluate(new Function(`return (${EXPAND_SRC})().map((e) => e.textContent.trim().replace(/\\d+/g, 'N'))`));
     // 默认选中的作品切过去可能不重新请求，所以一楼列表从头找、按 aweme_id 过滤
-    const select = (await bodies(page, SELECT, 0)).map(slimList).filter((j) => j.comments.length && j.comments.every((c) => String(c.aweme_id) === it.item_id_plain));
+    const { select, selectErrors } = splitSelect((await bodies(page, SELECT, 0)).map(slimList), it.item_id_plain, (await bodies(page, SELECT, from)).map(slimList));
     const replies = (await bodies(page, REPLY, from)).map(slimList);
-    // 切到这个作品后的一楼请求里出错的（status_code 非 0，错误响应没有 comments 可按作品过滤）
-    const selectErrors = (await bodies(page, SELECT, from)).filter((j) => j.status_code !== 0).map((j) => ({ status_code: j.status_code ?? null }));
     works.push({ item_id_plain: it.item_id_plain, opened: true, clicks, expandLeft: left.length, expandLeftTexts: left, select, replies, selectErrors });
   }
   return { itemListCodes, windowStartMs, items, works };
@@ -98,6 +104,16 @@ export async function switchTo(page, id) {
   return ok;
 }
 
+/**
+ * 私信列表明确为空（在页面里跑，导出给测试传假 doc）：页面上没有会话行，且列表组件显示了 Semi 的空状态或「暂无私信」类文案。
+ * 抖音的会话列表只能从 DOM 行的 fiber 读，没有能直接读的列表数组，所以靠空状态判断（U1 复查）。
+ */
+export function dyDmEmptyState(doc) {
+  const d = doc ?? document;
+  if (d.querySelectorAll('li.semi-list-item').length) return false;
+  return !!d.querySelector('.semi-list-empty') || /暂无(私信|消息|会话)|没有(私信|消息|会话)/.test(d.body?.innerText ?? '');
+}
+
 async function rawDms(page, o) {
   await page.waitForSelector('li.semi-list-item', { timeout: o.loadMs }).catch(() => {});
   await sleep(2000);
@@ -114,7 +130,7 @@ async function rawDms(page, o) {
   }).filter(Boolean));
   const diag = conversations.length ? null : await page.evaluate(() => ({ path: location.pathname, txt: document.body?.innerText.length ?? 0, li: document.querySelectorAll('li').length, semi: document.querySelectorAll('[class*=semi-list]').length }));
   // U1：0 个会话时只有页面明确显示空状态才算「没有私信」
-  const emptyState = conversations.length ? false : await page.evaluate(() => /暂无(私信|消息|会话)|没有(私信|消息|会话)/.test(document.body?.innerText ?? ''));
+  const emptyState = conversations.length ? false : await page.evaluate(dyDmEmptyState);
   return { conversations, emptyState, ...(diag ? { diag } : {}) };
 }
 
@@ -155,12 +171,14 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     works.push({ nativeId: wid, title: it?.title ?? null, url: `https://www.douyin.com/video/${wid}`, postTime: t ? new Date(t).toISOString() : null });
     if (!w.opened || !w.select.length) { scannedWorks.push({ workNativeId: wid, complete: false, threadsPartial: true }); continue; }
     const seen = new Map();
-    for (const j of w.select) for (const c of j.comments) seen.set(String(c.cid), { ...base(c, wid), parentNativeId: null, rootNativeId: String(c.cid), replyTo: null, replyCount: numOrNull(c.reply_comment_total) });
+    const bad = (j) => j.status_code !== 0 || !Array.isArray(j.comments);
+    for (const j of w.select.filter((x) => !bad(x))) for (const c of j.comments) seen.set(String(c.cid), { ...base(c, wid), parentNativeId: null, rootNativeId: String(c.cid), replyTo: null, replyCount: numOrNull(c.reply_comment_total) });
     const roots = new Map([...seen.values()].map((c) => [c.nativeId, 0]));
     // X-B3：一楼或子回复有任何一条 status_code 非 0 的响应，这个作品拿不全
-    const apiError = (w.selectErrors ?? []).length > 0 || w.select.some((j) => j.status_code !== 0) || w.replies.some((j) => j.status_code !== 0);
-    let partial = apiError || w.expandLeft > 0 || w.replies.some((j) => Number(j.has_more) === 1 && j.comments.length === 0);
-    for (const j of w.replies) for (const c of j.comments) {
+    const apiError = (w.selectErrors ?? []).length > 0 || w.select.some(bad) || w.replies.some(bad);
+    const replies = w.replies.filter((j) => !bad(j));
+    let partial = apiError || w.expandLeft !== 0 || replies.some((j) => Number(j.has_more) === 1 && j.comments.length === 0);
+    for (const j of replies) for (const c of j.comments) {
       const id = String(c.cid), root = str(c.reply_id) ?? null;
       if (!root || root === '0') continue;
       const to = str(c.reply_to_reply_id);
@@ -169,7 +187,8 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
       if (roots.has(root)) roots.set(root, roots.get(root) + 1);
     }
     // 子回复数对不上（没展开完、或分页没跟到）的楼算拿不全
-    for (const [root, n] of roots) if ((seen.get(root).replyCount ?? 0) > n) partial = true;
+    // 子回复总数缺失时不知道拿全没有，算拿不全（X2-S8）
+    for (const [root, n] of roots) { const total = seen.get(root).replyCount; if (total == null || total > n) partial = true; }
     comments.push(...seen.values());
     const lastSelect = w.select.at(-1);
     // has_more 必须明确是 0/false 才算翻到底
@@ -180,7 +199,7 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
   const scannedIds = new Set(scannedWorks.map((x) => x.workNativeId));
   for (const it of raw.items) {
     const id = String(it.item_id_plain), t = publishedAt(it.create_time);
-    if (Number(it.comment_count) !== 0 || scannedIds.has(id) || raw.windowStartMs == null || t == null || t < raw.windowStartMs) continue;
+    if (it.comment_count !== 0 || scannedIds.has(id) || raw.windowStartMs == null || t == null || t < raw.windowStartMs) continue;
     works.push({ nativeId: id, title: it.title ?? null, url: `https://www.douyin.com/video/${id}`, postTime: new Date(t).toISOString() });
     scannedWorks.push({ workNativeId: id, complete: true, threadsPartial: false });
   }

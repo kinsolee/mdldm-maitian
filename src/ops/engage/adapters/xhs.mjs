@@ -41,6 +41,16 @@ async function selfUid(page, raw) {
   return self.length === 1 ? String(self[0]) : null;
 }
 
+// 页面脚本里的归一化（导出给测试）：缺失的列表字段保留成 null，只有接口真的给了数组才是数组（X2-B1、X2-B2、X2-S1、X2-S2）
+const arr = (v) => (Array.isArray(v) ? v : null);
+export const slimMentionPage = (json) => ({ code: json?.code ?? null, data: { has_more: json?.data?.has_more, message_list: arr(json?.data?.message_list) && dropSecrets(json.data.message_list) } });
+export const slimCommentPage = (c) => ({ root_comment_id: urlParam(c.url, 'root_comment_id'), code: c.json?.code ?? null, data: { has_more: c.json?.data?.has_more, comments: arr(c.json?.data?.comments) && dropSecrets(c.json.data.comments) } });
+export const chatsCodeOf = (json) => (json?.code === 0 && !Array.isArray(json?.data?.chats) ? 'no-list' : json?.code ?? null);
+export function slimHistory(chatUserId, json) {
+  const list = arr(json?.data?.out_message_list) ?? arr(json?.data?.message_list);
+  return { chat_user_id: chatUserId, code: json?.code ?? null, messages: list && list.map((m) => ({ id: m.id, sender_id: m.sender_id, receiver_id: m.receiver_id, created_at: m.created_at, content: m.content })) };
+}
+
 const jsons = async (page, re, from = 0) => (await captured(page, re, from)).map((c) => ({ url: c.url, json: bigJson(c.body) })).filter((c) => c.json);
 const notLoggedIn = (j) => j && (j.code === -100 || j.code === -101 || /登录/.test(j.msg ?? ''));
 
@@ -68,7 +78,7 @@ async function rawComments(page, o) {
   const notes = [];
   // 连着开笔记页会被限流（核对时连跑几轮后笔记页、通知页都不出数据），每篇之间停一下
   for (const [id, tok] of [...tokens].slice(0, o.maxNotes)) { notes.push(await openNote(page, id, tok, o)); await sleep(o.noteGapMs); }
-  return { kind: 'comments', windowStart: since, mentions: mentions.map((m) => ({ code: m.json.code, data: { has_more: m.json.data?.has_more, message_list: dropSecrets(m.json.data?.message_list ?? []) } })), notes };
+  return { kind: 'comments', windowStart: since, mentions: mentions.map((m) => slimMentionPage(m.json)), notes };
 }
 
 const EXPAND_SRC = `() => { const re = /^展开\\s*(\\d+\\s*条回复|更多回复?)$/; return [...document.querySelectorAll('.show-more, div, span')].filter((e) => re.test(e.textContent.trim()) && ![...e.children].some((c) => re.test(c.textContent.trim()))); }`;
@@ -101,10 +111,9 @@ export async function openNote(page, id, tok, o) {
     await sleep(1000);
   }
   const left = await page.evaluate(new Function(`return (${EXPAND_SRC})().length`));
-  const pick = (c) => ({ root_comment_id: urlParam(c.url, 'root_comment_id'), code: c.json.code, data: dropSecrets({ has_more: c.json.data?.has_more, comments: c.json.data?.comments ?? [] }) });
   const mine = (c) => !urlParam(c.url, 'note_id') || urlParam(c.url, 'note_id') === id;
   return { noteId: id, opened: true, detail, clicks, expandLeft: left,
-    pages: (await jsons(page, PAGE_API, from)).filter(mine).map(pick), subs: (await jsons(page, SUB_API, from)).filter(mine).map(pick) };
+    pages: (await jsons(page, PAGE_API, from)).filter(mine).map(slimCommentPage), subs: (await jsons(page, SUB_API, from)).filter(mine).map(slimCommentPage) };
 }
 
 async function rawDms(page, o) {
@@ -115,8 +124,8 @@ async function rawDms(page, o) {
   if (!chatsCap.length) return { failed: 'no-data', error: `${o.loadMs}ms 内没抓到 im/web/v3/chats` };
   if (notLoggedIn(chatsCap[0].json)) return { loginLost: true, evidence: `v3/chats code=${chatsCap[0].json.code}` };
   const chats = new Map();
-  const chatsCodes = chatsCap.map((c) => c.json.code ?? null);
-  for (const c of chatsCap) if (c.json.code === 0) for (const x of c.json.data?.chats ?? []) chats.set(x.chat_user_id, x);
+  const chatsCodes = chatsCap.map((c) => chatsCodeOf(c.json));
+  for (const c of chatsCap) if (chatsCodeOf(c.json) === 0) for (const x of c.json.data.chats) chats.set(x.chat_user_id, x);
   const unread = Object.assign({}, ...(await jsons(page, 'chat/get_unread')).map((c) => c.json.data?.user_chat_unread_counts ?? {}));
   const since = o.since ? Date.parse(o.since) : null;
   // 点开会话后列表会重新渲染（行数变了），按行号点不稳；直接打开 /chat/<chat_user_id>（地址里只有对方 uid）
@@ -130,8 +139,7 @@ async function rawDms(page, o) {
     for (const end = Date.now() + 15000; !h && Date.now() < end; await sleep(1000)) h = (await jsons(page, re)).find((x) => urlParam(x.url, 'chat_user_id') === c.chat_user_id) ?? null;
     if (!h) { tried.push('no-history'); continue; }
     tried.push(h.json.code === 0 ? 'ok' : `code=${h.json.code}`);
-    const msgs = h.json.data?.out_message_list ?? h.json.data?.message_list ?? [];
-    histories.push({ chat_user_id: c.chat_user_id, code: h.json.code ?? null, messages: msgs.map((m) => ({ id: m.id, sender_id: m.sender_id, receiver_id: m.receiver_id, created_at: m.created_at, content: m.content })) });
+    histories.push(slimHistory(c.chat_user_id, h.json));
     await sleep(800);
   }
   const slim = [...chats.values()].map((c) => ({ chat_user_id: c.chat_user_id, user_id: c.user_id, last_msg_time: c.last_msg_time, last_msg_content: c.last_msg_content,
@@ -190,7 +198,8 @@ export function parseComments(raw, { accountUid, fetchedAt, since = null }) {
       byId.set(id, mk(c, n.noteId, root, parent, { replyTo: parent !== root && tu ? { uid: uidOf(tu), nickname: tu.nickname ?? null } : null }));
       subsByRoot.set(root, (subsByRoot.get(root) ?? 0) + 1);
     }
-    for (const t of tops) if ((numOrNull(t.sub_comment_count) ?? 0) > (subsByRoot.get(String(t.id)) ?? 0)) partial = true;
+    // 子评论总数缺失时不知道拿全没有，算拿不全（X2-S8）
+    for (const t of tops) { const n = numOrNull(t.sub_comment_count); if (n == null || n > (subsByRoot.get(String(t.id)) ?? 0)) partial = true; }
     const lastPage = n.pages.at(-1).data.has_more === false;
     scannedWorks.push({ workNativeId: n.noteId, complete: lastPage && !partial, threadsPartial: partial });
   }

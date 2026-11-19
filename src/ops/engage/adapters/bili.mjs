@@ -50,7 +50,9 @@ export async function rawComments(get, o) {
   for (let pn = 1; pn <= o.maxPages; pn++) {
     const j = await get(`${API}/x/v2/reply/up/fulllist?order=1&filter=-1&type=1&pn=${pn}&ps=20`);
     if (j.code !== 0) throw new Error(`up/fulllist code=${j.code} ${j.message ?? ''}`);
-    const list = j.data?.list ?? [];
+    // X2-B6：code=0 但缺 list 不能当空页（会判成到底、把旧评论标 gone）
+    if (!Array.isArray(j.data?.list)) return { failed: 'api-error', error: `x/v2/reply/up/fulllist 第 ${pn} 页 code=0 但缺 data.list` };
+    const list = j.data.list;
     pages.push({ code: j.code, data: { page: j.data?.page, list: list.map(slimReply) } });
     // G-B6a：total 缺失时不能拿 0 比，只有不满一页、或 total 是数字且已翻够才算到底
     const total = j.data?.page?.total;
@@ -68,7 +70,8 @@ export async function rawComments(get, o) {
     for (let pn = 1; pn <= 10; pn++) {
       const j = await get(`${API}/x/v2/reply/reply?oid=${oid}&type=1&root=${root}&ps=20&pn=${pn}`);
       if (j.code !== 0) { t.ok = false; t.error = `reply/reply code=${j.code}`; done = true; break; }
-      const rs = j.data?.replies ?? [];
+      if (!Array.isArray(j.data?.replies) && j.data?.replies !== null) { t.ok = false; t.error = 'reply/reply 缺 data.replies'; done = true; break; }
+      const rs = j.data.replies ?? [];
       const count = j.data?.page?.count;
       if (rs.length < 20 || (Number.isFinite(count) && pn * 20 >= count)) done = true;
       t.pages.push({ code: 0, data: { page: j.data?.page, root: slimReply(j.data?.root), replies: rs.map(slimReply), upper: j.data?.upper ? { mid: j.data.upper.mid, top: j.data.upper.top ? { rpid: j.data.upper.top.rpid } : null } : null } });
@@ -89,13 +92,15 @@ export async function rawComments(get, o) {
   return { fulllist: pages, reachedEnd, threadsCut: roots.size > o.maxThreads, threads, views };
 }
 
-async function rawDms(get, o) {
+export async function rawDms(get, o) {
   const sessions = [];
   let endTs = null;
   for (let i = 0; sessions.length < o.maxSessions && i < 5; i++) {
     const j = await get(`${VC}/session_svr/v1/session_svr/get_sessions?session_type=1&group_fold=1&unfollow_fold=0&sort_rule=2${endTs ? `&end_ts=${endTs}` : ''}&build=0&mobi_app=web`);
     if (j.code !== 0) throw new Error(`get_sessions code=${j.code} ${j.message ?? ''}`);
-    const l = j.data?.session_list ?? [];
+    // X2-B7：code=0 但缺 session_list 不能当没有会话
+    if (!Array.isArray(j.data?.session_list)) return { failed: 'api-error', error: `session_svr/get_sessions code=0 但缺 data.session_list` };
+    const l = j.data.session_list;
     sessions.push(...l);
     if (!j.data?.has_more || !l.length) break;
     endTs = l.at(-1).session_ts;
@@ -114,8 +119,10 @@ async function rawDms(get, o) {
   const cards = [], cardsCodes = [];
   for (let i = 0; i < uids.length; i += 20) {
     const j = await get(`${VC}/account/v1/user/cards?uids=${uids.slice(i, i + 20).join(',')}`);
-    cardsCodes.push(j.code ?? null);
-    if (j.code === 0) cards.push(...(j.data ?? []).map((c) => ({ mid: String(c.mid), name: c.name })));
+    // X2-S6：code=0 但缺 data 记成失败码
+    const ok = j.code === 0 && Array.isArray(j.data);
+    cardsCodes.push(ok ? 0 : j.code === 0 ? 'no-list' : j.code ?? null);
+    if (ok) cards.push(...j.data.map((c) => ({ mid: String(c.mid), name: c.name })));
     await sleep(o.gapMs);
   }
   return { sessions: list.map(({ account_info, ...s }) => ({ ...s, ...(account_info ? { account_info: { name: account_info.name } } : {}) })), msgs, cards, cardsCodes };

@@ -42,24 +42,47 @@ async function waitShadow(page, sel, ms) {
   return false;
 }
 
-const FEEDS_SRC = `let x = sr.querySelector('.comment-feed-wrap'); let vm = null;
+// 页面内取数源码（在 wujie shadowRoot 上跑，sr 是 shadowRoot；导出给测试在假 shadowRoot 上跑）。
+// 组件读不到返回 null；组件在、数据是合法空数组才返回 []（X2-B3）。作品一个都没有时 .comment-feed-wrap 不存在，所以退而扫全部元素找组件。
+export const FEEDS_SRC = `let x = sr.querySelector('.comment-feed-wrap'); let vm = null;
   for (let i = 0; x && i < 8 && !vm; x = x.parentElement, i++) if (Array.isArray(x.__vue__?.commentFeeds)) vm = x.__vue__;
+  if (!vm) for (const e of sr.querySelectorAll('*')) if (Array.isArray(e.__vue__?.commentFeeds)) { vm = e.__vue__; break; }
   return vm ? vm.commentFeeds.map((f, i) => ({ i, objectId: f.objectId, objectNonce: f.objectNonce, createTime: f.createTime, commentCount: f.commentCount, commentClose: f.commentClose,
     desc: { description: f.desc?.description ?? null, shortTitle: (f.desc?.shortTitle ?? []).map((s) => ({ shortTitle: s.shortTitle })) } })) : null;`;
 
-const ITEMS_SRC = `return [...sr.querySelectorAll('.comment-item')].map((e) => e.__vue__?.$props?.dataSource).filter(Boolean).map((c) => {
+// X2-B4：一个评论组件都没有、或有组件读不到 dataSource，返回 null（不和「零评论」的 [] 混在一起）
+export const ITEMS_SRC = `const els = [...sr.querySelectorAll('.comment-item')]; const ds = els.map((e) => e.__vue__?.$props?.dataSource);
+  if (!els.length || ds.some((d) => !d)) return null;
+  return ds.map((c) => {
   const one = (c) => ({ commentId: c.commentId, commentNickname: c.commentNickname, commentContent: c.commentContent, commentCreatetime: c.commentCreatetime, commentLikeCount: c.commentLikeCount,
     replyCommentId: c.replyCommentId ?? null, downContinueFlag: c.downContinueFlag, visibleFlag: c.visibleFlag, readFlag: c.readFlag, likeFlag: c.likeFlag, username: c.username });
   return { ...one(c), levelTwoComment: (c.levelTwoComment || []).map(one) }; });`;
 
+export const SESSIONS_SRC = `let v = null; for (let x = sr.querySelector('.session-wrap'), i = 0; x && i < 8 && !v; x = x.parentElement, i++) if (Array.isArray(x.__vue__?.$data?.sessionList)) v = x.__vue__;
+    if (!v) for (const e of sr.querySelectorAll('*')) if (Array.isArray(e.__vue__?.$data?.sessionList)) { v = e.__vue__; break; }
+    if (!v) return null;
+    return v.$data.sessionList.map(([id, s]) => ({ sessionId: id, sessionType: s.sessionType ?? null, newMsgCount: s.newMsgCount ?? 0, sessionIsUnread: !!s.sessionIsUnread,
+      sessionInfo: { sessionId: s.sessionInfo?.sessionId, username: s.sessionInfo?.username, nickname: s.sessionInfo?.nickname, fromUserType: s.sessionInfo?.fromUserType ?? null },
+      messageList: (s.messageList ?? []).map((m) => ({ message: { msgId: m.message?.msgId ?? m.message?.newMsgId ?? null, fromUsername: m.message?.fromUsername, toUsername: m.message?.toUsername, ts: m.message?.ts, msgType: m.message?.msgType, textMsg: m.message?.textMsg ? { content: m.message.textMsg.content } : null } })) }));`;
+
+/** 列表 → 原始数据里的 { [key], emptyState }：组件给了数组（含合法空数组）就用它，空数组即明确为空；组件读不到时只有页面显示「暂无…」才算空，否则 null（X2-B3）。 */
+export function listState(key, list, emptyShownFlag) {
+  if (Array.isArray(list)) return { [key]: list, emptyState: list.length === 0 };
+  return emptyShownFlag ? { [key]: [], emptyState: true } : { [key]: null, emptyState: false, note: `${key} 组件读不到` };
+}
+
+async function pollList(page, src, ms) {
+  let list = null;
+  for (const end = Date.now() + ms; !Array.isArray(list) && Date.now() < end; await sleep(1000)) list = await inShadow(page, src);
+  return list;
+}
+
 async function rawComments(page, o) {
-  // X-B5：列表没出来时，只有页面明确显示空状态才算「没有作品」；否则 feeds=null，解析按 no-data 失败
-  if (!(await waitShadow(page, '.comment-feed-wrap', o.waitMs))) return { feeds: (await emptyShown(page)) ? [] : null, emptyState: await emptyShown(page), works: [], note: '作品列表没出来' };
   const sinceSec = o.now / 1000 - o.maxAgeDays * 86400;
   const windowStartSec = Math.floor(sinceSec);
+  let feeds = await pollList(page, FEEDS_SRC, o.waitMs);
+  if (!Array.isArray(feeds) || !feeds.length) return { windowStartSec, ...listState('feeds', feeds, await emptyShown(page)), works: [] };
   // 作品列表滚动懒加载：滚到最后一个，直到最早的早于窗口或不再变多
-  let feeds = await inShadow(page, FEEDS_SRC);
-  if (!Array.isArray(feeds)) return { feeds: null, works: [], note: '作品列表组件（commentFeeds）没找到' };
   for (let i = 0; i < 6 && feeds.length && Math.min(...feeds.map((f) => f.createTime)) >= sinceSec; i++) {
     await inShadow(page, `const l = [...sr.querySelectorAll('.comment-feed-wrap')].at(-1); l?.scrollIntoView({ block: 'end' }); return true;`);
     await sleep(2500);
@@ -78,20 +101,17 @@ async function rawComments(page, o) {
       clicks++; await sleep(2000);
     }
     const left = await inShadow(page, `return [...sr.querySelectorAll('*')].filter((e) => e.children.length === 0 && /^展开更多回复$/.test(e.textContent.trim()) && e.getBoundingClientRect().height > 0).length;`);
-    works.push({ objectNonce: f.objectNonce, opened: true, clicks, expandLeft: left ?? 0, items: await inShadow(page, ITEMS_SRC) });
+    works.push({ objectNonce: f.objectNonce, opened: true, clicks, expandLeft: left, items: await inShadow(page, ITEMS_SRC) });
   }
-  return { windowStartSec, feeds, works };
+  return { windowStartSec, ...listState('feeds', feeds, false), works };
 }
 
 async function rawDms(page, o) {
-  if (!(await waitShadow(page, '.session-wrap', o.waitMs))) return { sessions: (await emptyShown(page)) ? [] : null, emptyState: await emptyShown(page), note: '会话列表没出来' };
+  // 会话列表先渲染出来再读（读到的是合法空数组也再等一会儿，避免刚加载时的空列表）
+  await waitShadow(page, '.session-wrap', o.waitMs);
   await sleep(1500);
-  const sessions = await inShadow(page, `let v = null; for (let x = sr.querySelector('.session-wrap'), i = 0; x && i < 8 && !v; x = x.parentElement, i++) if (x.__vue__?.$data?.sessionList) v = x.__vue__;
-    if (!v) return null;
-    return v.$data.sessionList.map(([id, s]) => ({ sessionId: id, sessionType: s.sessionType ?? null, newMsgCount: s.newMsgCount ?? 0, sessionIsUnread: !!s.sessionIsUnread,
-      sessionInfo: { sessionId: s.sessionInfo?.sessionId, username: s.sessionInfo?.username, nickname: s.sessionInfo?.nickname, fromUserType: s.sessionInfo?.fromUserType ?? null },
-      messageList: (s.messageList ?? []).map((m) => ({ message: { msgId: m.message?.msgId ?? m.message?.newMsgId ?? null, fromUsername: m.message?.fromUsername, toUsername: m.message?.toUsername, ts: m.message?.ts, msgType: m.message?.msgType, textMsg: m.message?.textMsg ? { content: m.message.textMsg.content } : null } })) }));`);
-  return { sessions: Array.isArray(sessions) ? sessions : null, ...(Array.isArray(sessions) ? {} : { note: '会话列表组件（sessionList）没找到' }) };
+  const sessions = await pollList(page, SESSIONS_SRC, 5000);
+  return listState('sessions', sessions, Array.isArray(sessions) ? false : await emptyShown(page));
 }
 
 // —— 解析 ——
@@ -119,7 +139,7 @@ export function parseComments(raw, { accountUid, nickname, fetchedAt }) {
     if (!w.opened || !Array.isArray(w.items)) { scannedWorks.push({ workNativeId: String(w.objectNonce), complete: false, threadsPartial: true }); continue; }
     // 嵌套的 levelTwoComment 和单独渲染的 .comment-item 合起来按 id 去重；replyCommentId 链往上走到没有 replyCommentId 的那条就是一楼
     const all = new Map();
-    let more = w.expandLeft > 0;
+    let more = w.expandLeft !== 0;   // 剩余「展开更多回复」读不到（null）也算没展开完
     for (const c of w.items) {
       if (Number(c.downContinueFlag) === 1) more = true;
       for (const x of [c, ...c.levelTwoComment.map((r) => ({ ...r, replyCommentId: r.replyCommentId || c.commentId }))]) {
