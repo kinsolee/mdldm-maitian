@@ -602,3 +602,250 @@ test('仓库夹具里没有会过期的 URL 或凭据', () => {
     assert.doesNotMatch(JSON.stringify(data), /https?:\/\/[^"]*\?(?!<)|x-expires|xsec|finderUsername|token/i, f);
   }
 });
+
+// 作品列表没读成功时不能当成「窗口内 0 条」：调用方按 posts 覆盖整个平台，会把导出写空（KIN-328 集成实测小红书出过一次）
+describe('作品列表没读成功 → complete=false', () => {
+  const ok = (x) => ({ http: 200, ...x });
+
+  describe('抖音', async () => {
+    const dy = await import('../src/ops/works/douyin.mjs');
+    const S = sample('douyin');
+    const fx = fixture('douyin-account');
+    const opts = { days: 30, nowMs: cstMs('2026-11-19 14:50:13') };
+    const run = (pages, more = {}) => dy.map({ info: fx.info, pages, fans: fx.fans, ...more }, opts);
+    const empty = ok({ status_code: 0, total: 0, has_more: false, max_cursor: 0, aweme_list: [], items: [] });
+
+    test('读成功 → complete=true、incomplete=null', () => {
+      const r = run([ok(S.raw.work_list)]);
+      assert.equal(r.complete, true);
+      assert.equal(r.incomplete, null);
+    });
+    test('确实 0 条 → complete=true、posts=[]', () => {
+      const r = run([empty]);
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.posts, []);
+    });
+    test('http 406 / status_code≠0 / 没有 aweme_list（任一页）→ complete=false，写明接口和第几页', () => {
+      let r = run([{ ...empty, http: 406, status_code: null, aweme_list: null }]);
+      assert.equal(r.complete, false);
+      assert.match(r.incomplete, /work_list 第 1 页.*http=406/);
+      r = run([ok(S.raw.work_list), { ...empty, status_code: 2190008 }]);
+      assert.equal(r.complete, false);
+      assert.match(r.incomplete, /work_list 第 2 页.*code=2190008/);
+      assert.equal(r.posts.length, 1);   // 读到的照出，调用方按 complete 决定写不写
+      assert.match(run([{ ...empty, aweme_list: null }]).incomplete, /data 缺失/);
+    });
+    test('翻到页数上限还没停 → complete=false', () => {
+      assert.equal(run([ok(S.raw.work_list)], { hitMaxPages: true }).complete, false);
+    });
+    test('没登录 → complete=false', () => {
+      assert.equal(dy.map({ info: { http: 200, status_code: 8 } }, opts).complete, false);
+    });
+    test('粉丝接口失败不影响 complete：daily 为空，stats 写明', () => {
+      const r = run([ok(S.raw.work_list)], { fans: { http: 500, status_code: null, metrics: [] } });
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.account.daily, []);
+      assert.match(r.stats.fansProblems.join(), /dashboard\/fans.*http=500/);
+    });
+    test('fetchRaw：work_list 回 406 的 HTML → complete=false', async () => {
+      const page = fakePage({ routes: [[/user\/info/, { body: { status_code: 0, user: { uid: 1 } } }], [/work_list/, { status: 406, body: '<html/>' }], [/dashboard\/fans/, { body: { status_code: 0, metrics: [] } }]] });
+      const r = dy.map(await dy.fetchRaw(page, { ...opts, ...fakeSleep() }), opts);
+      assert.equal(r.complete, false);
+      assert.match(r.incomplete, /http=406/);
+    });
+  });
+
+  describe('B站', async () => {
+    const bili = await import('../src/ops/works/bili.mjs');
+    const S = sample('bili');
+    const fx = fixture('bili-account');
+    const opts = { days: 30, nowMs: cstMs('2026-11-19 14:26:35') };
+    const run = (archives, more = {}) => bili.map({ nav: fx.nav, archives, compare: ok(S.raw.compare), fansGraph: fx.fansGraph, fansNum: ok(S.raw.fansNum), ...more }, opts);
+
+    test('读成功 → complete=true', () => {
+      const r = run([ok(S.raw.archives)]);
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.stats.fansProblems, []);
+      assert.equal(r.stats.compareProblem, null);
+    });
+    test('确实 0 条（arc_audits=null、page.count=0）→ complete=true', () => {
+      const r = run([ok({ code: 0, data: { class: { pubed: 0 }, page: { pn: 1, ps: 20, count: 0 }, arc_audits: null } })]);
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.posts, []);
+    });
+    test('http≠200 / code≠0 / data 缺失（任一页）→ complete=false', () => {
+      assert.match(run([{ http: 412, code: null, data: null }]).incomplete, /archives 第 1 页.*http=412/);
+      assert.match(run([ok(S.raw.archives), ok({ code: -400, data: null })]).incomplete, /archives 第 2 页.*code=-400/);
+      assert.match(run([ok({ code: 0, data: null })]).incomplete, /data 缺失/);
+      assert.equal(run([ok({ code: 0, data: { page: { count: 3 }, arc_audits: null } })]).complete, false);
+    });
+    test('compare 失败：作品照出、fansAdd/viewTime 为 null，complete 仍为 true，stats 写明', () => {
+      const r = run([ok(S.raw.archives)], { compare: { http: 500, code: null, data: null } });
+      assert.equal(r.complete, true);
+      assert.equal(r.posts.length, 1);
+      assert.equal(r.posts[0].fansAdd, null);
+      assert.equal(r.posts[0].viewTime, null);
+      assert.match(r.stats.compareProblem, /compare.*http=500/);
+    });
+    test('粉丝接口失败不影响 complete', () => {
+      const r = run([ok(S.raw.archives)], { fansNum: { http: 200, code: -101, data: null } });
+      assert.equal(r.complete, true);
+      assert.equal(r.account.fans, null);
+      assert.match(r.stats.fansProblems.join(), /fans\/stat\/num/);
+    });
+  });
+
+  describe('小红书', async () => {
+    const xhs = await import('../src/ops/works/xhs.mjs');
+    const S = sample('xhs');
+    const fx = fixture('xhs-account');
+    const nowMs = cstMs('2026-11-19 14:26:09');
+    const opts = { days: 30, nowMs };
+    const one = () => { const a = structuredClone(S.raw.analyze); a.data.total = 1; return ok(a); };
+    const run = (analyze, more = {}) => xhs.map({ atLoginPage: false, analyze, posted: [], userInfo: fx.userInfo, personalInfo: S.raw.personal_info, fans: fx.fans, ...more }, opts);
+
+    test('读成功 → complete=true', () => assert.equal(run([one()]).complete, true));
+    test('确实 0 条（total=0）→ complete=true', () => {
+      const r = run([ok({ code: 0, data: { total: 0, note_infos: [] } })]);
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.posts, []);
+    });
+    test('406 / code≠0 / data 缺失 / 签名函数缺失 → complete=false', () => {
+      assert.match(run([{ http: 406, code: null, data: null }]).incomplete, /analyze\/list 第 1 页.*http=406/);
+      assert.match(run([ok({ code: -1, data: null })]).incomplete, /code=-1/);
+      assert.match(run([ok({ code: 0, data: null })]).incomplete, /data 缺失/);
+      assert.match(run([ok({ code: 0, data: { note_infos: [] } })]).incomplete, /data 缺失/);   // 没有 total
+      assert.match(run([{ http: null, code: null, error: '页面没有 _webmsxyw', data: null }]).incomplete, /_webmsxyw/);
+    });
+    test('第一页 total=15、实际只拿到 1 条（中途某页失败）→ complete=false', () => {
+      const a = ok(S.raw.analyze);   // 样例 total=15、note_infos 只有 1 条
+      const r = run([a]);
+      assert.equal(r.complete, false);
+      assert.match(r.incomplete, /只拿到 1 条，total=15/);
+      assert.equal(run([a, { http: 500, code: null, data: null }]).complete, false);
+    });
+    test('跳到登录页 → complete=false', () => assert.equal(xhs.map({ atLoginPage: true }, opts).complete, false));
+    test('笔记管理列表、粉丝接口失败不影响 complete', () => {
+      const r = run([one()], { posted: [{ http: 406, code: null, data: { notes: [] } }], fans: { http: 500, code: null, data: { thirty: null } } });
+      assert.equal(r.complete, true);
+      assert.equal(r.stats.postedProblems.length, 1);
+      assert.match(r.stats.fansProblems.join(), /overall_new/);
+    });
+
+    describe('fetchRaw：等签名函数、第一页重试', () => {
+      // 假 page：签名函数第 readyAt 次查询时才出现；analyze 按次序回 analyzeSeq（每个元素是 {status, body}）
+      function page({ readyAt = 1, analyzeSeq }) {
+        const st = { polls: 0, analyze: 0 };
+        const p = fakePage({
+          url: 'https://creator.xiaohongshu.com/new/note-manager',
+          routes: [
+            [/user\/info/, { body: { code: 0, data: { userId: 'u1' } } }],
+            [/personal_info/, { body: { code: 0, data: { name: 'n', fans_count: 3 } } }],
+            [/overall_new/, { body: { code: 0, data: { thirty: { fans_list: [] } } } }],
+          ],
+          evaluate: async (arg, fn) => {
+            const saved = { window: globalThis.window, fetch: globalThis.fetch };
+            const ready = arg === undefined ? ++st.polls >= readyAt : st.polls >= readyAt;
+            globalThis.window = ready ? { _webmsxyw: () => ({ 'X-s': 's', 'X-t': 1 }) } : {};
+            globalThis.fetch = async (u) => {
+              const res = /analyze\/list/.test(u) ? analyzeSeq[Math.min(st.analyze++, analyzeSeq.length - 1)] : { status: 200, body: { code: 0, data: { notes: [] } } };
+              return { status: res.status ?? 200, text: async () => (typeof res.body === 'string' ? res.body : JSON.stringify(res.body)) };
+            };
+            try { return await fn(arg); } finally { globalThis.window = saved.window; globalThis.fetch = saved.fetch; }
+          },
+        });
+        return { p, st };
+      }
+      const good = { body: { code: 0, data: { total: 1, note_infos: [{ id: 'n1', audit_status: 1, type: 2, post_time: nowMs - 3600_000 }] } } };
+
+      test('签名函数第 4 次查询才出现：每秒查一次，就绪后才发第一个签名请求', async () => {
+        const { p, st } = page({ readyAt: 4, analyzeSeq: [good] });
+        const { sleep, waits } = fakeSleep();
+        const raw = await xhs.fetchRaw(p, { ...opts, sleep });
+        assert.equal(raw.signerPolls, 4);
+        assert.equal(raw.signerReady, true);
+        assert.deepEqual(waits.slice(0, 3), [1000, 1000, 1000]);
+        assert.equal(st.analyze, 1);
+        assert.equal(xhs.map(raw, opts).complete, true);
+      });
+
+      test('签名函数 20 秒都没出现：停止等待，complete=false', async () => {
+        const { p } = page({ readyAt: Infinity, analyzeSeq: [good] });
+        const { sleep, waits } = fakeSleep();
+        const raw = await xhs.fetchRaw(p, { ...opts, sleep });
+        assert.equal(raw.signerReady, false);
+        assert.equal(waits.filter((ms) => ms === 1000).length, 20);
+        const r = xhs.map(raw, opts);
+        assert.equal(r.complete, false);
+        assert.equal(r.stats.signerReady, false);
+      });
+
+      test('第一页 406：等 3 秒重试一次，成功就 complete=true，重试次数写进 raw 和 stats', async () => {
+        const { p, st } = page({ analyzeSeq: [{ status: 406, body: '' }, good] });
+        const { sleep, waits } = fakeSleep();
+        const raw = await xhs.fetchRaw(p, { ...opts, sleep });
+        assert.equal(st.analyze, 2);
+        assert.ok(waits.includes(3000));
+        assert.equal(raw.analyzeRetries, 1);
+        const r = xhs.map(raw, opts);
+        assert.equal(r.complete, true);
+        assert.equal(r.stats.analyzeRetries, 1);
+        assert.equal(r.stats.analyzeFirstTry.http, 406);
+      });
+
+      test('第一页 code≠0、重试仍失败 → 只重试一次，complete=false', async () => {
+        const { p, st } = page({ analyzeSeq: [{ body: { code: -1, success: false } }] });
+        const raw = await xhs.fetchRaw(p, { ...opts, ...fakeSleep() });
+        assert.equal(st.analyze, 2);
+        assert.equal(xhs.map(raw, opts).complete, false);
+      });
+
+      test('第一页一次成功：不重试', async () => {
+        const { p, st } = page({ analyzeSeq: [good] });
+        const raw = await xhs.fetchRaw(p, { ...opts, ...fakeSleep() });
+        assert.equal(st.analyze, 1);
+        assert.equal(raw.analyzeRetries, undefined);
+      });
+    });
+  });
+
+  describe('视频号', async () => {
+    const ch = await import('../src/ops/works/channels.mjs');
+    const S = sample('channels');
+    const fx = fixture('channels-account');
+    const opts = { days: 30, nowMs: cstMs('2026-11-19 15:36:47') };
+    const run = (postList, more = {}) => ch.map({ auth: fx.auth, postList, fansTrend: fx.fansTrend, ...more }, opts);
+    const one = () => { const a = structuredClone(S.raw.postList); a.data.totalCount = 1; return ok(a); };
+
+    test('读成功 → complete=true', () => assert.equal(run([one()]).complete, true));
+    test('确实 0 条（totalCount=0）→ complete=true', () => {
+      const r = run([ok({ errCode: 0, data: { totalCount: 0, list: [] } })]);
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.posts, []);
+    });
+    test('http≠200 / errCode≠0 / list 或 totalCount 缺失 → complete=false', () => {
+      assert.match(run([{ http: 500, errCode: null, data: null }]).incomplete, /post_list 第 1 页.*http=500/);
+      assert.match(run([one(), ok({ errCode: 300334, data: null })]).incomplete, /post_list 第 2 页.*code=300334/);
+      assert.match(run([ok({ errCode: 0, data: { totalCount: 3, list: null } })]).incomplete, /data 缺失/);
+      assert.match(run([ok({ errCode: 0, data: { totalCount: null, list: [] } })]).incomplete, /data 缺失/);
+    });
+    test('拿到的条数少于 totalCount → complete=false', () => {
+      assert.match(run([ok(S.raw.postList)]).incomplete, /只拿到 1 条，totalCount=16/);
+    });
+    test('粉丝接口失败不影响 complete', () => {
+      const r = run([one()], { fansTrend: { http: 200, errCode: -1, startTs: 0, data: null } });
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.account.daily, []);
+      assert.match(r.stats.fansProblems.join(), /fans_trend/);
+    });
+  });
+});
+
+test('四个平台的 map 都返回 complete 和 incomplete', async () => {
+  const idx = await import('../src/ops/works/index.mjs');
+  for (const code of idx.COLLECT_PLATFORMS) {
+    const r = (await idx.loadPlatform(code)).map({}, { days: 30, nowMs: 0 });
+    assert.equal(r.complete, false, code);
+    assert.equal(typeof r.incomplete, 'string', code);
+  }
+});

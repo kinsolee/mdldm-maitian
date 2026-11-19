@@ -2,7 +2,7 @@
 // 请求、签名、翻页照搬 spikes/platform/06-works-xhs.mjs（2026-11-19 实测）。
 // 两个作品列表接口直接 fetch 会 406，要带 X-s/X-t：用页面自己的 window._webmsxyw 在 page.evaluate 里现算、在页面里 fetch，
 // 签名不出页面。粉丝三个接口不用签名。fetchRaw 在 Ego space 里跑；map 是宿主侧纯函数。
-import { DAY, cst, cstMs, cstDate, cstDay0, num, pick } from './fmt.mjs';
+import { DAY, cst, cstMs, cstDate, cstDay0, num, pick, pageProblem } from './fmt.mjs';
 
 export const PLATFORM = 'XiaoHongShu';
 export const START_URL = 'https://creator.xiaohongshu.com/new/note-manager';
@@ -10,6 +10,10 @@ export const SETTLE_MS = 8000;
 const PAGE_GAP_MS = 2500;
 const MAX_ANALYZE_PAGES = 10;   // 每页 10 条
 const MAX_POSTED_PAGES = 5;
+// goto 之后页面的签名函数不一定马上就绪（KIN-328 实测第一次 analyze 0 条、紧接着重跑 15 条）：先等它出现
+const SIGNER_WAIT_MS = 20000;
+const SIGNER_POLL_MS = 1000;
+const FIRST_PAGE_RETRY_MS = 3000;
 
 // 时间窗：东八区当天 0 点往前 N 天，到今天 23:59:59（页面「近30天」就是这样传的毫秒时间戳）
 const windowOf = (days, nowMs) => {
@@ -43,16 +47,32 @@ export async function fetchRaw(page, { days, nowMs, sleep }) {
   const raw = { atLoginPage: /\/login/.test(url) };
   if (raw.atLoginPage) return raw;
 
+  raw.signerPolls = 0;
+  for (let waited = 0; ; waited += SIGNER_POLL_MS) {
+    raw.signerPolls++;
+    raw.signerReady = await page.evaluate(() => typeof window._webmsxyw === 'function');
+    if (raw.signerReady || waited >= SIGNER_WAIT_MS) break;
+    await sleep(SIGNER_POLL_MS);
+  }
+
   const { begin, end } = windowOf(days, nowMs);
   const analyzeUrl = (n) => `/api/galaxy/creator/datacenter/note/analyze/list?post_begin_time=${begin}&post_end_time=${end}&type=0&page_size=10&page_num=${n}`;
   raw.analyze = [];
   let got = 0;
   for (let n = 1; n <= MAX_ANALYZE_PAGES; n++) {
     if (n > 1) await sleep(PAGE_GAP_MS);
-    const r = await signedGet(page, analyzeUrl(n));
+    let r = await signedGet(page, analyzeUrl(n));
+    // 第一页没读成功等 3 秒重试一次；第一次的结果记在 analyzeFirstTry
+    if (n === 1 && (r.http !== 200 || r.json?.code !== 0)) {
+      raw.analyzeFirstTry = head(r);
+      raw.analyzeRetries = 1;
+      await sleep(FIRST_PAGE_RETRY_MS);
+      r = await signedGet(page, analyzeUrl(n));
+    }
     const d = r.json?.data;
     const notes = (d?.note_infos ?? []).map((x) => pick(x, NOTE_KEYS));
-    raw.analyze.push({ ...head(r), data: { total: d?.total ?? null, note_infos: notes } });
+    // 没有 data / note_infos 记 null（不是 []），map 据此判断这页没读成功
+    raw.analyze.push({ ...head(r), data: d ? { total: d.total ?? null, note_infos: Array.isArray(d.note_infos) ? notes : null } : null });
     got += notes.length;
     // data.total 是窗口内总数，按 page_num 翻到够数
     if (!notes.length || got >= (d?.total ?? 0)) break;
@@ -113,6 +133,16 @@ export function map(raw, { days, nowMs }) {
     };
   });
 
+  // analyze 任一页没读成功、或拿到的条数少于第一页的 total（中途某页失败），都不算完整；
+  // 笔记管理列表（只用来补状态）和粉丝接口失败不影响 complete
+  const an = raw.analyze ?? [];
+  const total = an[0]?.data?.total ?? null;
+  const incomplete = raw.atLoginPage ? '跳到登录页，没读作品列表'
+    : !loggedIn ? '没登录，没读作品列表'
+    : !an.length ? 'analyze/list 没读'
+    : an.map((x, i) => pageProblem('analyze/list', i, x, Array.isArray(x.data?.note_infos) && x.data.total != null)).find(Boolean)
+      ?? (notes.length < total ? `analyze/list 只拿到 ${notes.length} 条，total=${total}` : null);
+
   const t30 = raw.fans?.data?.thirty ?? {};
   const rise = new Map((t30.rise_fans_list ?? []).map((x) => [x.date, num(x.count)]));
   const leave = new Map((t30.leave_fans_list ?? []).map((x) => [x.date, num(x.count)]));
@@ -135,6 +165,14 @@ export function map(raw, { days, nowMs }) {
     errors: [...(raw.analyze ?? []), ...(raw.posted ?? [])].map((x) => x.error).filter(Boolean),
     total: raw.analyze?.[0]?.data?.total ?? null, fetched: notes.length, inWindow: posts.length,
     postedMatched: posts.filter((p) => p.permission).length,
+    signerReady: raw.signerReady ?? null, signerPolls: raw.signerPolls ?? 0,
+    analyzeRetries: raw.analyzeRetries ?? 0, analyzeFirstTry: raw.analyzeFirstTry ?? null,
+    postedProblems: (raw.posted ?? []).map((x, i) => pageProblem('user/posted', i, x, Array.isArray(x.data?.notes))).filter(Boolean),
+    fansProblems: [
+      raw.userInfo && pageProblem('user/info', 0, raw.userInfo, raw.userInfo.data?.userId != null),
+      raw.fans && pageProblem('fans/overall_new', 0, raw.fans, !!raw.fans.data?.thirty),
+      loggedIn && !raw.fans && 'fans/overall_new 没读，daily 为空',
+    ].filter(Boolean),
   };
-  return { loggedIn, uidSeen: uid, posts, account, stats };
+  return { loggedIn, complete: !incomplete, incomplete: incomplete || null, uidSeen: uid, posts, account, stats };
 }

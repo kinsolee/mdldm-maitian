@@ -1,7 +1,7 @@
 // 抖音：近 N 天作品 + 指标、粉丝总数和分日粉丝。读法和字段对照见 spikes/results/06-works.md「抖音」，
 // 请求、翻页、停止条件照搬 spikes/platform/06-works-douyin.mjs（2026-11-19 实测）。
 // fetchRaw 在 Ego space 里跑（只读 GET，不点任何东西）；map 是宿主侧纯函数。
-import { DAY, cst, num, pct, parseBigIds, pick } from './fmt.mjs';
+import { DAY, cst, num, pct, parseBigIds, pick, pageProblem } from './fmt.mjs';
 
 export const PLATFORM = 'Douyin';
 export const START_URL = 'https://creator.douyin.com/creator-micro/content/manage';
@@ -26,7 +26,8 @@ const STAT_KEYS = ['play_count', 'digg_count', 'comment_count', 'collect_count',
 const METRIC_KEYS = ['subscribe_count', 'unsubscribe_count', 'homepage_visit_count', 'completion_rate', 'bounce_rate_2s', 'completion_rate_5s', 'avg_view_second', 'fan_view_proportion'];
 const trimPage = ({ http, json: j }) => ({
   http, status_code: j?.status_code ?? null, total: j?.total ?? null, has_more: j?.has_more ?? null, max_cursor: j?.max_cursor ?? null,
-  aweme_list: (j?.aweme_list ?? []).map((a) => ({
+  // 响应里没有 aweme_list 记 null（不是 []），map 据此判断这页没读成功
+  aweme_list: !Array.isArray(j?.aweme_list) ? null : j.aweme_list.map((a) => ({
     ...pick(a, AWEME_KEYS), statistics: pick(a.statistics, STAT_KEYS),
     video: { cover: { url_list: (a.video?.cover?.url_list ?? []).slice(0, 1) } },
   })),
@@ -48,7 +49,7 @@ export async function fetchRaw(page, { days, nowMs, sleep }) {
     if (i) await sleep(PAGE_GAP_MS);
     const p = trimPage(await get(page, listUrl(cursor)));
     raw.pages.push(p);
-    const list = p.aweme_list;
+    const list = p.aweme_list ?? [];
     // 置顶作品 is_pinned=true（非置顶时没有这个键）排在第一页最前，发布时间可能很早，算「最早一条」时跳过；
     // 一页全是置顶时不据此停，看 has_more
     const unpinned = list.filter((a) => a.is_pinned !== true);
@@ -105,6 +106,12 @@ export function map(raw, { days, nowMs }) {
     };
   });
 
+  // 作品列表任一页没读成功、或翻到上限还没停，都不算完整；粉丝接口失败不影响 complete
+  const incomplete = !loggedIn ? '没登录，没读作品列表'
+    : !raw.pages?.length ? 'work_list 没读'
+    : pages.map((p, i) => pageProblem('work_list', i, { http: p.http, code: p.status_code }, Array.isArray(p.aweme_list))).find(Boolean)
+      ?? (raw.hitMaxPages ? `work_list 翻到 ${MAX_PAGES} 页上限还没到窗口起点` : null);
+
   const metric = (name) => (raw.fans?.metrics ?? []).find((x) => x.english_metric_name === name);
   const net = new Map((metric('net_fans_cnt')?.trends ?? []).map((t) => [t.date_time, t.value]));
   const account = {
@@ -119,6 +126,11 @@ export function map(raw, { days, nowMs }) {
     code: { info: raw.info?.status_code ?? null, list: pages.map((p) => p.status_code), fans: raw.fans?.status_code ?? null },
     totalAllTime: pages[0]?.total ?? null, fetched: aweme.length, inWindow: posts.length,
     itemsMatched: posts.filter((p) => items.has(p.postId)).length, hitMaxPages: raw.hitMaxPages ?? false,
+    fansProblems: [
+      raw.info?.status_code !== 0 && 'user/info 没读成功，fans 为 null',
+      raw.fans && pageProblem('dashboard/fans', 0, { http: raw.fans.http, code: raw.fans.status_code }, true),
+      !raw.fans && loggedIn && 'dashboard/fans 没读，daily 为空',
+    ].filter(Boolean),
   };
-  return { loggedIn, uidSeen: uid, posts, account, stats };
+  return { loggedIn, complete: !incomplete, incomplete: incomplete || null, uidSeen: uid, posts, account, stats };
 }

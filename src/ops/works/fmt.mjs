@@ -32,3 +32,10 @@ export const pick = (o, keys) => {
   for (const k of keys) if (o[k] !== undefined) out[k] = o[k];
   return out;
 };
+
+// 作品列表某一页没读成功的说明（成功返回 null）。没读成功的页不能当成「这页 0 条」：
+// 调用方会按 map 的 posts 覆盖整个平台，把失败当 0 条就会把导出写空（KIN-328 小红书实测过一次）
+export function pageProblem(api, index, { http, code, error }, dataOk) {
+  const why = error ? `error=${error}` : http !== 200 ? 'http 不是 200' : code !== 0 ? 'code 不是 0' : !dataOk ? 'data 缺失' : null;
+  return why && `${api} 第 ${index + 1} 页没读成功：${why}（http=${http ?? null} code=${code ?? null}）`;
+}
