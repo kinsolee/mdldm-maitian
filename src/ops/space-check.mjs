@@ -38,11 +38,30 @@ const CHECKS = {
     const code = r.json?.code;
     return { state: code === 0 && r.json?.data?.isLogin ? 'ok' : code === -101 ? 'out' : 'unknown', evidence: `GET api.bilibili.com/x/web-interface/nav http=${r.status} code=${code} isLogin=${r.json?.data?.isLogin}`, uidSeen: r.json?.data?.mid ?? null };
   },
-  async GongZhongHao(page, a) {
-    const url = await page.url();
-    const hasToken = /[?&]token=\d+/.test(url);
-    const hasGh = hasToken ? await page.evaluate((gh) => document.documentElement.innerHTML.includes(gh), a.uid) : false;
-    return { state: hasToken ? 'ok' : 'out', evidence: `落地 URL ${hasToken ? '带 token' : '不带 token'}；页面含登记的 gh_ id=${hasGh}`, uidSeen: hasGh ? a.uid : null };
+  async GongZhongHao(page) {
+    // 读实际登录的原始 ID（gh_ + 12 位十六进制），由 login.mjs 和登记的比对；token 只用来请求设置页，不写进证据
+    const token = (await page.url()).match(/[?&]token=(\d+)/)?.[1];
+    if (!token) return { state: 'out', evidence: '落地 URL 不带 token', uidSeen: null };
+    const seen = await page.evaluate(() => {
+      const valid = (v) => typeof v === 'string' && /^gh_[0-9a-f]{12}$/.test(v);
+      let common = [];
+      try { common = [...new Set([window.wx?.commonData?.data?.user_name, window.wx?.commonData?.user_name].filter(valid))]; } catch {}
+      return { common, html: [...new Set(document.documentElement.innerHTML.match(/\bgh_[0-9a-f]{12}\b/g) ?? [])] };
+    });
+    let source, ids, note = '';
+    if (seen.common.length) [source, ids] = ['commonData', seen.common];
+    else if (seen.html.length) [source, ids] = ['html', seen.html];
+    else {
+      source = 'settingpage';
+      try {
+        const r = await page.fetch(`/cgi-bin/settingpage?t=setting/index&action=index&token=${token}&lang=zh_CN`, { method: 'GET', timeout: 15000 });
+        // 只认 2xx：500、302 跳登录之类的响应不可信，不解析
+        ids = r.status >= 200 && r.status < 300 ? [...new Set(String(r.body ?? '').match(/\bgh_[0-9a-f]{12}\b/g) ?? [])] : [];
+        note = ` http=${r.status}`;
+      } catch (e) { ids = []; note = ` 请求失败（${e.name}）`; }
+    }
+    const found = ids.length === 1 ? `取到 ${ids[0]}` : ids.length ? `找到 ${ids.length} 个不同的 gh_ id，没法确定当前账号` : '没找到 gh_ id';
+    return { state: 'ok', evidence: `落地 URL 带 token；gh_ id 来源 ${source}${note}，找到 ${ids.length} 个，${found}`, uidSeen: ids.length === 1 ? ids[0] : null };
   },
   async Weibo(page, a) {
     // /ajax/profile/info 未登录也返回 ok=1，不能单独判断；要看落地 URL 和页面配置里的自己 uid

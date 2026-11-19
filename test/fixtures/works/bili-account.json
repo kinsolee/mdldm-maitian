@@ -1,0 +1,9 @@
+{
+  "note": "B站样例缺的账号响应：nav 和 30 天分日的最后三天（照 06-bili-works.json 的 mapped.account 改出来；total_inc 是当天总数）",
+  "nav": { "http": 200, "code": 0, "data": { "isLogin": true, "mid": 478358005, "uname": "Kinsolee" } },
+  "fansGraph": {
+    "http": 200,
+    "code": 0,
+    "data": { "tendency": [{ "date_key": 1794758400, "total_inc": 88 }, { "date_key": 1794844800, "total_inc": 96 }, { "date_key": 1794931200, "total_inc": 99 }] }
+  }
+}
