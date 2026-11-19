@@ -58,5 +58,10 @@ CREATE TABLE IF NOT EXISTS sync_jobs (
   requestedAt TEXT NOT NULL, startedAt TEXT, finishedAt TEXT, error TEXT, stats TEXT
 );
 CREATE INDEX IF NOT EXISTS sync_jobs_platform ON sync_jobs (platformCode, kind, requestedAt);
+-- 每个账号每种 kind 第一次成功入库的时间。有这行才出事件（空的首轮也算建立了基线）
+CREATE TABLE IF NOT EXISTS engage_baselines (accountId TEXT NOT NULL, kind TEXT NOT NULL, establishedAt TEXT NOT NULL, PRIMARY KEY (accountId, kind));
+-- 升级前的库：已经有评论、会话行的账号补上基线，免得升级后再吞一轮
+INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'comments', min(firstSeenAt) FROM comments GROUP BY accountId;
+INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt) FROM conversations GROUP BY accountId;
 `);
 }

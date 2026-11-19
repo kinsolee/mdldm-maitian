@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { setCapability } from '../src/ops/accounts.mjs';
-import { requestRefresh, getJob } from '../src/ops/engage/store.mjs';
+import { requestRefresh, getJob, startJob, createJob, STALE_RUNNING_MS } from '../src/ops/engage/store.mjs';
 import { subscribe } from '../src/ops/engage/subscribers.mjs';
 import { runRound, shouldStartRound, makeEngageTicker, engageStatus, redact } from '../src/daemon/sync.mjs';
 import { acquireRoundLock } from '../src/daemon/round-lock.mjs';
@@ -182,6 +182,34 @@ describe('一轮抓取', () => {
     assert.equal(getJob(db, jobId).status, 'ok');
     assert.equal(calls.length, 2);
     assert.equal(jobsOf(db).length, 2);
+  });
+
+  test('X-B9：上一个进程崩在 running 的 refresh 每轮开头被回收为 failed，新的 refresh_now 能排上并跑', async () => {
+    const { db, c, base } = setup();
+    const { collect, calls } = fakeCollect({ 'Douyin/comments': [commentsSnap([comment('c1')]), commentsSnap([comment('c1')])] });
+    await runRound(db, { ...base, collect });
+    const stuck = requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: c.now }).jobId;
+    startJob(db, stuck, { now: c.now });   // 崩了，没 finishJob
+    c.advance(STALE_RUNNING_MS + MIN);
+    await runRound(db, { ...base, collect, kinds: ['dms'] });   // 这一轮不跑评论，只回收
+    assert.equal(getJob(db, stuck).status, 'failed');
+    assert.match(getJob(db, stuck).error, /遗留的 running 任务已回收/);
+    assert.equal(requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: c.now }).deduped, true);   // G-B8b：刚回收的 failed 5 分钟内也去重
+    c.advance(5 * MIN + 1);
+    const fresh = requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: c.now });
+    assert.equal(fresh.deduped, false);
+    const r = await runRound(db, { ...base, collect });
+    assert.ok(r.jobs.some((j) => j.jobId === fresh.jobId && j.status === 'ok'));
+    assert.equal(calls.length, 2);
+  });
+
+  test('G-B8c：遗留的非抓取平台 requested 任务不让守护进程每分钟起一轮', async () => {
+    const { db, c, base } = setup();
+    const { collect } = fakeCollect({ 'Douyin/comments': commentsSnap([comment('c1')]), 'Douyin/dms': dmsSnap([]) });
+    await runRound(db, { ...base, collect, trigger: 'manual' });
+    createJob(db, { platformCode: 'Instagram', kind: 'comments', trigger: 'refresh_now', now: c.now });
+    c.advance(MIN);
+    assert.deepEqual(shouldStartRound(db, { now: c.now, lockPath: base.lockPath, timeZone }), { start: false, reason: 'idle' });
   });
 
   test('refresh_now 指到能力位关着的平台：记 skipped，不抓', async () => {

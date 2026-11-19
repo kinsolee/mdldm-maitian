@@ -1,6 +1,6 @@
 // 只查库的读接口：MCP read 组和以后的 CLI 共用。入参出参的 id 都是 <platformCode>:<原生 id>。
 // 列表一律游标分页：{ items, nextCursor }，nextCursor 为 null 表示没有下一页。
-import { listAccounts as listAccountRows, getAccount, PLATFORM_NAMES } from '../accounts.mjs';
+import { listAccounts as listAccountRows, getAccount } from '../accounts.mjs';
 import { splitId, checkPlatforms } from './ids.mjs';
 import { requestRefresh } from './store.mjs';
 
@@ -117,7 +117,10 @@ const workBrief = (db, workId) => {
   return w ? { id: w.id, title: w.title, url: w.url } : { id: workId, title: null, url: null };
 };
 
-/** 整楼嵌套树。所在楼的一楼不在库里时 root 是占位（missing: true），partial 也是 true。 */
+/**
+ * 整楼嵌套树。所在楼的一楼不在库里时 root 是占位（missing: true）。
+ * partial：作品标了楼中楼不全，或这楼里有 parent 不在库里的评论（被删的楼中楼，子评论只能挂到一楼），或一楼缺失。
+ */
 export function getCommentThread(db, commentId) {
   splitId(commentId, 'commentId');
   const hit = db.prepare('SELECT rootId, workId FROM comments WHERE id = ?').get(commentId);
@@ -126,12 +129,15 @@ export function getCommentThread(db, commentId) {
   const nodes = new Map(rows.map((r) => [r.id, { ...toComment(r), children: [] }]));
   let root = nodes.get(hit.rootId);
   if (!root) root = { id: hit.rootId, missing: true, children: [] };
+  let orphan = false;
   for (const n of nodes.values()) {
     if (n === root) continue;
-    (nodes.get(n.parentId) ?? root).children.push(n);
+    const parent = nodes.get(n.parentId);
+    if (!parent) orphan = true;
+    (parent ?? root).children.push(n);
   }
   const flag = db.prepare('SELECT partial FROM thread_partial WHERE workId = ?').get(hit.workId);
-  return { work: workBrief(db, hit.workId), partial: flag?.partial === 1 || !!root.missing, root };
+  return { work: workBrief(db, hit.workId), partial: flag?.partial === 1 || orphan || !!root.missing, root };
 }
 
 // ---------- 私信 ----------
@@ -251,6 +257,5 @@ export function getWorkFlow(db, workId) {
 }
 
 export function refreshNow(db, { kind, platform, now }) {
-  if (!PLATFORM_NAMES[platform]) throw new Error(`不认识的平台：${platform}`);
   return requestRefresh(db, { kind, platform, ...(now ? { now } : {}) });
 }

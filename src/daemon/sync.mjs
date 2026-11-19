@@ -11,7 +11,8 @@ import { openOpsDb } from '../ops/db.mjs';
 import { listAccounts, getAccount, PENDING, PLATFORM_NAMES } from '../ops/accounts.mjs';
 import { opsDbPath, engageLockPath } from '../ops/paths.mjs';
 import { defaultNotify } from '../ops/login.mjs';
-import { ingestSnapshot, createJob, startJob, finishJob, getJob, pendingRefreshes, recordSyncFailure, recordLoginLost, SYNC_KINDS } from '../ops/engage/store.mjs';
+import { ingestSnapshot, createJob, startJob, finishJob, getJob, pendingRefreshes, reclaimStaleJobs, recordSyncFailure, recordLoginLost, SYNC_KINDS } from '../ops/engage/store.mjs';
+import { redact } from '../ops/engage/redact.mjs';
 import { deliverPending } from './outbox.mjs';
 import { ENGAGE_PLATFORMS, isDue } from './schedule.mjs';
 import { acquireRoundLock, heldLock } from './round-lock.mjs';
@@ -23,13 +24,8 @@ const KIND_CN = { comments: '评论', dms: '私信' };
 const iso = (ms) => new Date(ms).toISOString();
 const localTime = (ms) => new Date(ms).toLocaleString('sv-SE', { hour12: false });
 
-/** 错误信息去敏：地址只留 origin + path，cookie / token 一类的值打码，截到 300 字。日志、库、飞书都用它。 */
-export function redact(s) {
-  return String(s ?? '')
-    .replace(/https?:\/\/[^\s"'<>）)]+/g, (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return '（地址）'; } })
-    .replace(/\b(set-cookie|cookie|xsec_token|access_token|refresh_token|token|authorization|secret|password|passwd|sessionid|sid)\b(\s*[:=]\s*)(bearer\s+)?[^\s;,&]+/gi, '$1$2***')
-    .slice(0, 300);
-}
+/** 错误信息去敏（日志、库、飞书都用它），规则见 src/ops/engage/redact.mjs。 */
+export { redact };
 
 // ---------- 每个平台每个 kind 的定时状态（只有这里建这张表） ----------
 
@@ -136,6 +132,7 @@ export async function runRound(db, {
   };
   try {
     ensureScheduleTable(db);
+    for (const id of reclaimStaleJobs(db, { now })) log(`${localTime(now())} [engage] 回收了遗留的 running 任务 ${id}`);
     const refreshed = new Set();
     // 1. refresh_now：用那条 job，不新建
     for (const job of pendingRefreshes(db)) {
