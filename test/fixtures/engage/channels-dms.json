@@ -1,0 +1,396 @@
+{
+ "kind": "dms",
+ "me": {
+  "nickname": "user_1246fe7d"
+ },
+ "sessions": [
+  {
+   "sessionId": "user_2e3ad0ee",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_2e3ad0ee",
+    "username": "user_6f83a1fe",
+    "nickname": "user_68da6265",
+    "fromUserType": 1
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_6f83a1fe",
+      "ts": 1794931923,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_6f83a1fe",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794929512,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "sessionId": "user_888224e4",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_888224e4",
+    "username": "user_4b93a445",
+    "nickname": "user_55c6d491",
+    "fromUserType": 0
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_4b93a445",
+      "ts": 1794921125,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_4b93a445",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794920506,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "sessionId": "user_605cca02",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_605cca02",
+    "username": "user_99709f17",
+    "nickname": "user_3922ef35",
+    "fromUserType": 2
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_99709f17",
+      "ts": 1794890344,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_99709f17",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794830442,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "sessionId": "user_685d8410",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_685d8410",
+    "username": "user_e97e5de6",
+    "nickname": "user_997e53ca",
+    "fromUserType": 0
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_e97e5de6",
+      "ts": 1794890327,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_e97e5de6",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794882635,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "sessionId": "user_4b765833",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_4b765833",
+    "username": "user_b348103a",
+    "nickname": "user_57824032",
+    "fromUserType": 0
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_b348103a",
+      "ts": 1794815426,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_b348103a",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794543303,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "sessionId": "user_eb160c84",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_eb160c84",
+    "username": "user_3b0ddb16",
+    "nickname": "user_d25853c2",
+    "fromUserType": 0
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_3b0ddb16",
+      "ts": 1794471468,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_3b0ddb16",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794468187,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_3b0ddb16",
+      "ts": 1794441918,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_3b0ddb16",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794438980,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "sessionId": "user_b7fa5e4e",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_b7fa5e4e",
+    "username": "user_3bb2a6ed",
+    "nickname": "user_6be8fb43",
+    "fromUserType": 1
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_3bb2a6ed",
+      "ts": 1794453572,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_3bb2a6ed",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794434126,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_3bb2a6ed",
+      "ts": 1794415978,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_3bb2a6ed",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794390200,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "sessionId": "user_e3b603b9",
+   "sessionType": 3,
+   "newMsgCount": 0,
+   "sessionIsUnread": true,
+   "sessionInfo": {
+    "sessionId": "user_e3b603b9",
+    "username": "user_abf83c3c",
+    "nickname": "user_bdececa0",
+    "fromUserType": 0
+   },
+   "messageList": [
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_abf83c3c",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794451487,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_abf83c3c",
+      "ts": 1794441915,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_abf83c3c",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794419952,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_8b7b7e91",
+      "toUsername": "user_abf83c3c",
+      "ts": 1794415975,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    },
+    {
+     "message": {
+      "msgId": null,
+      "fromUsername": "user_abf83c3c",
+      "toUsername": "user_8b7b7e91",
+      "ts": 1794393198,
+      "msgType": 1,
+      "textMsg": {
+       "content": "<已脱敏>"
+      }
+     }
+    }
+   ]
+  }
+ ]
+}
