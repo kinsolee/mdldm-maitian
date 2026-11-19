@@ -69,6 +69,19 @@ KIN-323 dev-2。代码在 `src/ops/engage/adapters/`，入口 `collect({ account
 - runner 返回 `busy`、`user-controlled`、`profile-needed`（锁文件损坏时 runner 也报 `busy`）：返回 `{ ok:false, skipped }`，不重试，不抢控制权。
 - runner 返回 `profile-rejected`（不是 Profile 5）：返回 `{ ok:false, reason:'profile-rejected' }`，按失败处理，不算跳过。
 - 页面脚本判断掉线：返回 `{ ok:false, reason:'login-lost' }`。页面脚本自己报的失败（如小红书 60 秒内没抓到接口）：返回 `{ ok:false, reason:'no-data' }`。解析出错或输出形状不对：返回 `{ ok:false, reason:'parse' }`。
+- 接口出错、数据读不到（评审第 1 轮 X-B3/X-B4/X-B5/X-B10/X-B11）：
+  - 整个 kind 失败（`reason:'api-error'` 或 `'no-data'`，error 带接口名和返回码）：抖音 `creator/item/list` 没抓到或全部 `status_code` 非 0；小红书 `you/mentions` 没有一页 `code=0`；视频号作品列表或私信会话列表的 Vue 数据读不到，或者为空但页面没显示「暂无…」空状态；B站 `fetch_session_msgs` 或 `account/v1/user/cards` 全部失败；抖音私信 0 个会话且页面没显示空状态（`no-data`）；小红书私信 `api/im/web/v3/chats` 没有一页 `code=0`（`api-error`）。
+  - 只这一个作品不算拿全（`complete:false, threadsPartial:true`，别的作品照常）：抖音这个作品的 `comment/list/select` 或 `comment/list/reply` 有任何一条 `status_code` 非 0，或最后一页没有明确的 `has_more=0`；小红书这篇笔记的 `comment/page` 有一页 `code` 非 0 或缺 `comments`（整楼数据不用，只用通知兜底），或 `comment/sub/page` 出错，或最后一页没有明确的 `has_more=false`；视频号打开的作品读不到评论组件。
+  - B站单个会话的 `fetch_session_msgs` 失败：会话照常报，这个会话不给 messages（不拿空数组冒充「没有消息」）。
+  - 小红书通知兜底只收抓取窗口内的通知：窗口是 `since`，没有就用页面脚本记下的 `windowStart`（默认近 7 天），通知最后一页带出的更早的通知不入库。
+- 账号核对（G-B7，同 `src/ops/collect.mjs`）：页面脚本返回 `uidSeen`，collect 在解析前比对：不符返回 `{ ok:false, reason:'uid-mismatch', uidSeen }`，读不到返回 `reason:'no-uid'`，都不入库。来源：B站 `x/web-interface/nav` 的 `data.mid`；抖音 `/web/api/media/user/info/` 的 `user.uid`；视频号 `auth/auth_data` 的 `finderUser.uniqId`；小红书依次取页面自己发的 `user/me` 响应、`window.__INITIAL_STATE__.user.userInfo`、私信会话列表里的 `user_id`（自己）。**小红书评论页的前两个来源这次没在真实页面上核实过**（私信页的 `user_id` 在 S0 里确认过），上线前要真跑一次，读不到会整轮报 `no-uid`。
+- 登录信息读不到：抖音 `user/info` 请求失败、不是 JSON，或者 `status_code` 既不是 0 也不是 8（8 算掉线），返回 `auth-failed`；视频号 `auth/auth_data` 超时、不是 JSON，或者缺 `finderUser.nickname`（没有它就判不出 `isMe`），返回 `auth-failed`，`errCode` 非 0 或页面在登录页算掉线。
+- 抖音有近期作品要扫，但一个都没切过去：返回 `no-data`（G-B5a）。
+- 拿全的判定（G-B4c、G-B6a、G-B6b）：
+  - 视频号：`commentCount` 含二楼，S0 实测每个作品去重后的条数等于它。`commentCount` 不是数字，不算拿全；读到的少于它，标 `threadsPartial:true`。
+  - B站：`up/fulllist` 不满一页，或者 `page.total` 是数字且已经翻够，才算翻到底。单楼 `reply/reply` 翻满 10 页还没到 `page.count`，这个作品标 `threadsPartial:true`；拿不全的楼现在只影响它所在的作品，只有楼数超上限时才全部标。
+- 评论数为 0 的作品（G-B11a）：抖音、视频号作品列表里窗口内评论数为 0 的作品补进 `scannedWorks`（`complete:true, threadsPartial:false`），库里这个作品已删的评论才能标 `goneAt`。B站同类情形（G-B11b）还没做。
+- 小红书私信 `messages/history`（G-B3c）：只采信 `code===0` 的；打开了但失败的会话照常报，不给 messages，`last` 为 null。
 - `error` 文本经过 `safeError`：去掉 URL 查询串、cookie，以及各种 token、签名的值，最多 300 字。
 - 适配器不调用 `finishSpace`，space 留着给下次复用。
 

@@ -1,5 +1,9 @@
 {
  "kind": "dms",
+ "uidSeen": "user_de0cde99",
+ "chatsCodes": [
+  0
+ ],
  "chats": [
   {
    "chat_user_id": "user_534e71a8",
@@ -91,6 +95,7 @@
  "histories": [
   {
    "chat_user_id": "user_534e71a8",
+   "code": 0,
    "messages": [
     {
      "id": "user_de0cde99.user_534e71a8.1eafe99fb06b9a8",
@@ -103,6 +108,7 @@
   },
   {
    "chat_user_id": "user_86e62543",
+   "code": 0,
    "messages": [
     {
      "id": "user_de0cde99.user_86e62543.1eafd258506ab8f",
@@ -185,6 +191,7 @@
   },
   {
    "chat_user_id": "user_cf72d7bd",
+   "code": 0,
    "messages": [
     {
      "id": "user_de0cde99.user_cf72d7bd.1eadacf5355c3ff",
@@ -204,6 +211,7 @@
   },
   {
    "chat_user_id": "user_f4800048",
+   "code": 0,
    "messages": [
     {
      "id": "user_de0cde99.user_f4800048.1eabf898f2967fd",

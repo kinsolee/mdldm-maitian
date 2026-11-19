@@ -8,7 +8,7 @@
 //        取 ts 最大的判 last.by（fromUsername == sessionInfo.username 是对方）。
 // 不点 .like-action、不点回复图标、不往任何输入框里写字。
 import { open, atLogin, clickMarked, mainPage, sleep } from './page-lib.mjs';
-import { clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
+import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
 export const FILE = 'channels.mjs';
 export const LIMITS = { maxWorks: 10, maxAgeDays: 30, maxExpand: 15, waitMs: 20000 };
@@ -23,12 +23,19 @@ export async function runInSpace(task, params) {
   const auth = await page.fetch('/cgi-bin/mmfinderassistant-bin/auth/auth_data', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', timeout: 15000 }).catch(() => null);
   let a = null; try { a = JSON.parse(auth?.body ?? 'null'); } catch {}
   const login = await atLogin(page);
-  if (login || (a && a.errCode !== 0)) return { loginLost: true, evidence: `auth/auth_data errCode=${a?.errCode}；${login ? `页面在 ${login}` : '页面没跳登录'}` };
-  const me = { nickname: a?.data?.finderUser?.nickname ?? null };
-  return params.kind === 'dms' ? { kind: 'dms', me, ...(await rawDms(page, o)) } : { kind: 'comments', me, ...(await rawComments(page, o)) };
+  if (login || (a && a.errCode != null && a.errCode !== 0)) return { loginLost: true, evidence: `auth/auth_data errCode=${a?.errCode}；${login ? `页面在 ${login}` : '页面没跳登录'}` };
+  // G-B4b：没拿到自己的昵称就没法判 isMe（自己的回复会被当成新评论），不往下采
+  const fu = a?.data?.finderUser;
+  if (!a || !fu?.nickname) return { failed: 'auth-failed', error: `auth/auth_data ${!auth ? '请求失败或超时' : !a ? '不是 JSON' : `errCode=${a.errCode} 缺 finderUser.nickname`}` };
+  const me = { nickname: fu.nickname };
+  const uidSeen = fu.uniqId ?? null;
+  return params.kind === 'dms' ? { kind: 'dms', uidSeen, me, ...(await rawDms(page, o)) } : { kind: 'comments', uidSeen, me, ...(await rawComments(page, o)) };
 }
 
 const inShadow = (page, fnSrc, arg) => page.evaluate(new Function('arg', `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null; ${fnSrc}`), arg ?? null);
+
+// 页面明确显示「暂无…」空状态
+const emptyShown = async (page) => !!(await inShadow(page, `return /暂无|没有(更多)?(作品|评论|私信|消息)/.test(sr.textContent || '');`));
 
 async function waitShadow(page, sel, ms) {
   for (const end = Date.now() + ms; Date.now() < end; await sleep(1000)) if (await inShadow(page, `return !!sr.querySelector(${JSON.stringify(sel)});`)) return true;
@@ -46,14 +53,17 @@ const ITEMS_SRC = `return [...sr.querySelectorAll('.comment-item')].map((e) => e
   return { ...one(c), levelTwoComment: (c.levelTwoComment || []).map(one) }; });`;
 
 async function rawComments(page, o) {
-  if (!(await waitShadow(page, '.comment-feed-wrap', o.waitMs))) return { feeds: [], works: [], note: '作品列表没出来' };
+  // X-B5：列表没出来时，只有页面明确显示空状态才算「没有作品」；否则 feeds=null，解析按 no-data 失败
+  if (!(await waitShadow(page, '.comment-feed-wrap', o.waitMs))) return { feeds: (await emptyShown(page)) ? [] : null, emptyState: await emptyShown(page), works: [], note: '作品列表没出来' };
   const sinceSec = o.now / 1000 - o.maxAgeDays * 86400;
+  const windowStartSec = Math.floor(sinceSec);
   // 作品列表滚动懒加载：滚到最后一个，直到最早的早于窗口或不再变多
-  let feeds = (await inShadow(page, FEEDS_SRC)) ?? [];
+  let feeds = await inShadow(page, FEEDS_SRC);
+  if (!Array.isArray(feeds)) return { feeds: null, works: [], note: '作品列表组件（commentFeeds）没找到' };
   for (let i = 0; i < 6 && feeds.length && Math.min(...feeds.map((f) => f.createTime)) >= sinceSec; i++) {
     await inShadow(page, `const l = [...sr.querySelectorAll('.comment-feed-wrap')].at(-1); l?.scrollIntoView({ block: 'end' }); return true;`);
     await sleep(2500);
-    const next = (await inShadow(page, FEEDS_SRC)) ?? [];
+    const next = (await inShadow(page, FEEDS_SRC)) ?? feeds;
     if (next.length <= feeds.length) break;
     feeds = next;
   }
@@ -68,20 +78,20 @@ async function rawComments(page, o) {
       clicks++; await sleep(2000);
     }
     const left = await inShadow(page, `return [...sr.querySelectorAll('*')].filter((e) => e.children.length === 0 && /^展开更多回复$/.test(e.textContent.trim()) && e.getBoundingClientRect().height > 0).length;`);
-    works.push({ objectNonce: f.objectNonce, opened: true, clicks, expandLeft: left ?? 0, items: (await inShadow(page, ITEMS_SRC)) ?? [] });
+    works.push({ objectNonce: f.objectNonce, opened: true, clicks, expandLeft: left ?? 0, items: await inShadow(page, ITEMS_SRC) });
   }
-  return { feeds, works };
+  return { windowStartSec, feeds, works };
 }
 
 async function rawDms(page, o) {
-  if (!(await waitShadow(page, '.session-wrap', o.waitMs))) return { sessions: [], note: '会话列表没出来' };
+  if (!(await waitShadow(page, '.session-wrap', o.waitMs))) return { sessions: (await emptyShown(page)) ? [] : null, emptyState: await emptyShown(page), note: '会话列表没出来' };
   await sleep(1500);
   const sessions = await inShadow(page, `let v = null; for (let x = sr.querySelector('.session-wrap'), i = 0; x && i < 8 && !v; x = x.parentElement, i++) if (x.__vue__?.$data?.sessionList) v = x.__vue__;
     if (!v) return null;
     return v.$data.sessionList.map(([id, s]) => ({ sessionId: id, sessionType: s.sessionType ?? null, newMsgCount: s.newMsgCount ?? 0, sessionIsUnread: !!s.sessionIsUnread,
       sessionInfo: { sessionId: s.sessionInfo?.sessionId, username: s.sessionInfo?.username, nickname: s.sessionInfo?.nickname, fromUserType: s.sessionInfo?.fromUserType ?? null },
       messageList: (s.messageList ?? []).map((m) => ({ message: { msgId: m.message?.msgId ?? m.message?.newMsgId ?? null, fromUsername: m.message?.fromUsername, toUsername: m.message?.toUsername, ts: m.message?.ts, msgType: m.message?.msgType, textMsg: m.message?.textMsg ? { content: m.message.textMsg.content } : null } })) }));`);
-  return { sessions: sessions ?? [] };
+  return { sessions: Array.isArray(sessions) ? sessions : null, ...(Array.isArray(sessions) ? {} : { note: '会话列表组件（sessionList）没找到' }) };
 }
 
 // —— 解析 ——
@@ -92,14 +102,21 @@ export function parse(kind, raw, ctx) {
 
 const titleOf = (f) => f.desc?.shortTitle?.[0]?.shortTitle || String(f.desc?.description ?? '').split(/\s#/)[0].trim() || null;
 
+// X-B5：必需的页面数据读不到（null），或为空但页面没显示空状态，整个 kind 失败
+function requireList(list, emptyState, what, note) {
+  if (!Array.isArray(list)) adapterFail('no-data', `${what}读不到${note ? `：${note}` : ''}`);
+  if (!list.length && !emptyState) adapterFail('no-data', `${what}为空，但页面没显示空状态${note ? `：${note}` : ''}`);
+}
+
 export function parseComments(raw, { accountUid, nickname, fetchedAt }) {
+  requireList(raw.feeds, raw.emptyState, '视频号作品列表', raw.note);
   const myNick = raw.me?.nickname ?? nickname ?? null;
   const feeds = new Map(raw.feeds.map((f) => [f.objectNonce, f]));
   const works = [], comments = [], scannedWorks = [];
   for (const w of raw.works) {
     const f = feeds.get(w.objectNonce);
     works.push({ nativeId: String(w.objectNonce), title: f ? titleOf(f) : null, url: null, postTime: isoOf(f?.createTime) });
-    if (!w.opened) { scannedWorks.push({ workNativeId: String(w.objectNonce), complete: false, threadsPartial: true }); continue; }
+    if (!w.opened || !Array.isArray(w.items)) { scannedWorks.push({ workNativeId: String(w.objectNonce), complete: false, threadsPartial: true }); continue; }
     // 嵌套的 levelTwoComment 和单独渲染的 .comment-item 合起来按 id 去重；replyCommentId 链往上走到没有 replyCommentId 的那条就是一楼
     const all = new Map();
     let more = w.expandLeft > 0;
@@ -125,9 +142,19 @@ export function parseComments(raw, { accountUid, nickname, fetchedAt }) {
     });
     for (const x of thread) if (x.parentNativeId === null) x.replyCount = thread.filter((y) => y.rootNativeId === x.nativeId && y !== x).length;
     comments.push(...thread);
-    const seen = all;
-    const f2 = feeds.get(w.objectNonce);
-    scannedWorks.push({ workNativeId: String(w.objectNonce), complete: !more && seen.size >= (f2?.commentCount ?? 0), threadsPartial: more });
+    // G-B4c：commentCount 含二楼（S0 实测每个作品去重后的条数等于它）。不是数字不算拿全；读到的少于它算楼中楼拿不全
+    const count = f?.commentCount;
+    const known = typeof count === 'number' && Number.isFinite(count);
+    const short = known && all.size < count;
+    scannedWorks.push({ workNativeId: String(w.objectNonce), complete: known && !more && !short, threadsPartial: more || short });
+  }
+  // G-B11a：窗口内评论数为 0 的作品（列表本身读成功了）也算扫过、拿全，库里这个作品已删的评论才能标 goneAt
+  const scannedIds = new Set(scannedWorks.map((x) => x.workNativeId));
+  for (const f of raw.feeds) {
+    const id = String(f.objectNonce);
+    if (f.commentCount !== 0 || scannedIds.has(id) || raw.windowStartSec == null || !(Number(f.createTime) >= raw.windowStartSec)) continue;
+    works.push({ nativeId: id, title: titleOf(f), url: null, postTime: isoOf(f.createTime) });
+    scannedWorks.push({ workNativeId: id, complete: true, threadsPartial: false });
   }
   return okResult({ platformCode: 'Channels', accountUid, kind: 'comments', fetchedAt, works, comments, scannedWorks });
 }
@@ -136,6 +163,7 @@ export function parseComments(raw, { accountUid, nickname, fetchedAt }) {
 const TYPE = (t) => (Number(t) === 1 ? 'text' : Number(t) === 3 ? 'image' : 'other');
 
 export function parseDms(raw, { accountUid, fetchedAt }) {
+  requireList(raw.sessions, raw.emptyState, '视频号私信会话列表', raw.note);
   const conversations = [], messages = [];
   for (const s of raw.sessions) {
     const peer = s.sessionInfo?.username ?? null;

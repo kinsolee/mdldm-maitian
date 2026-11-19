@@ -1,5 +1,6 @@
 {
  "kind": "dms",
+ "uidSeen": "user_8f127407",
  "me": {
   "mid": "user_8f127407"
  },
@@ -1221,5 +1222,8 @@
    "mid": "user_7e35e314",
    "name": "user_77c11db3"
   }
+ ],
+ "cardsCodes": [
+  0
  ]
 }
