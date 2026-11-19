@@ -1,0 +1,12 @@
+{
+  "note": "抖音样例缺的账号响应：user/info 和 dashboard/fans 的分日（照 06-douyin-works.json 的 mapped.account 改出来）",
+  "info": { "http": 200, "status_code": 0, "user": { "uid": 106707338905, "nickname": "Kinso Lee", "follower_count": 295 } },
+  "fans": {
+    "http": 200,
+    "status_code": 0,
+    "metrics": [
+      { "english_metric_name": "total_fans_cnt", "metric_value": 294, "trends": [{ "date_time": "20261117", "value": 290 }, { "date_time": "20261118", "value": 294 }] },
+      { "english_metric_name": "net_fans_cnt", "metric_value": 130, "trends": [{ "date_time": "20261117", "value": 8 }, { "date_time": "20261118", "value": 4 }] }
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "note": "视频号样例缺的响应：auth_data 的 finderUser（uniqId 用样例里的打码占位，没有 finderUsername）、fans_trend 的最后两天（照 06-channels-works.json 的 mapped.account 改出来，startTs 是 2026-11-18 东八区 0 点）",
+  "auth": { "http": 200, "errCode": 0, "finderUser": { "uniqId": "<uniqId>", "nickname": "KinsoLee", "fansCount": 416, "feedsCount": 61 } },
+  "fansTrend": { "http": 200, "errCode": 0, "startTs": 1794931200, "data": { "add": [37, 11], "reduce": [0, 0], "netAdd": [37, 11], "total": [405, 416] } }
+}

@@ -1,0 +1,17 @@
+{
+  "note": "小红书样例缺的响应：user/info、样例作品在笔记管理接口里的状态行、30 天分日的最后两天（照 06-xhs-works.json 的 mapped 改出来；不含 xsec_token）",
+  "userInfo": { "http": 200, "code": 0, "data": { "userId": "5944af205e87e701889da649" } },
+  "postedNote": { "id": "6afbd09e00000000250132bd", "sticky": false, "time": "2026-11-17 11:57", "permission_code": 0, "permission_msg": "", "tab_status": 1, "schedule_post_time": 0 },
+  "fans": {
+    "http": 200,
+    "code": 0,
+    "data": {
+      "thirty": {
+        "fans_count": 2568,
+        "fans_list": [{ "date": 1794758400000, "count": 2556 }, { "date": 1794844800000, "count": 2567 }],
+        "rise_fans_list": [{ "date": 1794758400000, "count": 3 }, { "date": 1794844800000, "count": 11 }],
+        "leave_fans_list": [{ "date": 1794758400000, "count": 0 }, { "date": 1794844800000, "count": 0 }]
+      }
+    }
+  }
+}
