@@ -1,15 +1,15 @@
 // ego-shim 行为测试：在 Ego Lite Profile 5 的临时 space 里对本地测试页跑真实浏览器。
 import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { runEgoTask, runEgoScript, finishSpace } from '../src/ego-runner/index.mjs';
+import { runInSpace, runEgoScript } from '../src/ego-runner/index.mjs';
 import { createServer } from 'node:http';
-import { EGO_SKIP, tempSpaceName, fixtureUrl, FIXTURE_DIR } from './helpers/ego.mjs';
+import { EGO_SKIP, tempSpaceName, fixtureUrl, FIXTURE_DIR, closeTestSpace } from './helpers/ego.mjs';
 
 const FIXTURE = fixtureUrl('basic.html');
 const SHIM_URL = new URL('../src/ego-shim.mjs', import.meta.url).href;
 
 async function run(space, script, params = {}) {
-  const r = await runEgoTask({ space, script, params: { FIXTURE, FIXTURE_DIR, ...params } });
+  const r = await runInSpace({ space, script, params: { FIXTURE, FIXTURE_DIR, ...params } });
   assert.equal(r.ok, true, `${r.reason}: ${r.error}\n${r.stderr}\n${r.stdout}`);
   return r.result;
 }
@@ -17,7 +17,7 @@ async function run(space, script, params = {}) {
 describe('ego-shim（真实 Ego Lite）', { skip: EGO_SKIP ?? false }, () => {
   const spaces = [];
   const space = (tag) => { const s = tempSpaceName(tag); spaces.push(s); return s; };
-  after(async () => { for (const s of spaces) await finishSpace(s); });
+  after(async () => { for (const s of spaces) await closeTestSpace(s); });
 
   test('打开：tabs.create 后 tabs.get 读回 url 和 title', async () => {
     const r = await run(space('open'), `
@@ -55,7 +55,7 @@ describe('ego-shim（真实 Ego Lite）', { skip: EGO_SKIP ?? false }, () => {
       await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: "document.getElementById('marker').textContent = 'kept-1'" });
       return (await task.finish({ keep: "all" })).keptManagedLabels;`);
     // KIN-327 故事 7：ownership=user 时 runner 不认领、不碰页面
-    const owned = await runEgoTask({ space: s, script: 'return 1' });
+    const owned = await runInSpace({ space: s, script: 'return 1' });
     assert.equal(owned.reason, 'user-owned', `${owned.error} ${owned.stderr}`);
     // 负责人明确同意接手时才认领（这里直接调 Ego 模拟），之后 runner 按 agent 取用，找回没有 label 的页
     const claimed = await runEgoScript(`const e = (await listTaskSpaces()).find((x) => x.name === ${JSON.stringify(s)}); await claimTaskSpace(e.id); console.log("@@RESULT 1");`);

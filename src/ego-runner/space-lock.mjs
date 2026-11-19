@@ -16,7 +16,23 @@ function pidAlive(pid) {
   catch (e) { return e.code === 'EPERM'; }
 }
 
-/** 持锁方还在为这个任务负责吗：没放弃、且进程还活着（别的主机上的进程查不了，当它活着）。 */
+/** 锁文件内容是不是完整的：token、pid、host、startedAt 都在且类型对；abandonedAt 有就得是数字。不完整的按损坏处理。 */
+function validContent(c) {
+  return !!c && typeof c === 'object'
+    && typeof c.token === 'string' && !!c.token
+    && Number.isInteger(c.pid) && c.pid > 0
+    && typeof c.host === 'string' && !!c.host
+    && Number.isFinite(c.startedAt)
+    && (c.abandonedAt == null || Number.isFinite(c.abandonedAt));
+}
+
+/** 读锁文件，内容不完整时 content 置 null（损坏锁）；raw 留着给 reclaim 比对。 */
+function readSpaceLock(file) {
+  const raw = readLock(file);
+  return raw && { raw, content: validContent(raw.content) ? raw.content : null, mtimeMs: raw.mtimeMs };
+}
+
+/** 持锁方还在为这个任务负责吗：没放弃、且进程还活着（别的主机上的进程查不了，当它活着）。损坏的锁刚写不久时当被占。 */
 function holderActive(cur) {
   const c = cur.content;
   if (!c) return Date.now() - cur.mtimeMs <= EMPTY_LOCK_STALE_MS;
@@ -24,7 +40,7 @@ function holderActive(cur) {
   return c.host !== HOST || pidAlive(c.pid);
 }
 
-const describe = (c) => (c ? `pid ${c.pid}@${c.host}，${new Date(c.startedAt).toISOString()} 开始${c.abandonedAt ? `，${new Date(c.abandonedAt).toISOString()} 超时放弃` : ''}` : '锁文件内容还没写完');
+const describe = (c) => (c ? `pid ${c.pid}@${c.host}，${new Date(c.startedAt).toISOString()} 开始${c.abandonedAt ? `，${new Date(c.abandonedAt).toISOString()} 放弃` : ''}` : '锁文件内容损坏或还没写完');
 
 /**
  * 拿 space 锁。
@@ -35,6 +51,8 @@ const describe = (c) => (c ? `pid ${c.pid}@${c.host}，${new Date(c.startedAt).t
  */
 export async function acquireSpaceLock(space, { mode = 'wait', timeoutMs, opsDir = OPS_DIR, heartbeatStaleMs = HEARTBEAT_STALE_MS, pollMs = 200 } = {}) {
   const { spaceLock: file, heartbeat } = opsPaths(space, opsDir);
+  if (timeoutMs != null && !(typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs >= 0)) throw new TypeError(`timeoutMs 要是有限的非负毫秒数：${timeoutMs}`);
+  if (mode !== 'wait' && mode !== 'skip') throw new TypeError(`mode 只能是 wait 或 skip：${mode}`);
   const giveUpAt = timeoutMs == null ? Infinity : Date.now() + timeoutMs;
   // 上一个脚本最后的生命迹象：心跳；超时放弃的锁还要算上放弃的时刻（脚本可能还没来得及写第一次心跳）
   const stillRunning = (abandonedAt = 0) => {
@@ -51,16 +69,17 @@ export async function acquireSpaceLock(space, { mode = 'wait', timeoutMs, opsDir
       if (stillRunning()) { removeIfOwned(file, token); return previous(null); }
       return { ok: true, lock: spaceLock(file, token, content) };
     }
-    const cur = readLock(file);
-    if (cur && !holderActive(cur)) {
-      if (stillRunning(cur.content?.abandonedAt)) return previous(cur.content);
-      reclaim(file, cur);
-      continue;
+    const cur = readSpaceLock(file);
+    if (!cur) continue;   // 刚被放掉：马上再抢
+    if (!holderActive(cur)) {
+      if (stillRunning(cur.content?.abandonedAt ?? 0)) return previous(cur.content);
+      if (reclaim(file, cur.raw)) continue;
+      // 回收没成（别人正在回收、或锁刚被换掉）：和被占一样走下面的 skip / 超时 / 等待
     }
     if (mode === 'skip' || Date.now() >= giveUpAt) {
-      return { ok: false, reason: 'locked', error: `space ${space} 正被别的任务占用（${cur ? describe(cur.content) : '刚被释放'}）${mode === 'skip' ? '' : `，等了 ${timeoutMs}ms`}` };
+      return { ok: false, reason: 'locked', error: `space ${space} 正被别的任务占用（${describe(cur.content)}）${mode === 'skip' ? '' : `，等了 ${timeoutMs}ms`}` };
     }
-    await sleep(Math.min(pollMs, giveUpAt - Date.now()));
+    await sleep(Math.max(1, Math.min(pollMs, giveUpAt - Date.now())));
   }
 }
 

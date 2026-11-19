@@ -4,13 +4,21 @@
 //        [--params '{"k":1}'] [--timeout-ms 600000] [--lock wait|skip] [--lock-timeout-ms 60000]
 //        [--take-back] [--finish] [script.js]   # 不给脚本文件就读 stdin
 // 结果以一行 JSON 打到 stdout，失败时带 reason；退出码见 index.mjs 的 EXIT_CODES：
-//   0 成功；1 任务失败；2 space 名不对；3 Profile 6 或 Profile 5 不存在；4 space 在用户手里；5 space 锁被占或上一个任务还在跑。
+//   0 成功；1 任务失败；2 space 名或参数不对；3 Profile 6 或 Profile 5 不存在；4 space 在用户手里；5 space 锁被占或上一个任务还在跑。
 // --take-back 只给负责人手动「扫完了，收回」用：space 是 agentDelegatedToUser 时收回；定时任务不要带。
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { runInSpace, DEFAULT_PROFILE, DEFAULT_PLUGIN_DIR } from './index.mjs';
 
-const { values, positionals } = parseArgs({
+// 参数不对：打一行带 reason 的 JSON，退出码 2（不带着 NaN 之类的值去跑）
+const badArgs = (error) => {
+  console.log(JSON.stringify({ ok: false, reason: 'bad-args', error, exitCode: 2 }));
+  process.exit(2);
+};
+
+let parsed;
+try {
+  parsed = parseArgs({
   allowPositionals: true,
   options: {
     space: { type: 'string' },
@@ -23,12 +31,24 @@ const { values, positionals } = parseArgs({
     'take-back': { type: 'boolean', default: false },
     finish: { type: 'boolean', default: false },
   },
-});
+  });
+} catch (e) { badArgs(e.message); }
+const { values, positionals } = parsed;
 
-if (values.lock !== 'wait' && values.lock !== 'skip') {
-  console.log(JSON.stringify({ ok: false, reason: 'bad-args', error: `--lock 只能是 wait 或 skip：${values.lock}` }));
-  process.exit(1);
+if (values.lock !== 'wait' && values.lock !== 'skip') badArgs(`--lock 只能是 wait 或 skip：${values.lock}`);
+/** 毫秒参数：不给返回 undefined；给了就必须是 >= min 的整数，否则参数错误。 */
+function msArg(name, min) {
+  const v = values[name];
+  if (v == null) return undefined;
+  const n = /^\d+$/.test(v.trim()) ? Number(v) : NaN;
+  if (!Number.isSafeInteger(n) || n < min) badArgs(`--${name} 要是 >= ${min} 的整数毫秒：${v}`);
+  return n;
 }
+const timeoutMs = msArg('timeout-ms', 1);
+const lockTimeoutMs = msArg('lock-timeout-ms', 0);
+let params;
+try { params = JSON.parse(values.params); } catch (e) { badArgs(`--params 不是合法 JSON：${e.message}`); }
+if (!params || typeof params !== 'object' || Array.isArray(params)) badArgs('--params 要是 JSON 对象');
 
 async function readStdin() {
   const chunks = [];
@@ -41,13 +61,13 @@ const r = await runInSpace({
   space: values.space,
   profileId: values.profile,
   pluginDir: values['plugin-dir'],
-  params: JSON.parse(values.params),
+  params,
   script,
   lock: values.lock,
   takeBack: values['take-back'],
   finish: values.finish,
-  ...(values['timeout-ms'] ? { timeoutMs: Number(values['timeout-ms']) } : {}),
-  ...(values['lock-timeout-ms'] ? { lockTimeoutMs: Number(values['lock-timeout-ms']) } : {}),
+  ...(timeoutMs != null ? { timeoutMs } : {}),
+  ...(lockTimeoutMs != null ? { lockTimeoutMs } : {}),
 });
 const { stdout = '', stderr = '', ...summary } = r;
 const finishFailed = r.finish && !r.finish.ok;

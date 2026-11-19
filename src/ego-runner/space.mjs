@@ -1,6 +1,8 @@
 // 在 ego-browser nodejs 里运行：按名字取用 task space（有就接着用，没有才在指定 profile 上新建）。
-// 只取用、不建 profile；Profile 6 一律拒绝。调用方只认名字，不存 spaceId（S0：Ego 会回收闲置 space，id 会变）。
+// 只取用、不建 profile；只用 Profile 5，别的（包括 Profile 6）一律拒绝。调用方只认名字，不存 spaceId（S0：Ego 会回收闲置 space，id 会变）。
 export const FORBIDDEN_PROFILE = 'Profile 6';
+/** 只用这一个 profile（白名单）；别的一律拒绝。 */
+export const ALLOWED_PROFILE = 'Profile 5';
 export const USER_OWNED = 'user-owned';
 
 /**
@@ -10,7 +12,7 @@ export const USER_OWNED = 'user-owned';
  *   takeBack=true（只给负责人手动「扫完了，收回」用）时，agentDelegatedToUser 用 takeOverTaskSpace 收回；user 仍不碰。
  */
 export async function openSpace(ego, { name, profileId, takeBack = false }) {
-  if (!profileId || profileId === FORBIDDEN_PROFILE) throw new Error(`不允许使用 ${profileId || '默认 profile'}`);
+  if (profileId !== ALLOWED_PROFILE) throw new Error(`不允许使用 ${profileId || '默认 profile'}，只用 ${ALLOWED_PROFILE}`);
   const found = (await ego.listTaskSpaces()).find((s) => s.name === name);
   if (!found) return ego.taskSpace(name, { profileId });
   if (found.profileId !== profileId) throw new Error(`space ${name} 在 ${found.profileId} 上，不是 ${profileId}`);
