@@ -195,3 +195,58 @@ function verify(secret, rawBody, header) {
 3. 要确认最新状态时，调 `refresh_now`，然后等任务完成后再读（`list_accounts` 的 `lastSync` 会更新）。
 4. 处理完调 `ack_event`。
 5. 启动时和定期调一次 `list_events({ unhandled: true })` 补漏。
+
+## 8. 抓取节奏和运维
+
+这一节写给麦田负责人。bot 不需要读。
+
+### 时间表
+
+- 抓评论和抓私信分开排，四个平台（抖音、视频号、小红书、B站）也各排各的。
+- 本机时间（台湾）08:00 到 23:00 之间每 15 分钟抓一次，包括 08:00，不包括 23:00。其余时间每小时整点抓一次。
+- 抓取时间按时钟对齐：白天是 :00、:15、:30、:45，夜里是整点。上一轮跑得晚，下一轮不会跟着往后推。
+- 守护进程停了一段时间再启动时，只补抓一轮，不把错过的轮次都补上。
+- Instagram 和其他平台不抓。
+
+### refresh_now
+
+- bot 调 `refresh_now` 后，守护进程最多 1 分钟就会看到这条任务。如果这时没有别的一轮在跑，就马上开始抓。
+- 同一平台同一 kind 的任务 5 分钟内只跑一次（见第 3 节）。
+- 守护进程的主循环里有些步骤会长时间阻塞（例如知识站建课），阻塞期间新任务要等这些步骤结束才开始。
+
+### 先开能力位
+
+账号的能力位关着时不抓。开能力位：
+
+```sh
+hub ops accounts set-cap Douyin:106707338905 readComments true   # 抓评论
+hub ops accounts set-cap Douyin:106707338905 readDM true         # 抓私信
+```
+
+uid 还是 `pending` 的账号（例如视频号），要先用 `hub ops accounts set-uid` 登记真实 uid，才会抓。
+
+### 守护进程做什么
+
+- 守护进程（launchd `com.maitian.daemon`）只负责调度，不打开页面。它每分钟检查一次：有排着的 `refresh_now`，或有到点的任务，并且没有别的一轮在跑，就起一个子进程 `node src/daemon/sync.mjs --once`。
+- 子进程逐个账号抓，不并行。每个任务都通过 runner 短进程在账号自己的 space 里跑。space 被占着（`busy`）或负责人正在手动操作（`user-controlled`）时跳过这个任务，不算失败。
+- 一轮抓完后统一推送一次事件，所以同一轮的新评论合在一批里推。
+- 同一时刻只有一轮在跑。轮锁在 `data/engage-sync.lock`（可用 `MAITIAN_ENGAGE_LOCK` 改）。持锁进程已退出或锁超过 60 分钟时，锁视为过期，下一轮会接管。
+- 同一平台同一 kind 连续失败 2 次，发一张飞书卡片。账号掉线时也发一张，同一账号 6 小时内只发一次。
+
+### 关掉
+
+在守护进程的环境里设置 `HUB_NO_ENGAGE=1` 后重启守护进程，就不再自动抓取。手动抓不受影响。
+
+### 手动跑和查看状态
+
+```sh
+hub ops engage sync --once                                    # 跑一轮：先跑 refresh_now，再跑到点的任务
+hub ops engage sync --once --platform Douyin --kind comments --force   # 不看时间表，立刻抓抖音评论
+hub ops engage status                                         # 每个平台每个 kind 最近一次任务的状态、时间、条数，以及未处理事件数
+```
+
+`sync` 的退出码：`0` 表示这一轮跑完了（有任务失败也是 `0`，失败通过事件和飞书通知）；`1` 表示参数错；`5` 表示已有一轮在跑，这次没有跑。加 `--json` 时，标准输出只有 JSON，日志写到标准错误。
+
+### 日志
+
+每个任务在 `data/daemon.log` 里写一行：时间、平台、kind、结果，以及条数或跳过原因。日志里不写评论正文、昵称、密钥、cookie、token，也不写订阅地址的 query。能力位关着这类原因只在第一次出现或原因变化时写一行。

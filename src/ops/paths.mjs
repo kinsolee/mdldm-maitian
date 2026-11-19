@@ -7,6 +7,7 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 
 export const opsDbPath = () => process.env.MAITIAN_OPS_DB || path.join(ROOT, 'data', 'ops.db');
 export const envPath = () => process.env.MAITIAN_ENV_FILE || path.join(ROOT, '.env');
+export const engageLockPath = () => process.env.MAITIAN_ENGAGE_LOCK || path.join(ROOT, 'data', 'engage-sync.lock');
 export const seedPath = () => path.join(ROOT, 'src', 'ops', 'accounts.seed.json');
 
 // 知识站后台地址：config.json 的 site.base + site.adminPath（同 src/site.mjs 的算法）。
