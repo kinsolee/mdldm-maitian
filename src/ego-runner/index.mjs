@@ -9,7 +9,7 @@
 // 杀掉 CLI 停不掉 Ego 里的脚本（spikes/results/03），所以脚本自己写心跳文件、到截止时间自己退出；
 // runner 超时后要等心跳确认旧脚本停了才释放锁，没停就把锁留给它（见 locks.mjs 的 orphanLock）。
 import { spawn } from 'node:child_process';
-import { FORBIDDEN_PROFILE } from './space.mjs';
+import { ALLOWED_PROFILES, profileAllowed } from './space.mjs';
 import { locksDir as defaultLocksDir, orphanLock, releaseLock, spaceLockPath, tryLock, waitQuiet } from './locks.mjs';
 
 export const DEFAULT_PROFILE = 'Profile 5';
@@ -159,7 +159,7 @@ export async function runEgoTask({
   timeoutMs = DEFAULT_TIMEOUT_MS, deadlineMs, lock = true, locksDir = defaultLocksDir(),
   heartbeatMs = 2000, staleMs = 10_000, graceMs = 30_000, focusTimeoutMs,
 } = {}) {
-  if (profileId === FORBIDDEN_PROFILE) return { ok: false, reason: 'profile-rejected', error: `不允许使用 ${FORBIDDEN_PROFILE}` };
+  if (!profileAllowed(profileId)) return { ok: false, reason: 'profile-rejected', error: `不允许使用 ${profileId || '空 profile'}（只认 ${ALLOWED_PROFILES.join('、')}）` };
   if (!SPACE_NAME.test(space || '')) return { ok: false, reason: 'bad-space-name', error: `space 名要是 kinso/<平台>/<uid>：${space}` };
   return withSpaceLock(space, { lock, locksDir, staleMs, graceMs }, (held) => {
     const deadlineAt = Date.now() + (deadlineMs ?? timeoutMs - deadlineMargin(timeoutMs));
@@ -169,22 +169,22 @@ export async function runEgoTask({
 }
 
 /**
- * 关掉指定名字的 space（不存在就什么都不做）。只动 kinso/ 开头、且在 profileId 上的；Profile 6 一律拒绝。
+ * 关掉指定名字的 space（不存在就什么都不做）。只动 kinso/ 开头、且在 profileId 上的；profile 只认 ALLOWED_PROFILES。
  * 同名 space 在别的 profile 上时不接管、不关，返回 ok:false, reason:'profile-mismatch'。
+ * 只关 ownership=agent 的；user、agentDelegatedToUser 等在负责人手里的不 claim、不关，返回 reason:'user-controlled'。
  * 跟 runEgoTask 一样持 space 锁：别的任务正持锁时不关，返回 reason:'busy'。
  */
 export async function finishSpace(space, { profileId = DEFAULT_PROFILE, lock = true, locksDir = defaultLocksDir(), staleMs = 10_000, graceMs = 30_000, ...opts } = {}) {
-  if (!profileId || profileId === FORBIDDEN_PROFILE) return { ok: false, reason: 'profile-rejected', error: `不允许使用 ${profileId || '空 profile'}` };
+  if (!profileAllowed(profileId)) return { ok: false, reason: 'profile-rejected', error: `不允许使用 ${profileId || '空 profile'}（只认 ${ALLOWED_PROFILES.join('、')}）` };
   if (!SPACE_NAME.test(space || '')) return { ok: false, reason: 'bad-space-name', error: space };
   const r = await withSpaceLock(space, { lock, locksDir, staleMs, graceMs }, () => runEgoScript(`const s = (await listTaskSpaces()).find((x) => x.name === ${JSON.stringify(space)});
 const want = ${JSON.stringify(profileId)};
 let r = { closed: false, existed: !!s };
 if (s && s.profileId !== want) r = { closed: false, existed: true, mismatch: true, profileId: s.profileId ?? null };
-else if (s) {
-  const t = s.ownership === "agent" ? await taskSpace(s.id) : s.ownership === "user" ? await claimTaskSpace(s.id) : null;
-  if (t) r = { existed: true, ...(await t.finish({ keep: [] })) };
-}
+else if (s && s.ownership !== "agent") r = { closed: false, existed: true, userControlled: true, ownership: s.ownership ?? null };
+else if (s) r = { existed: true, ...(await (await taskSpace(s.id)).finish({ keep: [] })) };
 console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify(r));`, opts));
   if (r.ok && r.result?.mismatch) return { ...r, ok: false, reason: 'profile-mismatch', error: `space ${space} 在 ${r.result.profileId} 上，不是 ${profileId}，没有关` };
+  if (r.ok && r.result?.userControlled) return { ...r, ok: false, reason: 'user-controlled', error: `space ${space} 在负责人手里（ownership=${r.result.ownership}），没有关` };
   return r;
 }
