@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import { opsDir } from './paths.mjs';
-import { PLATFORMS, CAPABILITIES, DEFAULT_PROFILE, spaceNameOf } from './accounts.mjs';
+import { PLATFORMS, CAPABILITIES, DEFAULT_PROFILE, PENDING, spaceNameOf } from './accounts.mjs';
 
 export const LOGIN_STATES = ['ok', 'out', 'awaiting_user', 'unknown'];
 
@@ -77,7 +77,11 @@ export function setLastAlertAt(db, { platformCode, uid }, at) {
 }
 
 /** uid 从 pending 改成真实值：主键和 spaceName 一起改，同时写登录状态；一个事务。返回新名字。 */
+export const validUid = (v) => typeof v === 'string' && v !== '' && v !== PENDING && !/[/\s]/.test(v);
+
 export function adoptUid(db, { platformCode, uid: oldUid }, newUid, state, checkedAt) {
+  // 读到的值要能当主键和 space 名的一段：不能空、不能是 pending、不能含 / 或空白
+  if (!validUid(newUid)) throw new Error(`读到的 uid 不合格（${typeof newUid}，长度 ${String(newUid ?? '').length}），登记没改`);
   const spaceName = spaceNameOf(platformCode, newUid);
   db.exec('BEGIN IMMEDIATE');
   try {

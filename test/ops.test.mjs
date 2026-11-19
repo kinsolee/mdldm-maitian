@@ -273,6 +273,47 @@ describe('login --check', () => {
     assert.equal(e.acct('Douyin').loginState, 'unknown');
   });
 
+  test('G-B4 公众号登录成别的号：读出实际 gh_ 号，uid-mismatch 硬停（6），登记不变', async () => {
+    const before = e.acct('GongZhongHao');
+    e.deps.runInSpace = async ({ params }) => ({ ok: true, result: await CHECKS[params.platformCode].check(fakePage({ url: 'https://mp.weixin.qq.com/cgi-bin/home?token=9', evaluate: () => ({ own: null, ghs: ['gh_other0000001'] }) }), params) });
+    assert.equal(await e.run('login', '--check', '公众号'), 6);
+    assert.deepEqual(e.acct('GongZhongHao'), before);
+    assert.match(e.rows()[0].error, /gh_other0000001/);
+  });
+
+  test('G-B4 pending 读到不合格的 uid（pending、空白、含 /）不改登记，退出码 1', async () => {
+    for (const bad of ['pending', 'a b', 'x/y', ' ']) {
+      e.deps.runInSpace = async () => ({ ok: true, result: { state: 'ok', uidSeen: bad } });
+      assert.equal(await e.run('login', '--check', 'youtube'), 1, JSON.stringify(bad));
+      const yt = e.acct('YouTube');
+      assert.equal(yt.uid, 'pending'); assert.equal(yt.spaceName, 'kinso/YouTube/pending'); assert.equal(yt.loginState, 'unknown');
+    }
+    assert.equal(e.finishes.length, 0);
+  });
+
+  test('G-B3 --check 放在平台名后面也是只读检测，不 handOff、不改成 awaiting_user', async () => {
+    assert.equal(await e.run('login', 'douyin', '--check'), 0);
+    assert.equal(e.calls[0].lock, 'skip'); assert.equal(e.calls[0].script, DETECT_SCRIPT);
+    assert.equal(e.acct('Douyin').loginState, 'ok');
+    e.reset();
+    assert.equal(await e.run('login', 'douyin', '--take-back', '--check'), 0);
+    assert.equal(e.calls[0].takeBack, true); assert.equal(e.calls[0].script, DETECT_SCRIPT);
+  });
+
+  test('G-B3 参数不对一律打印用法、退出码 2，不调 runInSpace', async () => {
+    const bad = [
+      ['login', 'douyin', '--take-back'], ['login', '--take-back'], ['login', '--check', 'douyin', 'bili'], ['login'],
+      ['login', 'douyin', 'bili'], ['login', '--check', '--force'], ['login', 'douyin', '-x'], ['login', '--check', '--check'],
+      ['accounts', 'seed', 'extra'], ['accounts', 'list', '--all'], ['tokens', 'init', 'x'], ['tokens'], ['accounts'], ['nope'],
+    ];
+    for (const argv of bad) {
+      e.errs.length = 0;
+      assert.equal(await e.run(...argv), 2, argv.join(' '));
+      assert.match(e.errs.join('\n'), /login --check/, argv.join(' '));
+    }
+    assert.equal(e.calls.length, 0);
+  });
+
   test('点名 Instagram / 知识站：拒绝，不调 runInSpace', async () => {
     for (const p of ['instagram', 'Instagram', '知识站', 'zsz']) {
       assert.equal(await e.run('login', '--check', p), 2);
@@ -374,14 +415,33 @@ describe('口令', () => {
     assert.deepEqual(r.tokens.map((t) => t.status), ['已存在', '已生成']);
   });
 
-  test('requireToken：缺或格式不对拒绝（退出码 8，报错不带值）；合格放行', () => {
-    assert.equal(requireToken('engage', {}).exitCode, 8);
-    const bad = requireToken('publish', { MAITIAN_PUBLISH_TOKEN: 'short-secret' });
-    assert.equal(bad.ok, false); assert.equal(bad.reason, 'token-missing');
-    assert.doesNotMatch(bad.error, /short-secret/);
-    assert.deepEqual(requireToken('engage', { MAITIAN_ENGAGE_TOKEN: 'c'.repeat(64) }), { ok: true });
-    assert.equal(requireToken('other', {}).ok, false);
-    assert.ok(HEX.test('c'.repeat(64)));
+  test('G-B2 requireToken：没有 .env 拒绝（退出码 8），哪怕环境变量是合格的 64 位 hex', () => {
+    const root = tmp();
+    const r = requireToken('engage', { MAITIAN_ENGAGE_TOKEN: 'c'.repeat(64) }, { root });
+    assert.equal(r.ok, false); assert.equal(r.exitCode, 8); assert.equal(r.reason, 'token-missing');
+    assert.equal(requireToken('other', {}, { root }).ok, false);
+  });
+
+  test('G-B2 requireToken：伪造的 64 位 hex 被拒，和 .env 一致才放行；报错不带值', () => {
+    const root = tmp();
+    initTokens({ root, gen });
+    const real = fs.readFileSync(path.join(root, '.env'), 'utf8').match(/^MAITIAN_ENGAGE_TOKEN=(.*)$/m)[1];
+    const fake = 'd'.repeat(64);
+    const bad = requireToken('engage', { MAITIAN_ENGAGE_TOKEN: fake }, { root });
+    assert.equal(bad.ok, false); assert.equal(bad.exitCode, 8);
+    assert.ok(!bad.error.includes(fake) && !bad.error.includes(real));
+    const short = requireToken('engage', { MAITIAN_ENGAGE_TOKEN: 'short-secret' }, { root });
+    assert.equal(short.exitCode, 8); assert.doesNotMatch(short.error, /short-secret/);
+    assert.equal(requireToken('engage', {}, { root }).exitCode, 8);
+    assert.deepEqual(requireToken('engage', { MAITIAN_ENGAGE_TOKEN: real }, { root }), { ok: true });
+    // engage 的口令不能拿去过 publish
+    assert.equal(requireToken('publish', { MAITIAN_PUBLISH_TOKEN: real }, { root }).ok, false);
+  });
+
+  test('G-B2 requireToken：.env 里的值格式不对也拒绝', () => {
+    const root = tmp();
+    fs.writeFileSync(path.join(root, '.env'), 'MAITIAN_ENGAGE_TOKEN=abc\n');
+    assert.equal(requireToken('engage', { MAITIAN_ENGAGE_TOKEN: 'abc' }, { root }).exitCode, 8);
   });
 });
 
@@ -415,8 +475,8 @@ describe('检测脚本和判据（假页面，不需要 Ego Lite）', () => {
       ['X', { url: 'https://x.com/i/flow/login', evaluate: () => null }, 'out', null],
       ['Weibo', { url: 'https://weibo.com/', fetch: () => ({ ok: 1 }), evaluate: () => '2272770294' }, 'ok', '2272770294'],
       ['Weibo', { url: 'https://passport.weibo.com/visitor', fetch: () => ({ ok: 1 }), evaluate: () => '' }, 'out', null],
-      ['GongZhongHao', { url: 'https://mp.weixin.qq.com/cgi-bin/home?t=home&token=123', evaluate: () => true }, 'ok', 'gh_eb2c407bc687'],
-      ['GongZhongHao', { url: 'https://mp.weixin.qq.com/' }, 'out', null],
+      ['GongZhongHao', { url: 'https://mp.weixin.qq.com/cgi-bin/home?t=home&token=123', evaluate: () => ({ own: 'gh_eb2c407bc687', ghs: [] }) }, 'ok', 'gh_eb2c407bc687'],
+      ['GongZhongHao', { url: 'https://mp.weixin.qq.com/', evaluate: () => ({ ghs: [], loginBox: true }) }, 'out', null],
     ];
     for (const [code, page, state, uid] of cases) {
       const r = await CHECKS[code].check(fakePage(page), { uid: code === 'GongZhongHao' ? 'gh_eb2c407bc687' : '1' });
