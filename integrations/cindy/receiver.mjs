@@ -13,11 +13,13 @@ import { verifySignature, HOOK_PATH, MAX_BODY_BYTES } from '../openbot/receiver.
 import { ensureSubscribed } from '../openbot/subscribe.mjs';
 import { childEnv } from '../openbot/forward.mjs';
 import { ENV_FILE, enforceEnvPerms, loadEnvFile, readConfig } from './config.mjs';
-import { openInbox } from './store.mjs';
+import { openInbox, eventProblem } from './store.mjs';
 
 export { HOOK_PATH };
 export const BACKFILL_OVERLAP_MS = 2 * 3600_000;
+export const BACKFILL_FIRST_WINDOW_MS = 24 * 3600_000;
 export const BACKFILL_PAGE = 100;
+export const MCP_TIMEOUT_MS = 60_000;
 
 const stamp = () => new Date().toISOString();
 const defaultLog = (line) => console.log(`${stamp()} ${line}`);
@@ -25,7 +27,10 @@ const defaultLog = (line) => console.log(`${stamp()} ${line}`);
 export function createReceiver({ secret, subscriberId, inbox, log = defaultLog, now = Date.now }) {
   function handler(req, res) {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }).end(JSON.stringify(body)); };
-    if (req.method === 'GET' && req.url === '/health') { send(200, { ok: true, ...inbox.stats() }); return; }
+    if (req.method === 'GET' && req.url === '/health') {
+      try { send(200, { ok: true, ...inbox.stats() }); } catch (e) { send(503, { ok: false, error: 'store failed' }); }
+      return;
+    }
     if (req.method !== 'POST' || req.url.split('?')[0] !== HOOK_PATH) { send(404, { error: 'not found' }); return; }
     const chunks = [];
     let size = 0;
@@ -48,7 +53,7 @@ export function createReceiver({ secret, subscriberId, inbox, log = defaultLog, 
       if (!body || typeof body !== 'object' || body.subscriberId !== subscriberId || !Array.isArray(body.events)) { send(400, { error: 'unexpected body' }); return; }
       const events = body.events;
       // 有一条不合格就整批拒收：回 200 会让麦田当成送达，不合格的事件就丢了
-      if (!events.every((e) => e && typeof e.id === 'string' && e.id && typeof e.type === 'string' && e.type)) { send(400, { error: 'event without id or type' }); return; }
+      if (events.some((e) => eventProblem(e))) { log('推送里有不合格的事件，整批回 400'); send(400, { error: 'malformed event' }); return; }
       let r;
       try { r = inbox.receive(events, now(), 'push'); } catch (e) { log(`收件箱写入失败：${e.message}`); send(503, { error: 'store failed' }); return; }
       log(`收到 ${events.length} 条（新 ${r.accepted}，重复 ${r.duplicate}）`);
@@ -59,38 +64,53 @@ export function createReceiver({ secret, subscriberId, inbox, log = defaultLog, 
 }
 
 /**
- * 补漏一次：从收件箱最新一条往前退 2 小时（收件箱空时从现在往前 2 小时）起，翻页读 list_events，没见过的收进收件箱。
+ * 补漏一次。起点是上次补漏成功开始的时间往前退 2 小时；从没补过（或水位坏了）就从现在往前 24 小时。
+ * 翻页读完、全部收进收件箱之后才推进水位；任何一页出错或有不合格的事件就抛错，水位不动，下一轮从原处重来。
+ * 水位不看收件箱里最新的事件：接收端停机期间 OpenBot 回执掉的事件麦田不会再推，只能靠这里按时间找回。
  * listEvents(args) => { items, nextCursor }。返回新收的条数。
  */
 export async function backfillOnce({ inbox, listEvents, types, now = Date.now }) {
-  const latest = inbox.latestCreatedAt();
-  const since = new Date((latest ? Date.parse(latest) : now()) - BACKFILL_OVERLAP_MS).toISOString();
+  const startedAt = now();
+  const mark = inbox.watermark();
+  const since = new Date(Number.isFinite(mark) ? mark - BACKFILL_OVERLAP_MS : startedAt - BACKFILL_FIRST_WINDOW_MS).toISOString();
   let cursor;
   let accepted = 0;
   for (;;) {
     const page = await listEvents({ types, since, limit: BACKFILL_PAGE, ...(cursor ? { cursor } : {}) });
-    const items = (page?.items ?? []).filter((e) => e && typeof e.id === 'string' && e.id && typeof e.type === 'string');
-    accepted += inbox.receive(items, now(), 'backfill').accepted;
-    if (!page?.nextCursor) break;
+    if (!page || !Array.isArray(page.items)) throw new Error('list_events 返回的不是 { items }');
+    const bad = page.items.find((e) => eventProblem(e));
+    if (bad) throw new Error(`list_events 返回了不合格的事件（${eventProblem(bad)}）`);
+    accepted += inbox.receive(page.items, now(), 'backfill').accepted;
+    if (!page.nextCursor) break;
     cursor = page.nextCursor;
   }
+  inbox.setWatermark(startedAt);
   return accepted;
 }
 
-/** 起麦田 MCP（stdio，read 组）调 list_events。每次补漏起一次、用完关掉。 */
-export function mcpListEvents({ mcpServer, opsDb }) {
+/** 起麦田 MCP（stdio，read 组）调 list_events。每次调用起一次、用完关掉；连接加调用超过 timeoutMs 就关掉子进程并抛错。 */
+export function mcpListEvents({ mcpServer, opsDb, timeoutMs = MCP_TIMEOUT_MS }) {
   return async (args) => {
     const env = childEnv();
     if (opsDb) env.MAITIAN_OPS_DB = opsDb;
     const transport = new StdioClientTransport({ command: process.execPath, args: [mcpServer, '--scope', 'read'], env, stderr: 'ignore' });
     const client = new Client({ name: 'cindy-receiver', version: '1' });
-    await client.connect(transport);
-    try {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`麦田 MCP 超时（${Math.round(timeoutMs / 1000)} 秒）`)), timeoutMs);
+    });
+    const call = (async () => {
+      await client.connect(transport);
       const r = await client.callTool({ name: 'list_events', arguments: args });
       if (r.isError) throw new Error(`list_events 失败：${r.content?.[0]?.text}`);
       return JSON.parse(r.content[0].text);
+    })();
+    try {
+      return await Promise.race([call, timeout]);
     } finally {
-      await client.close();
+      clearTimeout(timer);
+      await client.close().catch(() => {});
+      await transport.close().catch(() => {});
     }
   };
 }

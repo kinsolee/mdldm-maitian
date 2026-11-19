@@ -319,13 +319,13 @@ Cindy 0.1.141 的定时任务支持 webhook 触发，但打包版只走 Cindy �
 ### 两边同时订阅时要知道的
 
 - 订阅方 id 不同：OpenBot 用 `openbot-engage`（8790），Cindy 用 `cindy-engage`（8791）。
-- 麦田只推**还没回执**的事件。Cindy 的推送失败、等到重试时 OpenBot 已经回执了，这条就不会再推给 Cindy。接收端每 15 分钟用 `list_events`（不带 `unhandled`）补一次漏，保证两边收到的事件集合一致。
+- 麦田只推**还没回执**的事件。Cindy 的推送失败、等到重试时 OpenBot 已经回执了，这条就不会再推给 Cindy。接收端每 15 分钟用 `list_events`（不带 `unhandled`）补一次漏，保证两边收到的事件集合一致。补漏从「上次补漏成功开始的时间」往前 2 小时起查（水位存在收件箱里，停机重启也接得上；从没补过就查最近 24 小时），读完全部页才推进水位。连接加调用超过 60 秒按失败算，下一轮重来。
 - 「2 小时没回执」提醒看的是全局 `events.handledAt`（`src/daemon/outbox.mjs`）：OpenBot 回执了，Cindy 那边就不会提醒。只有 OpenBot 也超时没回执时，两个订阅方各提醒一次。
 - 以后要让 Cindy 当主处理方：OpenBot 停止回执（或对 `openbot-engage` 调 `unsubscribe_events`），Cindy 这边改 `agent-prompt.md` 加回执和正式记录。麦田不用改。
 
 ### 配置（`integrations/cindy/.env`，权限 0600，不进仓库）
 
-见 `integrations/cindy/.env.example`。`MAITIAN_SECRET` 由首次登记自动写入，不打印。验签、`.env` 读写、订阅登记直接复用 `integrations/openbot/` 的代码。
+见 `integrations/cindy/.env.example`。`MAITIAN_SUBSCRIBER_ID` 不能用 `openbot` 开头的 id，`CINDY_LEDGER_FILE` 必须是 `.jsonl` 且不能指向 OpenBot 的记录、待确认、话术文件，配错了启动直接报错。`MAITIAN_SECRET` 由首次登记自动写入，不打印。验签、`.env` 读写、订阅登记直接复用 `integrations/openbot/` 的代码。
 
 ### 启动和查看
 

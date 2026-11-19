@@ -5,7 +5,7 @@
 //   record           从 stdin 读 JSON 数组 [{ eventId, category, suggestedReply }]，写进对照文件，写成功才标已处理。
 import fs from 'node:fs';
 import { ENV_FILE, loadEnvFile, readPaths } from './config.mjs';
-import { openInbox, PENDING_LIMIT } from './store.mjs';
+import { openInbox, exists, PENDING_LIMIT } from './store.mjs';
 import { recordResults } from './ledger.mjs';
 
 export const PRECHECK_OK = 'CINDY_PRECHECK_OK';
@@ -15,7 +15,7 @@ export function run(argv, { paths, stdin = '', now = Date.now } = {}) {
   const [cmd, arg] = argv;
   if (cmd === 'check') {
     // 收件箱文件还没有（接收端没起过）：没有事件可处理，跳过本轮
-    if (!fs.existsSync(paths.stateDb)) return { code: 2, out: `收件箱还没建：${paths.stateDb}\n${PRECHECK_OK}` };
+    if (!exists(paths.stateDb)) return { code: 2, out: `收件箱还没建：${paths.stateDb}\n${PRECHECK_OK}` };
     const inbox = openInbox(paths.stateDb, { readOnly: true });
     try {
       const n = inbox.pendingCount();
@@ -25,13 +25,14 @@ export function run(argv, { paths, stdin = '', now = Date.now } = {}) {
   if (cmd === 'pending') {
     const limit = arg == null ? PENDING_LIMIT : Number(arg);
     if (!Number.isInteger(limit) || limit <= 0 || limit > 100) return { code: 1, out: 'pending 的条数要是 1 到 100 的整数' };
-    if (!fs.existsSync(paths.stateDb)) return { code: 0, out: '[]' };
+    if (!exists(paths.stateDb)) return { code: 0, out: '[]' };
     const inbox = openInbox(paths.stateDb, { readOnly: true });
     try { return { code: 0, out: JSON.stringify(inbox.pending(limit), null, 1) }; } finally { inbox.close(); }
   }
   if (cmd === 'record') {
     let results;
-    try { results = JSON.parse(stdin); } catch { return { code: 1, out: 'stdin 不是 JSON 数组' }; }
+    try { results = JSON.parse(stdin); } catch { results = null; }
+    if (!Array.isArray(results)) return { code: 1, out: 'stdin 不是 JSON 数组' };
     const inbox = openInbox(paths.stateDb);
     try {
       const r = recordResults({ inbox, file: paths.ledger, results, now });

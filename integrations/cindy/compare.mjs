@@ -8,7 +8,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { ENV_FILE, loadEnvFile, readPaths, DEFAULT_TYPES } from './config.mjs';
-import { openInbox } from './store.mjs';
+import { openInbox, exists, BUSY_TIMEOUT_MS } from './store.mjs';
 import { readLedger } from './ledger.mjs';
 
 const DATA_DIR = path.join(os.homedir(), 'Documents', 'OPC-vault', '10.个人IP', '数据');
@@ -27,12 +27,18 @@ export function idsBySection(markdown) {
   return out;
 }
 
-/** OpenBot 对一条事件的分类，按 Cindy 的四类算。还没处理返回 null。 */
+export const UNKNOWN = '未知';
+
+/**
+ * OpenBot 对一条事件的分类，按 Cindy 的四类算。还没处理返回 null。
+ * 回执了、但两个文件里都找不到这个 id 的，分不出类，返回「未知」，不硬算成建议回复。
+ */
 export function openbotCategory(ev, recordIds, pendingIds) {
   const sec = pendingIds.get(ev.id);
   if (sec != null) return sec.includes('广告') ? '广告' : '新问题';
   if (ev.handledOutcome === 'skipped' || ev.handledOutcome === 'ignored') return '跳过';
-  if (ev.handledAt || recordIds.has(ev.id)) return '建议回复';
+  if (recordIds.has(ev.id)) return '建议回复';
+  if (ev.handledAt) return UNKNOWN;
   return null;
 }
 
@@ -50,8 +56,8 @@ export function summarize(values) {
  * inboxRows：Cindy 收件箱的行；ledger：Map<eventId, 对照行>；records、pending：OpenBot 两个文件的全文。
  */
 export function buildReport({ events, inboxRows, ledger, records, pending, since, until }) {
-  const recordIds = idsBySection(records);
-  const pendingIds = idsBySection(pending);
+  const recordIds = idsBySection(records ?? '');
+  const pendingIds = idsBySection(pending ?? '');
   const inbox = new Map(inboxRows.map((r) => [r.id, r]));
   const rows = events.map((ev) => {
     const cindy = ledger.get(ev.id) ?? null;
@@ -74,7 +80,10 @@ export function buildReport({ events, inboxRows, ledger, records, pending, since
     receivedNotRecorded: rows.filter((r) => r.cindyReceived && !r.cindy).map((r) => r.id),
     openbotDelay: summarize(rows.map((r) => r.openbotDelay)),
     cindyDelay: summarize(rows.map((r) => r.cindyDelay)),
-    mismatches: rows.filter((r) => r.openbot && r.cindy && r.openbot !== r.cindy),
+    mismatches: rows.filter((r) => r.openbot && r.openbot !== UNKNOWN && r.cindy && r.openbot !== r.cindy),
+    cindyOnly: rows.filter((r) => r.cindy && !r.openbot),
+    openbotUnknown: rows.filter((r) => r.openbot === UNKNOWN),
+    missingFiles: [records == null && 'OpenBot 记录文件', pending == null && 'OpenBot 待确认文件'].filter(Boolean),
   };
 }
 
@@ -96,8 +105,17 @@ export function renderReport(r) {
     `| 两边都处理了、分类不一致 | ${r.mismatches.length} | ${r.mismatches.length} |`,
     '',
   ];
+  if (r.missingFiles.length) lines.push(`> 读不到：${r.missingFiles.join('、')}。OpenBot 一侧的分类不全，下面的「未知」会偏多。`, '');
   if (r.missingInCindy.length) lines.push('## Cindy 没收到的事件', '', ...r.missingInCindy.map((id) => `- \`${id}\``), '');
   if (r.receivedNotRecorded.length) lines.push('## Cindy 收到了还没写进对照文件', '', ...r.receivedNotRecorded.map((id) => `- \`${id}\``), '');
+  if (r.cindyOnly.length) {
+    lines.push('## Cindy 已分类、OpenBot 还没处理', '', '| 事件 id | 平台 | Cindy |', '| --- | --- | --- |',
+      ...r.cindyOnly.map((m) => `| \`${m.id}\` | ${m.platform} | ${m.cindy} |`), '');
+  }
+  if (r.openbotUnknown.length) {
+    lines.push('## OpenBot 回执了、但记录和待确认文件里找不到（分类未知）', '', '| 事件 id | 平台 | Cindy |', '| --- | --- | --- |',
+      ...r.openbotUnknown.map((m) => `| \`${m.id}\` | ${m.platform} | ${m.cindy ?? '—'} |`), '');
+  }
   if (r.mismatches.length) {
     lines.push('## 分类不一致', '', '| 事件 id | 平台 | OpenBot | Cindy |', '| --- | --- | --- | --- |',
       ...r.mismatches.map((m) => `| \`${m.id}\` | ${m.platform} | ${m.openbot} | ${m.cindy} |`), '');
@@ -105,20 +123,21 @@ export function renderReport(r) {
   return lines.join('\n');
 }
 
+/** 读文本；文件不在返回 null（报告里会提示），其他错误照常抛出。 */
 function readText(file) {
-  try { return fs.readFileSync(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; }
+  try { return fs.readFileSync(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
 }
 
 export function main(argv = process.argv.slice(2), env = process.env) {
   const { values } = parseArgs({ args: argv, options: { hours: { type: 'string', default: '24' }, until: { type: 'string' } } });
   const hours = Number(values.hours);
-  if (!(hours > 0)) throw new Error('--hours 要是正数');
+  if (!(hours > 0) || !Number.isFinite(hours)) throw new Error('--hours 要是正数');
   const until = values.until ? new Date(values.until).toISOString() : new Date().toISOString();
   const since = new Date(Date.parse(until) - hours * 3600_000).toISOString();
   const opsDb = env.MAITIAN_OPS_DB || path.resolve(import.meta.dirname, '../../data/ops.db');
   const paths = readPaths(env);
 
-  const db = new DatabaseSync(opsDb, { readOnly: true });
+  const db = new DatabaseSync(opsDb, { readOnly: true, timeout: BUSY_TIMEOUT_MS });
   let events;
   try {
     events = db.prepare(`SELECT id, type, platformCode, createdAt, handledAt, handledOutcome FROM events
@@ -127,7 +146,7 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   } finally { db.close(); }
 
   let inboxRows = [];
-  if (fs.existsSync(paths.stateDb)) {
+  if (exists(paths.stateDb)) {
     const inbox = openInbox(paths.stateDb, { readOnly: true });
     try { inboxRows = inbox.all(); } finally { inbox.close(); }
   }

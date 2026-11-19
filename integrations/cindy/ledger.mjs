@@ -64,21 +64,23 @@ export function recordResults({ inbox, file, results, now = Date.now }) {
 
 function appendDurably(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  // 上次写到一半没换行时，先补一个换行，免得新行接在半行后面
-  let prefix = '';
+  const fd = fs.openSync(file, 'a+', 0o600);
   try {
-    const { size } = fs.statSync(file);
+    // 上次写到一半没换行时，先补一个换行，免得新行接在半行后面
+    const { size } = fs.fstatSync(fd);
+    let prefix = '';
     if (size > 0) {
-      const fd = fs.openSync(file, 'r');
       const b = Buffer.alloc(1);
       fs.readSync(fd, b, 0, 1, size - 1);
-      fs.closeSync(fd);
       if (b[0] !== 0x0a) prefix = '\n';
     }
-  } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const fd = fs.openSync(file, 'a', 0o600);
-  try {
-    fs.writeSync(fd, prefix + text);
+    const buf = Buffer.from(prefix + text, 'utf8');
+    // writeSync 可能只写了一部分：循环写完，写不动就抛错（事件不标已处理）
+    for (let off = 0; off < buf.length;) {
+      const n = fs.writeSync(fd, buf, off, buf.length - off);
+      if (!(n > 0)) throw new Error('对照文件写不进去（写入 0 字节）');
+      off += n;
+    }
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);

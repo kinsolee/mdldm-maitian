@@ -7,7 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { createHmac } from 'node:crypto';
-import { createReceiver, backfillOnce, mcpListEvents, HOOK_PATH, BACKFILL_OVERLAP_MS } from '../integrations/cindy/receiver.mjs';
+import { createReceiver, backfillOnce, mcpListEvents, HOOK_PATH, BACKFILL_OVERLAP_MS, BACKFILL_FIRST_WINDOW_MS } from '../integrations/cindy/receiver.mjs';
+import { spawn, spawnSync } from 'node:child_process';
 import { openInbox } from '../integrations/cindy/store.mjs';
 import { recordResults, readLedger } from '../integrations/cindy/ledger.mjs';
 import { run, PRECHECK_OK } from '../integrations/cindy/inbox.mjs';
@@ -216,29 +217,57 @@ describe('对照文件', () => {
 });
 
 describe('补漏', () => {
-  test('从收件箱最新一条往前退 2 小时起翻页读，已有的不重复收', async () => {
+  const page = (items, nextCursor = null) => ({ items, nextCursor });
+
+  test('从没补过：从现在往前 24 小时起；翻页读完才推进水位，已有的不重复收', async () => {
     const inbox = openInbox(':memory:');
-    inbox.receive([ev('c1', { createdAt: '2026-11-19T05:00:00.000Z' })], T0);
+    inbox.receive([ev('c1')], T0);
     const calls = [];
-    const pages = [
-      { items: [ev('c1'), ev('c2')], nextCursor: 'k1' },
-      { items: [ev('c3'), { type: 'comment.created' }], nextCursor: null },
-    ];
+    const pages = [page([ev('c1'), ev('c2')], 'k1'), page([ev('c3')])];
     const n = await backfillOnce({ inbox, types: ['comment.created'], now: at(T0), listEvents: async (a) => { calls.push(a); return pages[calls.length - 1]; } });
     assert.equal(n, 2);
-    assert.equal(calls[0].since, new Date(Date.parse('2026-11-19T05:00:00.000Z') - BACKFILL_OVERLAP_MS).toISOString());
-    assert.equal(calls[0].cursor, undefined);
+    assert.equal(calls[0].since, new Date(T0 - BACKFILL_FIRST_WINDOW_MS).toISOString());
     assert.equal(calls[1].cursor, 'k1');
+    assert.equal(inbox.watermark(), T0);
     assert.deepEqual(inbox.all().map((r) => [r.id, r.source]).sort(), [['c1', 'push'], ['c2', 'backfill'], ['c3', 'backfill']]);
     inbox.close();
   });
 
-  test('收件箱空：从现在往前 2 小时起', async () => {
+  test('水位不随新推送跳走：停机后来了新推送，下一次补漏仍从上次成功处往前 2 小时起', async () => {
     const inbox = openInbox(':memory:');
+    inbox.setWatermark(T0);
+    inbox.receive([ev('new', { createdAt: new Date(T0 + 10 * 3600_000).toISOString() })], T0 + 10 * 3600_000);
     let since;
-    await backfillOnce({ inbox, types: ['comment.created'], now: at(T0), listEvents: async (a) => { since = a.since; return { items: [], nextCursor: null }; } });
+    await backfillOnce({ inbox, types: ['comment.created'], now: at(T0 + 10 * 3600_000), listEvents: async (a) => { since = a.since; return page([]); } });
     assert.equal(since, new Date(T0 - BACKFILL_OVERLAP_MS).toISOString());
+    assert.equal(inbox.watermark(), T0 + 10 * 3600_000);
     inbox.close();
+  });
+
+  test('出错或有不合格的事件：抛错，水位不动，一条都不收', async () => {
+    const inbox = openInbox(':memory:');
+    inbox.setWatermark(T0);
+    await assert.rejects(backfillOnce({ inbox, types: ['comment.created'], now: at(T0 + MIN), listEvents: async () => { throw new Error('boom'); } }), /boom/);
+    await assert.rejects(backfillOnce({ inbox, types: ['comment.created'], now: at(T0 + MIN), listEvents: async () => page([ev('ok'), { ...ev('bad'), createdAt: 'nope' }]) }), /createdAt/);
+    await assert.rejects(backfillOnce({ inbox, types: ['comment.created'], now: at(T0 + MIN), listEvents: async () => ({}) }), /items/);
+    assert.equal(inbox.watermark(), T0);
+    assert.equal(inbox.stats().total, 0);
+    inbox.close();
+  });
+
+  test('mcpListEvents：list_events 报错时抛错，不当成空列表', async () => {
+    const opsDb = tmpDbFile();
+    freshDb(opsDb).close();
+    await assert.rejects(mcpListEvents({ mcpServer: MCP, opsDb })({ types: ['bogus.type'] }));
+  });
+
+  test('mcpListEvents：MCP 挂住时按超时抛错，不永远卡住', async () => {
+    const dir = tmpDir();
+    const hang = path.join(dir, 'hang.mjs');
+    fs.writeFileSync(hang, 'setInterval(() => {}, 1000);\n');
+    const t0 = Date.now();
+    await assert.rejects(mcpListEvents({ mcpServer: hang, timeoutMs: 500 })({ types: ['comment.created'] }), /超时/);
+    assert.ok(Date.now() - t0 < 5000);
   });
 });
 
@@ -393,5 +422,138 @@ describe('整条链路：麦田发件箱同时推给 OpenBot 和 Cindy', () => {
     assert.equal(n, 1);
     assert.deepEqual(inbox.all().map((r) => [r.id, r.source]), [['comment.created:Douyin:r2', 'backfill']]);
     inbox.close();
+  });
+});
+
+describe('第 1 轮评审修复', () => {
+  const INBOX_CLI = path.resolve(import.meta.dirname, '../integrations/cindy/inbox.mjs');
+  const cli = (args, env) => spawnSync(process.execPath, [INBOX_CLI, ...args], { env: { ...process.env, ...env }, encoding: 'utf8' });
+
+  test('推送里缺 platform、subjectId、createdAt 或时间不对：整批 400，不进收件箱', async () => {
+    const t = await start();
+    for (const bad of [{ platform: undefined }, { subjectId: '' }, { createdAt: undefined }, { createdAt: 'yesterday' }]) {
+      const res = await t.post({ subscriberId: SUB, events: [ev('ok'), { ...ev('x'), ...bad }] });
+      assert.equal(res.status, 400);
+    }
+    assert.equal(t.inbox.stats().total, 0);
+    await t.close();
+  });
+
+  test('收件箱写不进去回 503；日志里没有密钥、正文和昵称', async () => {
+    const logs = [];
+    const inbox = { receive: () => { throw new Error('database is locked'); }, stats: () => ({}) };
+    const r = createReceiver({ secret: SECRET, subscriberId: SUB, inbox, log: (l) => logs.push(l) });
+    const s = await listen(r.handler);
+    const raw = Buffer.from(JSON.stringify({ subscriberId: SUB, events: [ev('c1')] }));
+    const res = await fetch(s.url, { method: 'POST', body: raw, headers: { 'X-Maitian-Signature': sign(SECRET, raw) } });
+    assert.equal(res.status, 503);
+    await fetch(s.url, { method: 'POST', body: raw, headers: { 'X-Maitian-Signature': 'sha256=00' } });
+    assert.ok(logs.length >= 2);
+    for (const l of logs) assert.ok(!l.includes(SECRET) && !l.includes('正文') && !l.includes('昵称'), l);
+    await s.close();
+  });
+
+  test('check 作为子进程：收件箱目录没权限、库文件坏了都 exit 1，不输出 CINDY_PRECHECK_OK', () => {
+    const p = paths();
+    const locked = path.join(p.dir, 'locked');
+    fs.mkdirSync(locked);
+    fs.chmodSync(locked, 0o000);
+    try {
+      const r = cli(['check'], { CINDY_INBOX_DB: path.join(locked, 'inbox.db'), CINDY_LEDGER_FILE: p.ledger });
+      assert.equal(r.status, 1);
+      assert.ok(!r.stdout.includes(PRECHECK_OK));
+    } finally { fs.chmodSync(locked, 0o700); }
+    fs.writeFileSync(p.stateDb, 'not a sqlite file at all, just junk bytes '.repeat(50));
+    const r = cli(['check'], { CINDY_INBOX_DB: p.stateDb, CINDY_LEDGER_FILE: p.ledger });
+    assert.equal(r.status, 1);
+    assert.ok(!r.stdout.includes(PRECHECK_OK));
+  });
+
+  test('check 作为子进程：对照文件路径配成 OpenBot 的文件就 exit 1', () => {
+    const p = paths();
+    const r = cli(['check'], { CINDY_INBOX_DB: p.stateDb, CINDY_LEDGER_FILE: path.join(p.dir, '评论私信回复记录.md') });
+    assert.equal(r.status, 1);
+    assert.ok(!r.stdout.includes(PRECHECK_OK));
+  });
+
+  test('record 收到 JSON 但不是数组：exit 1，不建收件箱', () => {
+    const p = paths();
+    assert.equal(run(['record'], { paths: p, stdin: '{}' }).code, 1);
+    assert.equal(fs.existsSync(p.stateDb), false);
+  });
+
+  test('另一个进程占着写锁时，收件箱写入等锁释放，不直接报 database is locked', async () => {
+    const p = paths();
+    openInbox(p.stateDb).close();
+    const holder = spawn(process.execPath, ['-e', `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('BEGIN IMMEDIATE');
+      console.log('locked');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);
+      db.exec('COMMIT');
+      db.close();`, p.stateDb], { stdio: ['ignore', 'pipe', 'inherit'] });
+    await new Promise((ok) => holder.stdout.once('data', ok));
+    const inbox = openInbox(p.stateDb);
+    try {
+      assert.deepEqual(inbox.receive([ev('c1')], T0), { accepted: 1, duplicate: 0 });
+      inbox.markProcessed(['c1'], T0);
+      assert.equal(inbox.pendingCount(), 0);
+    } finally { inbox.close(); }
+    await new Promise((ok) => holder.once('exit', ok));
+  });
+
+  test('对照文件短写：循环写完整再标已处理', () => {
+    const p = paths();
+    const inbox = openInbox(p.stateDb);
+    inbox.receive([ev('c1'), ev('c2')], T0);
+    const orig = fs.writeSync;
+    fs.writeSync = (fd, buf, off, len, ...rest) => orig(fd, buf, off, Math.min(len, 7), ...rest);
+    try {
+      recordResults({ inbox, file: p.ledger, results: [{ eventId: 'c1', category: '建议回复', suggestedReply: '按话术 A 回一句比较长的建议' }, { eventId: 'c2', category: '跳过' }] });
+    } finally { fs.writeSync = orig; }
+    assert.deepEqual([...readLedger(p.ledger).keys()], ['c1', 'c2']);
+    assert.equal(inbox.pendingCount(), 0);
+    inbox.close();
+  });
+
+  test('对照文件写入 0 字节：抛错，不标已处理', () => {
+    const p = paths();
+    const inbox = openInbox(p.stateDb);
+    inbox.receive([ev('c1')], T0);
+    const orig = fs.writeSync;
+    fs.writeSync = () => 0;
+    try {
+      assert.throws(() => recordResults({ inbox, file: p.ledger, results: [{ eventId: 'c1', category: '跳过' }] }), /写不进去/);
+    } finally { fs.writeSync = orig; }
+    assert.equal(inbox.pendingCount(), 1);
+    inbox.close();
+  });
+
+  test('配置拒收 OpenBot 的订阅方 id 和 OpenBot 的文件', () => {
+    assert.throws(() => readConfig({ MAITIAN_SUBSCRIBER_ID: 'openbot-engage' }), /OpenBot/);
+    for (const f of ['评论私信回复记录.md', '评论私信待确认.md', '评论私信回复话术.md', '对照.md']) {
+      assert.throws(() => readPaths({ CINDY_LEDGER_FILE: path.join('/tmp', f) }), /CINDY_LEDGER_FILE/);
+    }
+    assert.equal(readPaths({ CINDY_LEDGER_FILE: '/tmp/x/对照.jsonl' }).ledger, '/tmp/x/对照.jsonl');
+  });
+
+  test('对照报告：Cindy 单边分类、OpenBot 分类未知、OpenBot 文件缺失都列出来', () => {
+    const c = (id) => `comment.created:Douyin:${id}`;
+    const base = { type: 'comment.created', platformCode: 'Douyin', createdAt: '2026-11-19T02:00:00.000Z' };
+    const events = [
+      { ...base, id: c('only'), handledAt: null, handledOutcome: null },
+      { ...base, id: c('unk'), handledAt: '2026-11-19T02:10:00.000Z', handledOutcome: 'pending_human' },
+    ];
+    const ledger = new Map([[c('only'), { category: '广告', processedAt: '2026-11-19T02:04:00.000Z' }], [c('unk'), { category: '跳过', processedAt: '2026-11-19T02:04:00.000Z' }]]);
+    const r = buildReport({ events, inboxRows: events.map((e) => ({ id: e.id })), ledger, records: null, pending: '', since: 's', until: 'u' });
+    assert.deepEqual(r.cindyOnly.map((m) => m.id), [c('only')]);
+    assert.deepEqual(r.openbotUnknown.map((m) => m.id), [c('unk')]);
+    assert.deepEqual(r.mismatches, []);
+    assert.deepEqual(r.missingFiles, ['OpenBot 记录文件']);
+    const md = renderReport(r);
+    assert.match(md, /Cindy 已分类、OpenBot 还没处理/);
+    assert.match(md, /分类未知/);
+    assert.match(md, /读不到：OpenBot 记录文件/);
   });
 });
