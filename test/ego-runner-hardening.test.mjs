@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runEgoTask, finishSpace } from '../src/ego-runner/index.mjs';
 import { openSpace, ALLOWED_PROFILES, FORBIDDEN_PROFILE } from '../src/ego-runner/space.mjs';
-import { tryLock, waitLock, spaceLockPath } from '../src/ego-runner/locks.mjs';
+import { tryLock, waitLock, spaceLockPath, foregroundLockPath } from '../src/ego-runner/locks.mjs';
 
 const FAKE_DIR = fileURLToPath(new URL('./fixtures/fake-ego/', import.meta.url));
 const FAKE_BIN = join(FAKE_DIR, 'ego-browser');
@@ -112,6 +112,17 @@ describe('条目 2：finishSpace 不接管负责人手里的 space', () => {
 });
 
 describe('条目 4：锁文件字段缺失或类型不对按损坏处理', () => {
+  test('损坏的 foreground.lock：waitLock 报 lock-timeout，信息写明损坏和路径、要手动删，不含 1970', async () => {
+    const fdir = join(dir, `fg-${n++}`); mkdirSync(fdir, { recursive: true });
+    const path = foregroundLockPath(fdir);
+    writeFileSync(path, '{"token":"x","pid":');
+    await assert.rejects(waitLock(path, { timeoutMs: 100, staleMs: 10 }), (e) => {
+      assert.equal(e.code, 'lock-timeout');
+      assert.ok(e.message.includes(path)); assert.match(e.message, /损坏/); assert.match(e.message, /手动删/);
+      assert.doesNotMatch(e.message, /1970/);
+      return true;
+    });
+  });
   const bad = {
     '空对象': {},
     '缺 heartbeatAt': { token: 'x', pid: null, startedAt: Date.now() },
@@ -121,6 +132,15 @@ describe('条目 4：锁文件字段缺失或类型不对按损坏处理', () =>
     'null': null,
     '数字': 42,
     '字符串': 'lock',
+    // 下面几种心跳已过期、pid 已死（或无法判断），不当损坏的话会被接管：rmSync(undefined) / pidAlive 抛错
+    '缺 heartbeatFile（过期）': { token: 'x', pid: null, startedAt: 1, heartbeatAt: 1 },
+    'heartbeatFile 为数字（过期）': { token: 'x', pid: null, startedAt: 1, heartbeatAt: 1, heartbeatFile: 42 },
+    'heartbeatFile 为空串（过期）': { token: 'x', pid: null, startedAt: 1, heartbeatAt: 1, heartbeatFile: '' },
+    'pid 为字符串（过期）': { token: 'x', pid: 'abc', startedAt: 1, heartbeatAt: 1, heartbeatFile: '/nonexistent/x.hb' },
+    'pid 为负数（过期）': { token: 'x', pid: -1, startedAt: 1, heartbeatAt: 1, heartbeatFile: '/nonexistent/x.hb' },
+    // 有限但超出 Date 范围：toISOString 会抛 RangeError
+    'startedAt 超出 Date 范围': { token: 'x', pid: null, startedAt: 1e300, heartbeatAt: Date.now(), heartbeatFile: '/nonexistent/x.hb' },
+    'heartbeatAt 超出 Date 范围': { token: 'x', pid: null, startedAt: Date.now(), heartbeatAt: 1e300, heartbeatFile: '/nonexistent/x.hb' },
   };
   const plant = (space, content) => {
     const path = spaceLockPath(LOCKS_DIR, space);
@@ -141,7 +161,10 @@ describe('条目 4：锁文件字段缺失或类型不对按损坏处理', () =>
     test(`${label}：waitLock 在 timeoutMs 内以 lock-timeout 抛出`, async () => {
       const path = plant(uniqueSpace('badw'), content);
       const t0 = Date.now();
-      await assert.rejects(waitLock(path, { timeoutMs: 100, staleMs: 10 }), { code: 'lock-timeout' });
+      await assert.rejects(waitLock(path, { timeoutMs: 100, staleMs: 10 }), (e) => {
+        assert.equal(e.code, 'lock-timeout'); assert.match(e.message, /损坏/); assert.doesNotMatch(e.message, /1970/);
+        return true;
+      });
       assert.ok(Date.now() - t0 < 2000);
     });
   }
