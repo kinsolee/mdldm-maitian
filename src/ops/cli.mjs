@@ -16,6 +16,8 @@ export const USAGE = `用法：hub ops <子命令>
   login --check [--platform <code>] [--json]   只读检测登录、核对 uid
   login <platformCode|账号id>                  打开登录页交给负责人扫码，交还后自动检测一次
   tokens init                                  生成写入口令到仓库根目录 .env（已有的不动，不打印口令值）
+  engage sync --once [--platform <code>] [--kind comments|dms] [--force] [--json]   跑一轮评论私信抓取（退出码 0 跑完、1 参数错、5 已有一轮在跑）
+  engage status [--json]                       评论私信：每个平台每个 kind 最近一次抓取、未处理事件数
 
 login 的退出码：0 全部检测完（含 out、unknown）；2 有账号 UID 不符（硬停）；1 有检测失败（runner 失败、结果结构不对、已登录但没读到 uid）；
   否则有跳过的账号：3 profile-needed（Ego 里没有要用的 profile）> 4 user-controlled（负责人在手动操作）> 5 busy（被别的任务占着）。
@@ -37,6 +39,7 @@ function printRows(rows) {
 
 export async function main(argv = process.argv.slice(2)) {
   const [group, sub, ...rest] = argv;
+  if (group === 'engage') return (await import('../daemon/sync.mjs')).main(argv.slice(1));
   const { values, positionals } = parseArgs({ args: group === 'login' ? argv.slice(1) : rest, allowPositionals: true, options: {
     json: { type: 'boolean', default: false }, check: { type: 'boolean', default: false }, platform: { type: 'string' }, help: { type: 'boolean', short: 'h', default: false },
   } });

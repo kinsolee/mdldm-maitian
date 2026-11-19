@@ -327,6 +327,7 @@ function scanPlans() {
 async function daemon() {
   if (!process.env.HUB_NO_WEB && config.web) { const { startWeb } = await import('./web.mjs'); startWeb(); }
   console.log(`发布中控守护进程启动（${drv.mode}）`);
+  if (!process.env.HUB_NO_ENGAGE) (await import('./daemon/sync.mjs')).startEngageTimer();   // 评论私信抓取：每分钟看一次，到点起 sync.mjs --once 子进程，不在这里开浏览器
   // 开机后 NAS 往往比守护进程晚挂上：等一等，自己挂一次（密码在钥匙串里），5 分钟还不行再报警
   { let ok = false; for (let i = 0; i < 10 && !(ok = await ensureNas()); i++) await drv.sleep(30000);
     if (ok) console.log('NAS 可读'); else await notify('⚠️ 麦田守护进程启动 5 分钟后仍读不到 NAS（已尝试自动挂载），取链接和封面会失败，请检查 NAS 是否开机'); }
