@@ -8,3 +8,4 @@ state/
 scripts-*.sh
 MAINTENANCE.md
 demo/
+.env
