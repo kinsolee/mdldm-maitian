@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS collect_runs (
   reason TEXT,
   message TEXT,
   postCount INTEGER,
+  days INTEGER,              -- 这次采了近几天（--days）；导出 posts 只认 30 天及以上的
   stats TEXT                 -- 平台模块 map 给的诊断（翻页数、各接口返回码等，不含凭据），JSON
 );
 CREATE INDEX IF NOT EXISTS collect_runs_ok ON collect_runs (platformCode, uid, result, finishedAt);
@@ -55,12 +56,13 @@ CREATE TABLE IF NOT EXISTS fans_daily (
   PRIMARY KEY (platformCode, uid, date)
 );`);
   // 早期建的 collect_runs 没有 stats 列（CREATE TABLE IF NOT EXISTS 不会补列）
-  if (!db.prepare('PRAGMA table_info(collect_runs)').all().some((c) => c.name === 'stats')) db.exec('ALTER TABLE collect_runs ADD COLUMN stats TEXT');
+  const cols = db.prepare('PRAGMA table_info(collect_runs)').all().map((c) => c.name);
+  for (const [name, type] of [['days', 'INTEGER'], ['stats', 'TEXT']]) if (!cols.includes(name)) db.exec(`ALTER TABLE collect_runs ADD COLUMN ${name} ${type}`);
 }
 
 export function recordRun(db, row) {
-  db.prepare('INSERT INTO collect_runs (runId, platformCode, uid, startedAt, finishedAt, result, reason, message, postCount, stats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(row.runId, row.platformCode, row.uid ?? null, row.startedAt, row.finishedAt, row.result, row.reason ?? null, row.message ?? null, row.postCount ?? null, row.stats == null ? null : JSON.stringify(row.stats));
+  db.prepare('INSERT INTO collect_runs (runId, platformCode, uid, startedAt, finishedAt, result, reason, message, postCount, days, stats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(row.runId, row.platformCode, row.uid ?? null, row.startedAt, row.finishedAt, row.result, row.reason ?? null, row.message ?? null, row.postCount ?? null, row.days ?? null, row.stats == null ? null : JSON.stringify(row.stats));
 }
 
 /**

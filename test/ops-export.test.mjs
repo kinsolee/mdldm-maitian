@@ -98,7 +98,7 @@ describe('导出', () => {
     // 绕过采集时的校验直接写进库（模拟库里已有的坏记录）
     const runId = 'bad-run';
     saveCollected(db, { runId, platformCode: 'Bili', uid: UIDS.Bili, at: new Date(T0 + H).toISOString(), posts: [post('Bili', 'BVbad', { like: '3', postTime: null })], account: account('Bili', { fans: '100' }) });
-    recordRun(db, { runId, platformCode: 'Bili', uid: UIDS.Bili, startedAt: new Date(T0 + H).toISOString(), finishedAt: new Date(T0 + H).toISOString(), result: 'ok' });
+    recordRun(db, { runId, platformCode: 'Bili', uid: UIDS.Bili, startedAt: new Date(T0 + H).toISOString(), finishedAt: new Date(T0 + H).toISOString(), result: 'ok', days: 30 });
     const out = tmp();
     const p = exportPosts(db, { out, now: () => T0 + H });
     assert.equal(p.exitCode, 1);
@@ -241,4 +241,64 @@ test('ensureWorksTables 幂等', () => {
   ensureWorksTables(db);
   ensureWorksTables(db);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('collect_runs', 'works', 'work_snapshots', 'account_snapshots', 'fans_daily')").get().n, 5);
+});
+
+describe('评审第 1 轮：fans 可为 null、posts 只取 30 天及以上的采集', () => {
+  test('fans:null 的账号照常采、照常导出 null；字符串、NaN 仍拒绝（Node 和 Python 两边）', async () => {
+    const db = await collected({ Bili: mapped('Bili', { account: account('Bili', { fans: null }) }) });
+    const out = tmp();
+    const a = exportAccounts(db, { out, now: () => T0 });
+    assert.equal(a.exitCode, 0, JSON.stringify(a));
+    assert.equal(read(a.file).find((x) => x.uid === UIDS.Bili).fans, null);
+    assert.equal(pyCheck('--accounts', a.file).status, 0);
+    const bad = path.join(out, 'bad.json');
+    for (const fans of ['100', 'NaN']) {
+      fs.writeFileSync(bad, `[${JSON.stringify(account('Bili')).replace('"fans":100', `"fans":${fans === 'NaN' ? 'NaN' : '"100"'}`)}]`);
+      const r = pyCheck('--accounts', bad);
+      assert.equal(r.status, 1, `${fans}: ${r.stdout}`);
+      assert.match(r.stdout, /fans/);
+    }
+    const s = await collected({ Bili: mapped('Bili', { account: account('Bili', { fans: '100' }) }) }, { platforms: ['Bili'] });
+    assert.equal(s.prepare("SELECT result FROM collect_runs WHERE platformCode = 'Bili'").get().result, 'failed');
+  });
+
+  test('collect_runs 记 days；exportPosts 跳过不足 30 天的 ok，没有合格的时写明只采了几天；accounts 不受影响', async () => {
+    const db = await collected({}, { platforms: ['Douyin'] });
+    await collected({}, { db, now: T0 + H, platforms: ['Douyin'] }).then(() => {});
+    db.prepare("UPDATE collect_runs SET days = 7 WHERE finishedAt = ?").run(new Date(T0 + H).toISOString());
+    assert.deepEqual(db.prepare("SELECT days FROM collect_runs ORDER BY rowid").all().map((x) => x.days), [30, 7]);
+    const out = tmp();
+    const p = exportPosts(db, { out, now: () => T0 + H });
+    assert.equal(p.exported.find((x) => x.platformCode === 'Douyin').finishedAt, new Date(T0).toISOString());
+    const a = exportAccounts(db, { out, now: () => T0 + H });
+    assert.equal(a.exported.find((x) => x.platformCode === 'Douyin').finishedAt, new Date(T0 + H).toISOString());
+    // 只有短窗口的 ok
+    const short = await collected({}, { platforms: ['Bili'] });
+    short.prepare("UPDATE collect_runs SET days = 7").run();
+    const r = exportPosts(short, { out: tmp(), now: () => T0 });
+    assert.equal(r.exitCode, 1);
+    assert.match(r.excluded.find((x) => x.platformCode === 'Bili').reason, /只采了 7 天/);
+  });
+
+  test('旧库的 collect_runs 没有 days 列：补列，旧行 NULL 不算 30 天（posts 不导出它，accounts 照用）', () => {
+    const db = openOpsDb(path.join(tmp(), 'ops.db'));
+    db.exec(`CREATE TABLE collect_runs (runId TEXT NOT NULL, platformCode TEXT NOT NULL, uid TEXT, startedAt TEXT NOT NULL, finishedAt TEXT NOT NULL,
+      result TEXT NOT NULL, reason TEXT, message TEXT, postCount INTEGER, stats TEXT)`);
+    ensureWorksTables(db);
+    const at = new Date(T0).toISOString();
+    saveCollected(db, { runId: 'old', platformCode: 'Bili', uid: UIDS.Bili, at, posts: [post('Bili', 'B1')], account: account('Bili') });
+    db.prepare("INSERT INTO collect_runs (runId, platformCode, uid, startedAt, finishedAt, result) VALUES ('old', 'Bili', ?, ?, ?, 'ok')").run(UIDS.Bili, at, at);
+    assert.equal(db.prepare('SELECT days FROM collect_runs').get().days, null);
+    const p = exportPosts(db, { out: tmp(), now: () => T0 });
+    assert.equal(p.exitCode, 1);
+    assert.match(p.excluded.find((x) => x.platformCode === 'Bili').reason, /没记采集天数/);
+    assert.equal(exportAccounts(db, { out: tmp(), now: () => T0 }).exported[0].runId, 'old');
+  });
+
+  test('同一时刻的两次 ok：取后写入的那次（rowid）', async () => {
+    const db = await collected({}, { platforms: ['Douyin'] });
+    await collected({ Douyin: mapped('Douyin', { posts: [post('Douyin', 'D-later')] }) }, { db, platforms: ['Douyin'] });
+    const p = exportPosts(db, { out: tmp(), now: () => T0 });
+    assert.deepEqual(read(p.file).map((x) => x.postId), ['D-later']);
+  });
 });

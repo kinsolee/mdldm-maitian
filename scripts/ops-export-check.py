@@ -9,6 +9,7 @@
 """
 import argparse
 import json
+import math
 import re
 import sys
 from datetime import datetime
@@ -22,7 +23,8 @@ DATE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 
 def is_num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    # json.load 会把 NaN、Infinity 读成 float，不算数字
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def parse_time(v):
@@ -93,8 +95,9 @@ def check_accounts(path):
             problems.append(f'{label} uid：不是 refresh.py 给这四个平台登记的 uid（B站、抖音、小红书、sph 开头的视频号），会被丢掉或混进别的账号')
         if a.get('loginStatus') != '登录有效':
             problems.append(f'{label} loginStatus：要是「登录有效」，实际 {a.get("loginStatus")!r}')
-        if not is_num(a.get('fans')):
-            problems.append(f'{label} fans：要是数字，实际 {a.get("fans")!r}')
+        # 粉丝总数接口失败时是 null；refresh.py 的 ingest_accounts 是 `if fans:`，null 会跳过
+        if a.get('fans') is not None and not is_num(a.get('fans')):
+            problems.append(f'{label} fans：要是数字或 null，实际 {a.get("fans")!r}')
         if not parse_time(a.get('updateTime')):
             problems.append(f'{label} updateTime：解析不了：{a.get("updateTime")!r}')
         daily = a.get('daily')

@@ -34,7 +34,7 @@ async function collectOne(db, a, ctx) {
   const startedAt = iso(now());
   let stats = null;   // map 之后才有：平台模块给的诊断（不含凭据），每行都带上，落库、--json 输出
   const finish = (result, extra = {}) => {
-    const row = { runId, id: a.id, platformCode: code, uid: a.uid, startedAt, finishedAt: iso(now()), result, ...extra, ...(stats != null ? { stats } : {}) };
+    const row = { runId, id: a.id, platformCode: code, uid: a.uid, startedAt, finishedAt: iso(now()), result, days, ...extra, ...(stats != null ? { stats } : {}) };
     recordRun(db, row);
     console.error(`[collect] ${a.id} ${result}${row.reason ? `(${row.reason})` : ''} ${row.message ?? ''}`);
     return row;

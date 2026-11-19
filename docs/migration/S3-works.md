@@ -35,7 +35,7 @@ platform 只收 `Douyin`、`XiaoHongShu`、`Bili`、`Channels`。其他平台直
 
 | 表 | 一行是 | 说明 |
 |---|---|---|
-| `collect_runs` | 一次采集里的一个账号 | runId、platformCode、uid、startedAt、finishedAt、result（ok / out / skipped / failed / uid-mismatch）、reason、message、postCount、stats（map 给的诊断 JSON，不含凭据；没跑到 map 时为空。早期建的表由 `ensureWorksTables` 补这一列） |
+| `collect_runs` | 一次采集里的一个账号 | runId、platformCode、uid、startedAt、finishedAt、result（ok / out / skipped / failed / uid-mismatch）、reason、message、postCount、days（这次的 `--days`）、stats（map 给的诊断 JSON，不含凭据；没跑到 map 时为空）。早期建的表由 `ensureWorksTables` 补 days、stats 两列，旧行为空 |
 | `works` | 一条作品（主键 platformCode, uid, postId） | 最近一次的记录 JSON、postTime、firstSeenAt、lastSeenAt、lastRunId |
 | `work_snapshots` | 一次采集里的一条作品（主键 runId, platformCode, uid, postId） | collectedAt、记录 JSON，每次采集都留 |
 | `account_snapshots` | 一次采集里的一个账号 | collectedAt、fans、loginStatus、记录 JSON |
@@ -44,10 +44,11 @@ platform 只收 `Douyin`、`XiaoHongShu`、`Bili`、`Channels`。其他平台直
 ## 导出
 
 - 默认目录 `data/ops-shadow/`（`MAITIAN_OPS_SHADOW_DIR` 可改，`--out` 优先），文件名日期默认东八区当天（`--date` 可改）。先写临时文件再 rename。
-- 每个平台取最近一次 ok 的采集：posts 是那次的 `work_snapshots`，原样写出，不改值；accounts 是那次的账号快照，加上 `fans_daily` 近 30 天的分日，形状是 `{uid, loginStatus, fans, updateTime, daily: [{date, fansTotal, fansNet}]}`，`daily` 按日期升序。
+- 每个平台取最近一次 ok 的采集（同一时刻按写入先后）：posts 是那次的 `work_snapshots`，原样写出，不改值。**posts 只认 `days >= 30` 的采集**：跑过 `--days 7` 后仍导出最近一次 30 天的，因为 refresh.py 读最新一份 posts，短窗口会让看板丢掉更早的期数；`days` 为空的旧记录也不认。没有合格的采集时 `excluded` 写明「最近一次 ok 采集只采了 N 天」。accounts 不看天数（粉丝分日固定 30 天），用那次的账号快照，加上 `fans_daily` 近 30 天的分日，形状是 `{uid, loginStatus, fans, updateTime, daily: [{date, fansTotal, fansNet}]}`，`daily` 按日期升序。
 - 顶层是数组。accounts 只有这四个平台：微博不进；公众号粉丝归 S4。
 - 最近一次 ok 早于 `--max-age-hours`（默认 26）或从没成功过的平台不导出，结果里的 `excluded` 写明原因。
-- 写之前逐条校验，规则同 `scripts/ops-export-check.py`：posts 的 `platform`、`postId`、`postTime`（能被 `datetime.fromisoformat` 解析）、`statusText`、六个指标（数字、-1 或 null）、`fullView`/`viewTime`、`(platform, postId)` 不重复；accounts 的 `loginStatus == "登录有效"`、`fans`、`updateTime`、`daily`。
+- 写之前逐条校验，规则同 `scripts/ops-export-check.py`：posts 的 `platform`、`postId`、`postTime`（能被 `datetime.fromisoformat` 解析）、`statusText`、六个指标（数字、-1 或 null）、`fullView`/`viewTime`、`(platform, postId)` 不重复；accounts 的 `loginStatus == "登录有效"`、`fans`（数字或 null）、`updateTime`、`daily`。
+- 粉丝总数接口失败不影响采集：平台模块照样给 `complete: true`，`fans` 写 null，作品照常写库，导出原样写 null（refresh.py 的 `ingest_accounts` 遇到空的 `fans` 跳过，保留上一次的总数）。字符串、NaN 仍不合格。
 
 | 退出码 | 含义 |
 |---|---|
