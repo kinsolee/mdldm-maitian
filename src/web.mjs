@@ -6,6 +6,7 @@ import { SITE } from './site.mjs';
 import { review } from './review.mjs';
 import { accessEmail } from './access.mjs';
 import { initLogin, sessionOk, handleLogin } from './login.mjs';
+import { readWorksView } from './ops/works-view.mjs'; import { opsDbPath } from './ops/paths.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url)), ROOT = path.resolve(DIR, '..');
 const W = config.web || { port: 8787, key: '' };
@@ -136,6 +137,8 @@ async function handle(req, res) {
   if (u.pathname === '/p') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'pages.html')), 'text/html; charset=utf-8');
   if (u.pathname === '/board') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'board.html')), 'text/html; charset=utf-8');
   if (u.pathname === '/') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'board.html')), 'text/html; charset=utf-8');
+  if (u.pathname === '/works') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'works.html')), 'text/html; charset=utf-8');   // KIN-330：ops.db 的作品
+  if (u.pathname === '/api/ops/works') return send(res, 200, readWorksView(opsDbPath(), { platform: u.searchParams.get('platform') || undefined }));
   if (u.pathname === '/widget') {   // 小组件安装页（已登录才能看）：脚本里填好麦田地址和小组件口令，手机上一键复制
     if (!W.widgetToken) return send(res, 404, '<meta charset="utf-8">没配 config.web.widgetToken', 'text/html; charset=utf-8');
     // 加载器会执行麦田发来的代码：只在 https 下用；http（局域网）明文传输可能被同一网络的人替换，就给完整脚本、不自动更新

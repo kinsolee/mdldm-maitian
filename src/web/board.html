@@ -170,7 +170,7 @@ function render() {
   const f0 = O.feed[0];
   $('#screen').innerHTML = `
   <div class="top"><div class="logo">麦<i>田</i></div><div class="tag">内容与粉丝监控</div>
-    <div class="nav"><a class="on" href="/">大屏</a><a href="/p#/traffic">流量</a><a href="/p#/calendar">日历</a>${O.siteOn ? '<a href="/p#/convert">转化</a>' : ''}<a href="/p#/archive">档案</a><a href="/p#/system">系统</a></div>
+    <div class="nav"><a class="on" href="/">大屏</a><a href="/p#/traffic">流量</a><a href="/p#/calendar">日历</a>${O.siteOn ? '<a href="/p#/convert">转化</a>' : ''}<a href="/p#/archive">档案</a><a href="/works">作品</a><a href="/p#/system">系统</a></div>
     <div class="lights"><span class="light ok">守护进程 运行中</span><span class="light ${h.nas ? 'ok' : 'bad'}">NAS ${h.nas ? '已挂载' : '读不到'}</span><span class="light ${h.chrome ? 'ok' : 'bad'}">专用浏览器 ${h.chrome ? '在线' : '没开'}</span>
       <span class="light ${!loginOk ? 'bad' : checked ? 'ok' : 'warn'}">平台登录 ${!loginOk ? '有掉线' : checked ? '今日已检' : '今天还没检'}</span></div>
     <div class="clock" id="clock"></div></div>
