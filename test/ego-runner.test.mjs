@@ -1,6 +1,10 @@
 import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { runEgoTask, runEgoScript, parseResult, finishSpace } from '../src/ego-runner/index.mjs';
+import { runEgoTask, runInSpace, runEgoScript, parseResult, finishSpace } from '../src/ego-runner/index.mjs';
+import { opsPaths } from '../src/ego-runner/paths.mjs';
+import { mkdtempSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { EGO_SKIP, tempSpaceName } from './helpers/ego.mjs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -98,6 +102,47 @@ describe('runEgoTask 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
   });
 });
 
+describe('runInSpace 真实 Ego Lite', { skip: EGO_SKIP ?? false }, () => {
+  const opsDir = mkdtempSync(join(tmpdir(), 'maitian-ops-'));
+  const spaces = [];
+  const space = (tag) => { const s = tempSpaceName(tag); spaces.push(s); return s; };
+  after(async () => { for (const s of spaces) await finishSpace(s); });
+  const ownershipOf = async (s) => (await runEgoScript(`console.log("@@RESULT " + JSON.stringify((await listTaskSpaces()).find((x) => x.name === ${JSON.stringify(s)})?.ownership ?? null))`)).result;
+
+  test('运行中有心跳、能用 withForegroundLock；结束后心跳、space 锁、前台锁都删掉', async () => {
+    const s = space('beat');
+    const { heartbeat, spaceLock, foregroundLock } = opsPaths(s, opsDir);
+    const r = await runInSpace({ space: s, opsDir, script: `const fs = await import("node:fs");
+      const beat = JSON.parse(fs.readFileSync(${JSON.stringify(heartbeat)}, "utf8"));
+      const inLock = await withForegroundLock(async () => fs.existsSync(${JSON.stringify(foregroundLock)}));
+      return { beatSpace: beat.space, inLock, deadline, spaceName: task.name };` });
+    assert.equal(r.ok, true, `${r.reason} ${r.error} ${r.stderr}`);
+    assert.equal(r.exitCode, 0);
+    assert.deepEqual({ ...r.result, deadline: typeof r.result.deadline }, { beatSpace: s, inLock: true, deadline: 'number', spaceName: s });
+    for (const f of [heartbeat, spaceLock, foregroundLock]) assert.equal(existsSync(f), false, f);
+  });
+
+  test('到截止时间脚本自己退出（不靠杀 CLI），心跳停下并删掉', async () => {
+    const s = space('deadline');
+    const t0 = Date.now();
+    const r = await runInSpace({ space: s, opsDir, timeoutMs: 12_000, script: 'await new Promise((r) => setTimeout(r, 60_000)); return 1;' });
+    assert.equal(r.reason, 'deadline', `${r.error} ${r.stderr}`); assert.equal(r.exitCode, 1);
+    assert.ok(Date.now() - t0 < 12_000, '应在 runner 超时前结束');
+    assert.equal(existsSync(opsPaths(s, opsDir).heartbeat), false);
+  });
+
+  test('上次 finish 保留了页面（ownership=user）：返回 user-owned、退出码 4，不认领', async () => {
+    const s = space('owned');
+    const kept = await runInSpace({ space: s, opsDir, script: 'await task.page("p1").goto("about:blank"); return (await task.finish({ keep: "all" })).keptManagedLabels;' });
+    assert.equal(kept.ok, true, `${kept.error} ${kept.stderr}`);
+    assert.equal(await ownershipOf(s), 'user');
+    const r = await runInSpace({ space: s, opsDir, script: 'return 1' });
+    assert.equal(r.reason, 'user-owned', `${r.error} ${r.stderr}`); assert.equal(r.exitCode, 4);
+    assert.equal(r.ownership, 'user');
+    assert.equal(await ownershipOf(s), 'user', '没有被认领');
+  });
+});
+
 describe('命令行入口', () => {
   const cli = (args, input) => new Promise((resolve) => {
     const c = spawn(process.execPath, [CLI, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -107,9 +152,9 @@ describe('命令行入口', () => {
     c.stdin.end(input);
   });
 
-  test('Profile 6 被拒绝，退出码 1', async () => {
+  test('Profile 6 被拒绝，退出码 3（KIN-327：退出码按 reason 区分）', async () => {
     const r = await cli(['--space', 'kinso/test/x', '--profile', 'Profile 6'], 'return 1');
-    assert.equal(r.code, 1); assert.equal(r.json.reason, 'profile-rejected');
+    assert.equal(r.code, 3); assert.equal(r.json.reason, 'profile-rejected');
   });
 
   test('从 stdin 读脚本跑完并 --finish 关掉 space', { skip: EGO_SKIP ?? false }, async () => {
@@ -117,7 +162,7 @@ describe('命令行入口', () => {
     const r = await cli(['--space', space, '--params', '{"x":2}', '--finish'], 'return params.x * 21');
     assert.equal(r.code, 0);
     const { finish, ...task } = r.json;
-    assert.deepEqual(task, { ok: true, result: 42, code: 0, signal: null });
+    assert.deepEqual(task, { ok: true, result: 42, code: 0, signal: null, exitCode: 0 });
     assert.equal(finish.ok, true); assert.equal(finish.result.closedSpace, true);
     const left = await runEgoScript(`console.log("@@RESULT " + JSON.stringify((await listTaskSpaces()).some((s) => s.name === ${JSON.stringify(space)})))`);
     assert.equal(left.result, false);
