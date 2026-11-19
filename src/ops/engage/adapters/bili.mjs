@@ -6,7 +6,7 @@
 //   私信：api.vc.bilibili.com session_svr/get_sessions（会话列表，last_msg.sender_uid 判 last.by）+
 //        svr_sync/fetch_session_msgs（最近消息）+ account/v1/user/cards（对方昵称，会话列表不带）。
 import { open, bigJson, mainPage, sleep } from './page-lib.mjs';
-import { clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
+import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
 export const FILE = 'bili.mjs';
 const PAGE = 'https://member.bilibili.com/platform/comment/article';
@@ -99,17 +99,18 @@ async function rawDms(get, o) {
   const msgs = {};
   for (const s of open) {
     const j = await get(`${VC}/svr_sync/v1/svr_sync/fetch_session_msgs?talker_id=${s.talker_id}&session_type=${s.session_type}&size=20&build=0&mobi_app=web`);
-    msgs[String(s.talker_id)] = { code: j.code, messages: j.data?.messages ?? [] };
+    msgs[String(s.talker_id)] = { code: j.code, messages: Array.isArray(j.data?.messages) ? j.data.messages : null };
     await sleep(o.gapMs);
   }
   const uids = list.filter((s) => s.session_type === 1 && !s.account_info).map((s) => String(s.talker_id));
-  const cards = [];
+  const cards = [], cardsCodes = [];
   for (let i = 0; i < uids.length; i += 20) {
     const j = await get(`${VC}/account/v1/user/cards?uids=${uids.slice(i, i + 20).join(',')}`);
+    cardsCodes.push(j.code ?? null);
     if (j.code === 0) cards.push(...(j.data ?? []).map((c) => ({ mid: String(c.mid), name: c.name })));
     await sleep(o.gapMs);
   }
-  return { sessions: list.map(({ account_info, ...s }) => ({ ...s, ...(account_info ? { account_info: { name: account_info.name } } : {}) })), msgs, cards };
+  return { sessions: list.map(({ account_info, ...s }) => ({ ...s, ...(account_info ? { account_info: { name: account_info.name } } : {}) })), msgs, cards, cardsCodes };
 }
 
 // —— 解析（Node 里跑）——
@@ -177,8 +178,15 @@ function textOf(m) {
   try { return clip(JSON.parse(m.content)?.content ?? null); } catch { return null; }
 }
 
+// X-B10：fetch_session_msgs 成功（code 0 且有 messages 数组）才用；失败的会话不给 messages，不拿空数组冒充「没有消息」
+const msgsOk = (x) => x?.code === 0 && Array.isArray(x.messages);
+
 export function parseDms(raw, { accountUid, fetchedAt }) {
   const me = String(accountUid);
+  const tried = Object.entries(raw.msgs ?? {});
+  if (tried.length && !tried.some(([, x]) => msgsOk(x))) adapterFail('api-error', `svr_sync/fetch_session_msgs 全部失败：code=${[...new Set(tried.map(([, x]) => x?.code))].join(',')}`);
+  const cc = raw.cardsCodes ?? [];
+  if (cc.length && !cc.includes(0)) adapterFail('api-error', `account/v1/user/cards 全部失败：code=${[...new Set(cc)].join(',')}`);
   const names = new Map(raw.cards.map((c) => [String(c.mid), c.name]));
   const conversations = [], messages = [];
   for (const s of raw.sessions) {
@@ -189,7 +197,7 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     const last = lm && lm.timestamp ? { by: String(lm.sender_uid) === me ? 'me' : 'peer', at: isoOf(lm.timestamp), text: textOf(lm), type: TYPE(lm.msg_type) } : null;
     conversations.push({ nativeId: id, peer: { uid: id, nickname: s.account_info?.name ?? names.get(id) ?? null, kind },
       unread: Number(s.unread_count) || 0, last, canSend: kind === 'user' });
-    for (const m of raw.msgs[id]?.messages ?? []) {
+    for (const m of msgsOk(raw.msgs[id]) ? raw.msgs[id].messages : []) {
       messages.push({ nativeId: String(m.msg_key ?? m.msg_seqno), conversationNativeId: id, by: String(m.sender_uid) === me ? 'me' : 'peer', at: isoOf(m.timestamp), type: TYPE(m.msg_type), text: textOf(m) });
     }
   }

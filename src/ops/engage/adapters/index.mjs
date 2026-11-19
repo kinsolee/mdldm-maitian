@@ -56,7 +56,7 @@ export async function collect({ account, kind, runner, now = Date.now, since = n
   let out;
   try {
     out = adapter.parse(kind, raw, { accountUid: String(account.uid), nickname: account.nickname ?? null, fetchedAt: new Date(now()).toISOString(), since });
-  } catch (e) { return fail('parse', e); }
+  } catch (e) { return fail(e?.reason ?? 'parse', e); }
   const errs = shapeErrors(out);
   if (errs.length) return fail('parse', `输出形状不对：${errs.slice(0, 3).join('；')}`);
   return out;

@@ -110,7 +110,8 @@ test('视频号私信：messageList 新到旧，取 ts 最大的判 last.by', ()
 });
 
 test('小红书评论：笔记页整楼，target_comment.id 还原 parent；只在通知里的评论按两层入库并标 threadsPartial', () => {
-  const r = xhs.parse('comments', fixture('xhs-comments'), { accountUid: ME.XiaoHongShu, fetchedAt });
+  // 样例的通知最后一页带出了窗口之前的旧通知（X-B11），这里把 since 放宽到能覆盖 ef84 那篇
+  const r = xhs.parse('comments', fixture('xhs-comments'), { accountUid: ME.XiaoHongShu, fetchedAt, since: '2026-11-10T00:00:00.000Z' });
   assertShape(r);
   const m = byId(r);
   const sub = m.get('6afc44b70000000032023a42');

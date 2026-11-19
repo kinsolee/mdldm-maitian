@@ -9,7 +9,7 @@
 //        只打开最后消息比 since 新的会话（没有 since 最多打开 maxOpen 个）。群聊不收。
 // 不点「回复」「发送」，不往输入框里写字。
 import { open, atLogin, bigJson, capCount, captured, clickMarked, dropSecrets, installHook, mainPage, sleep, urlParam, waitCaptured } from './page-lib.mjs';
-import { clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
+import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
 export const FILE = 'xhs.mjs';
 export const LIMITS = { maxNotes: 8, maxMentionPages: 4, maxExpand: 20, maxScroll: 5, maxOpen: 10, loadMs: 60000, noteGapMs: 5000 };
@@ -56,7 +56,7 @@ async function rawComments(page, o) {
   const notes = [];
   // 连着开笔记页会被限流（核对时连跑几轮后笔记页、通知页都不出数据），每篇之间停一下
   for (const [id, tok] of [...tokens].slice(0, o.maxNotes)) { notes.push(await openNote(page, id, tok, o)); await sleep(o.noteGapMs); }
-  return { kind: 'comments', mentions: mentions.map((m) => ({ code: m.json.code, data: { has_more: m.json.data?.has_more, message_list: dropSecrets(m.json.data?.message_list ?? []) } })), notes };
+  return { kind: 'comments', windowStart: since, mentions: mentions.map((m) => ({ code: m.json.code, data: { has_more: m.json.data?.has_more, message_list: dropSecrets(m.json.data?.message_list ?? []) } })), notes };
 }
 
 const EXPAND_SRC = `() => { const re = /^展开\\s*(\\d+\\s*条回复|更多回复?)$/; return [...document.querySelectorAll('.show-more, div, span')].filter((e) => re.test(e.textContent.trim()) && ![...e.children].some((c) => re.test(c.textContent.trim()))); }`;
@@ -134,8 +134,16 @@ export function parse(kind, raw, ctx) {
 
 const uidOf = (u) => str(u?.user_id ?? u?.userid);
 
-export function parseComments(raw, { accountUid, fetchedAt }) {
+const okPage = (p) => p.code === 0 && Array.isArray(p.data?.comments);
+
+export function parseComments(raw, { accountUid, fetchedAt, since = null }) {
   const me = String(accountUid);
+  // X-B4：you/mentions 没有一页成功，整个 kind 失败
+  const mentionPages = raw.mentions.filter((m) => m.code === 0 && Array.isArray(m.data?.message_list));
+  if (!mentionPages.length) adapterFail('api-error', `you/mentions code=${raw.mentions.map((m) => m.code).join(',') || '无响应'}`);
+  // X-B11：通知兜底只收抓取窗口内的（页面脚本按同一个窗口翻页，最后一页会带出更早的通知）
+  const windowStart = since ? Date.parse(since) / 1000 : raw.windowStart ?? Date.parse(fetchedAt) / 1000 - 7 * 86400;
+  const mentionList = mentionPages.flatMap((m) => m.data.message_list).filter((m) => Number(m.time) >= windowStart);
   const works = [], scannedWorks = [];
   const byId = new Map();
   const author = (u) => ({ uid: uidOf(u), nickname: u?.nickname ?? '', isMe: uidOf(u) === me });
@@ -143,9 +151,10 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     text: c.content ?? '', createdAt: isoOf(c.create_time), likeCount: numOrNull(c.like_count), likedByMe: null, pinned: null, replyCount: null, ipLabel: str(c.ip_location), ...extra });
   const opened = new Set();
   for (const n of raw.notes) {
-    const title = n.detail?.title || raw.mentions.flatMap((m) => m.data.message_list).find((m) => m.item_info?.id === n.noteId)?.item_info?.content || null;
+    const title = n.detail?.title || mentionList.find((m) => m.item_info?.id === n.noteId)?.item_info?.content || null;
     works.push({ nativeId: n.noteId, title, url: `https://www.xiaohongshu.com/explore/${n.noteId}`, postTime: isoOf(n.detail?.time) });
-    if (!n.opened || !n.pages.length) { scannedWorks.push({ workNativeId: n.noteId, complete: false, threadsPartial: true }); continue; }
+    // X-B4：comment/page 有任何一页 code 非 0 或缺 comments，这篇笔记的整楼数据不可信，按没打开处理（只用通知兜底）
+    if (!n.opened || !n.pages.length || !n.pages.every(okPage)) { scannedWorks.push({ workNativeId: n.noteId, complete: false, threadsPartial: true }); continue; }
     opened.add(n.noteId);
     const tops = n.pages.flatMap((p) => p.data.comments);
     const subsByRoot = new Map();
@@ -154,11 +163,12 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
       thread.set(String(t.id), { root: String(t.id), c: t, l1: true });
       for (const s of t.sub_comments ?? []) thread.set(String(s.id), { root: String(t.id), c: s });
     }
-    for (const p of n.subs) for (const s of p.data.comments) {
+    const subsOk = n.subs.every(okPage);
+    for (const p of n.subs.filter(okPage)) for (const s of p.data.comments) {
       const root = p.root_comment_id ?? thread.get(String(s.target_comment?.id))?.root;
       if (root) thread.set(String(s.id), { root: String(root), c: s });
     }
-    let partial = n.expandLeft > 0;
+    let partial = !subsOk || n.expandLeft > 0;
     for (const [id, { root, c, l1 }] of thread) {
       if (l1) { byId.set(id, mk(c, n.noteId, id, null, { replyCount: numOrNull(c.sub_comment_count), likedByMe: null })); continue; }
       const to = str(c.target_comment?.id);
@@ -168,11 +178,12 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
       subsByRoot.set(root, (subsByRoot.get(root) ?? 0) + 1);
     }
     for (const t of tops) if ((numOrNull(t.sub_comment_count) ?? 0) > (subsByRoot.get(String(t.id)) ?? 0)) partial = true;
-    scannedWorks.push({ workNativeId: n.noteId, complete: !n.pages.at(-1).data.has_more && !partial, threadsPartial: partial });
+    const lastPage = n.pages.at(-1).data.has_more === false;
+    scannedWorks.push({ workNativeId: n.noteId, complete: lastPage && !partial, threadsPartial: partial });
   }
   // 没能打开的笔记（或超出上限的）：you/mentions 里的评论按两层入库，被回复的那条当一楼
   const seenNotes = new Set(raw.notes.map((n) => n.noteId));
-  for (const m of raw.mentions.flatMap((x) => x.data.message_list)) {
+  for (const m of mentionList) {
     const noteId = m.item_info?.id, ci = m.comment_info;
     if (!noteId || !ci?.id || opened.has(noteId) || byId.has(String(ci.id))) continue;
     if (!seenNotes.has(noteId)) {

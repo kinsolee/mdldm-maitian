@@ -94,3 +94,9 @@ export function shapeErrors(r) {
   r.messages.forEach((m, i) => check(errs, `messages[${i}]`, m, { nativeId: isStr, conversationNativeId: isStr, by: (v) => v === 'me' || v === 'peer', at: isIso, type: (v) => TYPES.includes(v), text: nullable((v) => typeof v === 'string') }));
   return errs;
 }
+
+/** 解析时发现整个 kind 不可信（接口返回非 0、必需数据读不到）：collect 按 reason 返回失败，不报 ok。 */
+export class AdapterError extends Error {
+  constructor(reason, message) { super(message); this.reason = reason; }
+}
+export const adapterFail = (reason, message) => { throw new AdapterError(reason, message); };
