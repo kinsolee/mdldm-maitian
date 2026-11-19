@@ -66,14 +66,19 @@ export async function rawComments(get, o) {
   const threads = [];
   for (const [root, oid] of [...roots].slice(0, o.maxThreads)) {
     const t = { oid, root, pages: [], ok: true };
-    let done = false;
+    let done = false, got = 0;
     for (let pn = 1; pn <= 10; pn++) {
       const j = await get(`${API}/x/v2/reply/reply?oid=${oid}&type=1&root=${root}&ps=20&pn=${pn}`);
       if (j.code !== 0) { t.ok = false; t.error = `reply/reply code=${j.code}`; done = true; break; }
       if (!Array.isArray(j.data?.replies) && j.data?.replies !== null) { t.ok = false; t.error = 'reply/reply 缺 data.replies'; done = true; break; }
-      const rs = j.data.replies ?? [];
       const count = j.data?.page?.count;
+      // X3-B1：replies=null 只有 page.count 明确为 0 才是空楼
+      if (j.data.replies === null && count !== 0) { t.ok = false; t.error = `reply/reply replies=null 但 page.count=${count}`; done = true; break; }
+      const rs = j.data.replies ?? [];
+      got += rs.length;
       if (rs.length < 20 || (Number.isFinite(count) && pn * 20 >= count)) done = true;
+      // X3-B1：翻到底了累计条数还不到 page.count，这一楼拿不全
+      if (done && Number.isFinite(count) && got < count) { t.ok = false; t.error = `reply/reply 只拿到 ${got}/${count} 条`; }
       t.pages.push({ code: 0, data: { page: j.data?.page, root: slimReply(j.data?.root), replies: rs.map(slimReply), upper: j.data?.upper ? { mid: j.data.upper.mid, top: j.data.upper.top ? { rpid: j.data.upper.top.rpid } : null } : null } });
       if (done) break;
       await sleep(o.gapMs);

@@ -183,6 +183,49 @@ test('X2-S5 B站：单楼 reply/reply code=0 但缺 replies，这一楼拿不全
   assert.deepEqual(scanned(r, 'BV1'), { workNativeId: 'BV1', complete: false, threadsPartial: true });
 });
 
+// X3-B1：replies=null 只有在 page.count 明确为 0 时才算空楼；count>0 或缺失时这一楼拿不全，不能把已有楼中楼标 gone
+const biliThread = (data) => routes({
+  '/up/fulllist': (u) => ({ code: 0, data: { page: { total: 1 }, list: u.searchParams.get('pn') === '1' ? [reply(1, 7, 'BV1')] : [] } }),
+  '/reply/reply': () => ({ code: 0, data }),
+  '/web-interface/view': () => ({ code: 0, data: { bvid: 'BV1', aid: 7, title: 't', pubdate: recent } }),
+});
+const biliScanned = async (data) => {
+  const raw = await bili.rawComments(biliThread(data), o);
+  return [raw.threads[0].ok, scanned(bili.parse('comments', { kind: 'comments', ...raw }, { accountUid: 'u', fetchedAt }), 'BV1')];
+};
+
+test('X3-B1 B站：单楼 reply/reply code=0、replies=null 但 page.count>0，这一楼拿不全', async () => {
+  const [ok, s] = await biliScanned({ page: { count: 3 }, replies: null });
+  assert.equal(ok, false);
+  assert.deepEqual(s, { workNativeId: 'BV1', complete: false, threadsPartial: true });
+});
+
+test('X3-B1 B站：replies=null 且缺 page.count，不当空楼', async () => {
+  const [ok, s] = await biliScanned({ replies: null });
+  assert.equal(ok, false);
+  assert.equal(s.complete, false);
+});
+
+test('X3-B1 B站：replies=null 且 page.count 明确为 0，才算空楼', async () => {
+  const [ok, s] = await biliScanned({ page: { count: 0 }, replies: null });
+  assert.equal(ok, true);
+  assert.deepEqual(s, { workNativeId: 'BV1', complete: true, threadsPartial: false });
+});
+
+test('X3-B1 B站：最后一页不满 20 条但累计条数不到 page.count，这一楼拿不全', async () => {
+  const sub = { rpid: 2, oid: 7, root: 1, parent: 1, ctime: recent, mid: 2, member: { mid: '2', uname: 'b' }, content: { message: 'y' } };
+  const [ok, s] = await biliScanned({ page: { count: 3 }, replies: [sub] });
+  assert.equal(ok, false);
+  assert.equal(s.complete, false);
+});
+
+test('X3-B1 B站：累计条数达到 page.count，照常算拿全', async () => {
+  const sub = { rpid: 2, oid: 7, root: 1, parent: 1, ctime: recent, mid: 2, member: { mid: '2', uname: 'b' }, content: { message: 'y' } };
+  const [ok, s] = await biliScanned({ page: { count: 1 }, replies: [sub] });
+  assert.equal(ok, true);
+  assert.equal(s.complete, true);
+});
+
 test('X2-B7 B站：get_sessions code=0 但缺 session_list → api-error；明确为空 → ok 空会话', async () => {
   const bad = await bili.rawDms(routes({ '/get_sessions': () => ({ code: 0, data: { has_more: 0 } }) }), o);
   assert.equal(bad.failed, 'api-error');

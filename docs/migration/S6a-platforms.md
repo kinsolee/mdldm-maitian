@@ -84,7 +84,7 @@ KIN-323 dev-2。代码在 `src/ops/engage/adapters/`，入口 `collect({ account
 - 小红书私信 `messages/history`（G-B3c）：只采信 `code===0` 的；打开了但失败的会话照常报，不给 messages，`last` 为 null。
 - 缺失字段和明确为空分开（评审第 2 轮 X2-B1…X2-B7）：页面脚本不再把接口或组件的缺失字段归一成空数组，缺失一律保留成 `null`。
   - 接口 code=0 却缺列表字段：B站 `up/fulllist` 缺 `data.list`、`get_sessions` 缺 `data.session_list`，整个 kind 报 `api-error`；小红书 `you/mentions` 缺 `message_list`、`v3/chats` 缺 `chats`，以及抖音 `creator/item/list` 缺 `item_info_list`，都不算成功页，没有一页成功就报 `api-error`。
-  - 只影响一个作品的缺失：抖音 `comment/list/select`、`comment/list/reply` 缺 `comments`；小红书 `comment/page`、`comment/sub/page` 缺 `comments`；B站单楼 `reply/reply` 缺 `replies`（`null` 算空楼）；视频号评论组件读不到 `dataSource`，或者一个评论组件都没有；视频号剩余「展开更多回复」的数量读不到；一楼的子评论总数缺失。出现任何一种，这个作品就 `complete:false, threadsPartial:true`。
+  - 只影响一个作品的缺失：抖音 `comment/list/select`、`comment/list/reply` 缺 `comments`；小红书 `comment/page`、`comment/sub/page` 缺 `comments`；B站单楼 `reply/reply` 缺 `replies`，或 `replies` 为 `null` 而 `page.count` 不是明确的 0，或翻到底累计条数不到 `page.count`；视频号评论组件读不到 `dataSource`，或者一个评论组件都没有；视频号剩余「展开更多回复」的数量读不到；一楼的子评论总数缺失。出现任何一种，这个作品就 `complete:false, threadsPartial:true`。
   - 其他缺失：B站 `user/cards`、小红书 `messages/history` 缺列表时按失败处理，规则同 X-B10、G-B3c。抖音作品的 `comment_count` 缺失时记 null，这样的作品不当成 0 评论补进 `scannedWorks`。
   - 明确为空：视频号作品列表、私信会话的 Vue 组件在、数据是合法空数组时，就是明确为空，返回 ok 空结果，不要求页面上另有「暂无」文案。组件读不到时，只有页面显示「暂无…」才算空，否则 `no-data`。作品一个都没有时 `.comment-feed-wrap` 不存在，所以退而扫 shadowRoot 里所有元素找组件。抖音私信只能从 DOM 行读，页面上没有会话行，且显示 Semi 的空状态（`.semi-list-empty`）或「暂无私信」类文案，才算明确为空。
 - `error` 文本经过 `safeError`：去掉 URL 查询串、cookie，以及各种 token、签名的值，最多 300 字。
