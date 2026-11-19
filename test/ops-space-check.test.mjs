@@ -17,7 +17,7 @@ const OTHER = 'gh_0123456789ab';
 const THIRD = 'gh_ba9876543210';
 
 // 假 page：url 带不带 token、页面全局 wx、页面 HTML、settingpage 的响应
-function fakePage({ token = TOKEN, wx, html = '<body></body>', setting = '' } = {}) {
+function fakePage({ token = TOKEN, wx, html = '<body></body>', setting = '', settingStatus = 200 } = {}) {
   const fetched = [];
   const page = {
     goto: async () => {},
@@ -28,7 +28,7 @@ function fakePage({ token = TOKEN, wx, html = '<body></body>', setting = '' } = 
       globalThis.document = { documentElement: { innerHTML: html } };
       try { return await fn(arg); } finally { Object.assign(globalThis, saved); }
     },
-    fetch: async (url, opts) => { fetched.push({ url, opts }); return { status: 200, body: setting }; },
+    fetch: async (url, opts) => { fetched.push({ url, opts }); return { status: settingStatus, body: setting }; },
   };
   return { page, fetched };
 }
@@ -127,8 +127,52 @@ describe('公众号：读页面上实际登录的 gh_ id', () => {
     assert.equal(fetched.length, 0);
   });
 
+  test('commonData 两处给出两个不同的合法 gh_ → uidSeen=null，不往 html / settingpage 降级', async () => {
+    const { page, fetched } = fakePage({ wx: { commonData: { user_name: REG, data: { user_name: OTHER } } }, html: `<a>${THIRD}</a>` });
+    const r = await check(page);
+    assert.equal(r.state, 'ok');
+    assert.equal(r.uidSeen, null);
+    assert.match(r.evidence, /来源 commonData/);
+    assert.match(r.evidence, /找到 2 个不同的 gh_ id，没法确定当前账号/);
+    assert.equal(fetched.length, 0);
+  });
+
+  test('commonData 两处是同一个 gh_ → 去重后取它', async () => {
+    const { page } = fakePage({ wx: { commonData: { user_name: REG, data: { user_name: REG } } } });
+    const r = await check(page);
+    assert.equal(r.uidSeen, REG);
+    assert.match(r.evidence, /找到 1 个/);
+  });
+
+  for (const status of [500, 302]) {
+    test(`settingpage 返回 ${status}（body 含一个 gh_）→ 不解析，uidSeen=null，evidence 含 http=${status}`, async () => {
+      const { page } = fakePage({ setting: `<div>${REG}</div>`, settingStatus: status });
+      const r = await check(page);
+      assert.equal(r.uidSeen, null);
+      assert.match(r.evidence, new RegExp(`http=${status}`));
+      assert.match(r.evidence, /找到 0 个/);
+    });
+  }
+
+  test('HTML 只有 high_0123456789ab.js 这类资源名 → 不误匹配，uidSeen=null', async () => {
+    const { page } = fakePage({ html: '<script src="/js/high_0123456789ab.js"></script>' });
+    assert.equal((await check(page)).uidSeen, null);
+  });
+
+  test('settingpage 只有 high_… 资源名 → 不误匹配，uidSeen=null', async () => {
+    const { page } = fakePage({ setting: '<link href="/css/high_0123456789ab.css">' });
+    assert.equal((await check(page)).uidSeen, null);
+  });
+
+  for (const [label, html] of [['引号里', `"${OTHER}"`], ['标签之间', `<b>${OTHER}</b>`], ['URL 参数里', `?a=${OTHER}&b=1`]]) {
+    test(`HTML 里正常写法（${label}）仍能取到`, async () => {
+      const { page } = fakePage({ html });
+      assert.equal((await check(page)).uidSeen, OTHER);
+    });
+  }
+
   test('evidence 不含 token 值', async () => {
-    for (const opts of [{ wx: { commonData: { data: { user_name: REG } } } }, { html: OTHER }, { html: `${OTHER} ${THIRD}` }, { setting: REG }, { setting: '' }, { token: null }]) {
+    for (const opts of [{ wx: { commonData: { data: { user_name: REG } } } }, { html: OTHER }, { html: `${OTHER} ${THIRD}` }, { setting: REG }, { setting: '' }, { setting: REG, settingStatus: 500 }, { wx: { commonData: { user_name: REG, data: { user_name: OTHER } } } }, { token: null }]) {
       const { page } = fakePage(opts);
       const r = await check(page);
       assert.doesNotMatch(JSON.stringify(r), new RegExp(TOKEN));
