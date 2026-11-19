@@ -41,7 +41,8 @@ export function accountProblems(a) {
   const out = [];
   if (typeof a.uid !== 'string' || !a.uid) out.push(`uid：要是非空字符串，实际 ${show(a.uid)}`);
   if (a.loginStatus !== '登录有效') out.push(`loginStatus：要是「登录有效」，实际 ${show(a.loginStatus)}`);
-  if (!isNum(a.fans)) out.push(`fans：要是数字，实际 ${show(a.fans)}`);
+  // 粉丝总数接口失败时平台模块给 null（作品照常完整）；refresh.py 的 ingest_accounts 遇到空的 fans 会跳过，不会出错
+  if (a.fans !== null && !isNum(a.fans)) out.push(`fans：要是数字或 null，实际 ${show(a.fans)}`);
   if (!isTime(a.updateTime)) out.push(`updateTime：要是 YYYY-MM-DD HH:mm:ss，实际 ${show(a.updateTime)}`);
   if (!Array.isArray(a.daily)) out.push(`daily：要是数组，实际 ${show(a.daily)}`);
   else a.daily.forEach((d, i) => {
@@ -64,12 +65,24 @@ export function postsProblems(posts) {
   return out;
 }
 
-// 每个平台最近一次 ok 的采集；没有或太旧的放进 excluded
-function latestRuns(db, { maxAgeHours, now }) {
+// posts 只取采了 POSTS_MIN_DAYS 天及以上的采集：refresh.py 读最新一份 posts，短窗口的会让看板丢掉更早的期数。
+// days 为 NULL 的是加 days 列之前的旧行，可能是短窗口，也不算。
+export const POSTS_MIN_DAYS = 30;
+
+// 每个平台最近一次（minDays 时还要天数够）ok 的采集；没有或太旧的放进 excluded
+function latestRuns(db, { maxAgeHours, now, minDays }) {
   const runs = [], excluded = [];
+  const latest = db.prepare("SELECT runId, uid, finishedAt, days FROM collect_runs WHERE platformCode = ? AND result = 'ok' ORDER BY finishedAt DESC, rowid DESC LIMIT 1");
+  const latestLong = db.prepare("SELECT runId, uid, finishedAt, days FROM collect_runs WHERE platformCode = ? AND result = 'ok' AND days >= ? ORDER BY finishedAt DESC, rowid DESC LIMIT 1");
   for (const platformCode of SCOPE) {
-    const r = db.prepare("SELECT runId, uid, finishedAt FROM collect_runs WHERE platformCode = ? AND result = 'ok' ORDER BY finishedAt DESC LIMIT 1").get(platformCode);
-    if (!r) { excluded.push({ platformCode, reason: '从没成功采集过' }); continue; }
+    const any = latest.get(platformCode);
+    if (!any) { excluded.push({ platformCode, reason: '从没成功采集过' }); continue; }
+    const r = minDays ? latestLong.get(platformCode, minDays) : any;
+    if (!r) {
+      const why = any.days == null ? '最近一次 ok 采集没记采集天数（加 days 列之前的旧记录）' : `最近一次 ok 采集只采了 ${any.days} 天`;
+      excluded.push({ platformCode, uid: any.uid, runId: any.runId, reason: `${why}，没有采满 ${minDays} 天的 ok 采集；跑一次 hub ops collect（默认 30 天）` });
+      continue;
+    }
     const ageH = (now() - Date.parse(r.finishedAt)) / 3600_000;
     if (ageH > maxAgeHours) { excluded.push({ platformCode, uid: r.uid, runId: r.runId, reason: `最近一次成功采集在 ${r.finishedAt}（${ageH.toFixed(1)} 小时前，超过 ${maxAgeHours} 小时）` }); continue; }
     runs.push({ platformCode, ...r });
@@ -88,11 +101,11 @@ function writeAtomic(file, list) {
  * 共用：取各平台最近一次 ok 的采集 → build(run) 出记录 → 校验 → 写文件。
  * 退出码：0 四个平台都导出；3 有平台没导出（太旧或没成功过）；1 一个都没有、或校验不合格（这两种都不写文件）。
  */
-function exportKind(db, kind, build, check, { out, date, maxAgeHours = DEFAULT_MAX_AGE_HOURS, now = Date.now } = {}) {
+function exportKind(db, kind, build, check, { out, date, maxAgeHours = DEFAULT_MAX_AGE_HOURS, now = Date.now, minDays } = {}) {
   if (date != null && !/^\d{8}$/.test(date)) throw new Error(`--date 要写成 YYYYMMDD：${date}`);
   if (!(maxAgeHours > 0)) throw new Error(`--max-age-hours 要是正数：${maxAgeHours}`);
   const file = path.join(out ?? shadowDir(), `${kind}-${date ?? dateCn(now()).replaceAll('-', '')}.json`);
-  const { runs, excluded } = latestRuns(db, { maxAgeHours, now });
+  const { runs, excluded } = latestRuns(db, { maxAgeHours, now, minDays });
   const exported = [], list = [];
   for (const run of runs) {
     const records = build(run);
@@ -110,7 +123,7 @@ function exportKind(db, kind, build, check, { out, date, maxAgeHours = DEFAULT_M
 export function exportPosts(db, opts = {}) {
   ensureWorksTables(db);   // 没采过的库也能跑（返回退出码 1）
   const q = db.prepare('SELECT record FROM work_snapshots WHERE runId = ? AND platformCode = ? AND uid = ? ORDER BY rowid');
-  return exportKind(db, 'posts', (run) => q.all(run.runId, run.platformCode, run.uid).map((r) => JSON.parse(r.record)), postsProblems, opts);
+  return exportKind(db, 'posts', (run) => q.all(run.runId, run.platformCode, run.uid).map((r) => JSON.parse(r.record)), postsProblems, { ...opts, minDays: POSTS_MIN_DAYS });
 }
 
 export function exportAccounts(db, opts = {}) {
