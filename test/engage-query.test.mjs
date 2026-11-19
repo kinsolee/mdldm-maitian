@@ -247,3 +247,41 @@ describe('评审第 1 轮回归（查询）', () => {
     assert.deepEqual(pendingRefreshes(db).map((x) => x.id), [r2.jobId]);
   });
 });
+
+describe('评审第 1 轮回归（Gemini，refresh_now）', () => {
+  test('G-B8b：上一次 refresh 以 skipped / failed 结束，5 分钟内也去重', () => {
+    for (const status of ['skipped', 'failed']) {
+      const db = freshDb();
+      const r1 = requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: at(T0) });
+      startJob(db, r1.jobId, { now: at(T0) });
+      finishJob(db, r1.jobId, { status, now: at(T0 + MIN) });
+      assert.deepEqual(requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: at(T0 + 2 * MIN) }), { jobId: r1.jobId, deduped: true, status }, status);
+      assert.equal(requestRefresh(db, { kind: 'comments', platform: 'Douyin', now: at(T0 + 7 * MIN) }).deduped, false, status);
+    }
+  });
+
+  test('G-B8b：X-B9 回收出来的 failed 也按 5 分钟去重', () => {
+    const db = freshDb();
+    const r1 = requestRefresh(db, { kind: 'dms', platform: 'Douyin', now: at(T0) });
+    startJob(db, r1.jobId, { now: at(T0) });
+    const t = T0 + STALE_RUNNING_MS + MIN;
+    reclaimStaleJobs(db, { now: at(t) });
+    assert.equal(requestRefresh(db, { kind: 'dms', platform: 'Douyin', now: at(t + MIN) }).deduped, true);
+    assert.equal(requestRefresh(db, { kind: 'dms', platform: 'Douyin', now: at(t + 6 * MIN) }).deduped, false);
+  });
+
+  test('G-B8c：不在评论私信抓取范围的平台（Instagram、YouTube）报错，不写任务', () => {
+    const db = freshDb();
+    for (const platform of ['Instagram', 'YouTube', 'Weibo']) {
+      assert.throws(() => q.refreshNow(db, { kind: 'comments', platform }), /Douyin、Channels、.*Bili/, platform);
+      assert.throws(() => requestRefresh(db, { kind: 'comments', platform }), /抓取范围/, platform);
+    }
+    assert.equal(db.prepare('SELECT count(*) n FROM sync_jobs').get().n, 0);
+  });
+
+  test('G-B8c：库里遗留的非抓取平台 requested 任务不算待跑的 refresh', () => {
+    const db = freshDb();
+    createJob(db, { platformCode: 'Instagram', kind: 'comments', trigger: 'refresh_now', now: at(T0) });
+    assert.deepEqual(pendingRefreshes(db), []);
+  });
+});

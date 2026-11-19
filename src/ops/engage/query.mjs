@@ -1,6 +1,6 @@
 // 只查库的读接口：MCP read 组和以后的 CLI 共用。入参出参的 id 都是 <platformCode>:<原生 id>。
 // 列表一律游标分页：{ items, nextCursor }，nextCursor 为 null 表示没有下一页。
-import { listAccounts as listAccountRows, getAccount, PLATFORM_NAMES } from '../accounts.mjs';
+import { listAccounts as listAccountRows, getAccount } from '../accounts.mjs';
 import { splitId, checkPlatforms } from './ids.mjs';
 import { requestRefresh } from './store.mjs';
 
@@ -257,6 +257,5 @@ export function getWorkFlow(db, workId) {
 }
 
 export function refreshNow(db, { kind, platform, now }) {
-  if (!PLATFORM_NAMES[platform]) throw new Error(`不认识的平台：${platform}`);
   return requestRefresh(db, { kind, platform, ...(now ? { now } : {}) });
 }

@@ -2,6 +2,7 @@
 // 事件 id 是确定性的，INSERT OR IGNORE，所以重放同一轮、守护进程重启都不会重复出事件。
 import { randomUUID } from 'node:crypto';
 import { joinId, splitId } from './ids.mjs';
+import { ENGAGE_PLATFORMS } from '../../daemon/schedule.mjs';
 
 export const REFRESH_DEDUPE_MS = 5 * 60_000;
 export const LOGIN_LOST_INTERVAL_MS = 6 * 3600_000;
@@ -76,7 +77,6 @@ function upsertComments(db, ctx, snap) {
   const { code } = ctx;
   const unresolved = new Set();
   const placed = placeComments(db, code, snap.comments, unresolved);
-  const workTitles = new Map(snap.works.map((w) => [joinId(code, w.nativeId), w]));
   const workOf = db.prepare('SELECT title, url FROM engage_works WHERE id = ?');
   const exists = db.prepare('SELECT 1 FROM comments WHERE id = ?');
   const cols = 'parentId = ?, rootId = ?, depth = ?, authorUid = ?, authorNickname = ?, authorIsMe = ?, replyToUid = ?, replyToNickname = ?, text = ?, createdAt = ?, likeCount = ?, likedByMe = ?, pinned = ?, replyCount = ?, ipLabel = ?';
@@ -96,7 +96,7 @@ function upsertComments(db, ctx, snap) {
     ins.run(workId, ctx.accountId, code, ...vals, id, ctx.at, ctx.at);
     ctx.stats.inserted++;
     if (ctx.firstSync || c.author?.isMe) continue;
-    const w = workTitles.get(workId) ?? workOf.get(workId) ?? {};
+    const w = workOf.get(workId) ?? {};   // upsertWorks 已先跑：库里是合并后的值（快照里 title 为 null 不会盖掉旧的）
     emit(db, ctx, { id: `comment.created:${id}`, type: 'comment.created', subjectId: id,
       payload: { workId, workTitle: w.title ?? null, workUrl: w.url ?? null, commentId: id, rootId: p.rootId, parentId: p.parentId, nickname: c.author?.nickname ?? null, text: snippet(c.text) } });
   }
@@ -218,21 +218,24 @@ export function reclaimStaleJobs(db, { now = Date.now, maxRunningMs = STALE_RUNN
 }
 
 /** 等着跑的 refresh_now（旧的在前）。调度每轮先拿这些，startJob 后跑。 */
+// 只认评论私信抓取的平台：库里遗留的其他平台任务永远不会被消费，不能让守护进程为它每分钟起一轮
 export const pendingRefreshes = (db) =>
-  db.prepare("SELECT * FROM sync_jobs WHERE trigger = 'refresh_now' AND status = 'requested' ORDER BY requestedAt, id").all();
+  db.prepare(`SELECT * FROM sync_jobs WHERE trigger = 'refresh_now' AND status = 'requested'
+    AND platformCode IN (SELECT value FROM json_each(?)) ORDER BY requestedAt, id`).all(JSON.stringify(ENGAGE_PLATFORMS));
 
 /**
- * refresh_now：同一平台同一 kind 已有排着的、还活着的 running（开始不到 STALE_RUNNING_MS），或 5 分钟内刚成功的 refresh，
- * 就返回那条（deduped: true），不新建。
+ * refresh_now：同一平台同一 kind 已有排着的、还活着的 running（开始不到 STALE_RUNNING_MS），或 5 分钟内刚结束的 refresh
+ * （ok、skipped、failed 都算，含 X-B9 回收的），就返回那条（deduped: true），不新建。平台只认 ENGAGE_PLATFORMS。
  * 返回 { jobId, deduped, status }。
  */
 export function requestRefresh(db, { kind, platform, now = Date.now }) {
   checkKind(kind);
+  if (!ENGAGE_PLATFORMS.includes(platform)) throw new Error(`${platform} 不在评论私信抓取范围内（只认 ${ENGAGE_PLATFORMS.join('、')}）`);
   const acc = accountOfPlatform(db, platform);
   if (!acc) throw new Error(`没有 ${platform} 的账号`);
   const since = iso(now() - REFRESH_DEDUPE_MS), alive = iso(now() - STALE_RUNNING_MS);
   const hit = db.prepare(`SELECT id, status FROM sync_jobs WHERE trigger = 'refresh_now' AND platformCode = ? AND kind = ?
-    AND (status = 'requested' OR (status = 'running' AND startedAt >= ?) OR (status = 'ok' AND finishedAt >= ?)) ORDER BY requestedAt DESC LIMIT 1`).get(platform, kind, alive, since);
+    AND (status = 'requested' OR (status = 'running' AND startedAt >= ?) OR (status IN ('ok', 'skipped', 'failed') AND finishedAt >= ?)) ORDER BY requestedAt DESC LIMIT 1`).get(platform, kind, alive, since);
   if (hit) return { jobId: hit.id, deduped: true, status: hit.status };
   const jobId = createJob(db, { platformCode: platform, accountId: joinId(acc.platformCode, acc.uid), kind, trigger: 'refresh_now', now });
   return { jobId, deduped: false, status: 'requested' };

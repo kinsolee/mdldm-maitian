@@ -204,3 +204,16 @@ describe('评审第 1 轮回归', () => {
     assert.deepEqual(ingestSnapshot(db, a, dmsSnap([conv('k1', { at: '2026-11-19T01:00:00.000Z' })]), { now: at(T0 + 2 * MIN) }).events, []);
   });
 });
+
+describe('评审第 1 轮回归（Gemini）', () => {
+  test('G-B10：次轮快照里作品 title/url 为 null 时，新评论事件仍带库里原来的标题和链接', () => {
+    const db = freshDb();
+    const a = douyin(db);
+    ingestSnapshot(db, a, commentsSnap([comment('c1')]), { now: at(T0) });
+    const works = [{ nativeId: 'w1', title: null, url: null, postTime: null }];
+    ingestSnapshot(db, a, commentsSnap([comment('c1'), comment('c2')], { works }), { now: at(T0 + MIN) });
+    const p = JSON.parse(one(db, "SELECT payload FROM events WHERE id = 'comment.created:Douyin:c2'").payload);
+    assert.equal(p.workTitle, '作品一');
+    assert.equal(p.workUrl, 'https://example.test/w1');
+  });
+});
