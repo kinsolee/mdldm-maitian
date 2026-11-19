@@ -7,7 +7,8 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 
 export const opsDbPath = () => process.env.MAITIAN_OPS_DB || path.join(ROOT, 'data', 'ops.db');
 export const envPath = () => process.env.MAITIAN_ENV_FILE || path.join(ROOT, '.env');
-export const seedPath = () => path.join(ROOT, 'src', 'ops', 'accounts.seed.json');
+export const shadowDir = () => process.env.MAITIAN_OPS_SHADOW_DIR || path.join(ROOT, 'data', 'ops-shadow');
+export const seedPath =() => path.join(ROOT, 'src', 'ops', 'accounts.seed.json');
 
 // 知识站后台地址：config.json 的 site.base + site.adminPath（同 src/site.mjs 的算法）。
 // 不 import site.mjs / feishu.mjs：它们在没有 config.json 时会 process.exit。
