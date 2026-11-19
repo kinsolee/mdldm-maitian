@@ -56,9 +56,12 @@ export async function main(argv = process.argv.slice(2)) {
     }
   }
   if (group === 'login') {
-    const bad = values.check
-      ? (positionals.length ? `--check 不接位置参数（收到 ${positionals.map((p) => JSON.stringify(p)).join(' ')}），平台用 --platform` : values.platform === '' ? '--platform 不能是空串' : null)
-      : values.platform !== undefined ? '扫码登录不接 --platform，写 hub ops login <platformCode|账号id>' : null;
+    let bad = null;
+    if (values.check) {
+      if (positionals.length) bad = `--check 不接位置参数（收到 ${positionals.map((p) => JSON.stringify(p)).join(' ')}），平台用 --platform`;
+      else if (values.platform === '') bad = '--platform 不能是空串';
+    } else if (values.platform !== undefined) bad = '扫码登录不接 --platform，写 hub ops login <platformCode|账号id>';
+    else if (positionals.length > 1) bad = `扫码登录只接一个 <platformCode|账号id>；要检测写 --check（收到 ${positionals.map((p) => JSON.stringify(p)).join(' ')}）`;
     if (bad) { console.error(`${bad}\n${USAGE}`); return 1; }
     const r = values.check
       ? await checkLogins(db, values.platform ? { platform: values.platform } : {})

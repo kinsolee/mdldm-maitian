@@ -46,7 +46,7 @@ const CHECKS = {
       const valid = (v) => typeof v === 'string' && /^gh_[0-9a-f]{12}$/.test(v);
       let common = [];
       try { common = [...new Set([window.wx?.commonData?.data?.user_name, window.wx?.commonData?.user_name].filter(valid))]; } catch {}
-      return { common, html: [...new Set(document.documentElement.innerHTML.match(/gh_[0-9a-f]{12}\b/g) ?? [])] };
+      return { common, html: [...new Set(document.documentElement.innerHTML.match(/\bgh_[0-9a-f]{12}\b/g) ?? [])] };
     });
     let source, ids, note = '';
     if (seen.common.length) [source, ids] = ['commonData', seen.common];
@@ -56,7 +56,7 @@ const CHECKS = {
       try {
         const r = await page.fetch(`/cgi-bin/settingpage?t=setting/index&action=index&token=${token}&lang=zh_CN`, { method: 'GET', timeout: 15000 });
         // 只认 2xx：500、302 跳登录之类的响应不可信，不解析
-        ids = r.status >= 200 && r.status < 300 ? [...new Set(String(r.body ?? '').match(/gh_[0-9a-f]{12}\b/g) ?? [])] : [];
+        ids = r.status >= 200 && r.status < 300 ? [...new Set(String(r.body ?? '').match(/\bgh_[0-9a-f]{12}\b/g) ?? [])] : [];
         note = ` http=${r.status}`;
       } catch (e) { ids = []; note = ` 请求失败（${e.name}）`; }
     }

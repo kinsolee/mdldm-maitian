@@ -73,6 +73,8 @@ describe('hub ops login 参数校验（空库，不应走到 runner）', () => {
     ['--check 带位置参数', ['login', '--check', 'Douyin', '--json'], /--check 不接位置参数/],
     ['--check --platform 空串', ['login', '--check', '--platform', '', '--json'], /--platform/],
     ['扫码登录带 --platform', ['login', 'Douyin', '--platform', 'X', '--json'], /--platform/],
+    ['扫码登录漏写横线（login Douyin check）', ['login', 'Douyin', 'check', '--json'], /扫码登录只接一个 <platformCode\|账号id>；要检测写 --check/],
+    ['扫码登录给了两个平台', ['login', 'Douyin', 'Bili', '--json'], /扫码登录只接一个 <platformCode\|账号id>；要检测写 --check/],
   ]) {
     test(`${label}：退出码 1，stderr 有说明和用法，没调用 checkLogins/scanLogin`, () => {
       const { hub } = sandbox();

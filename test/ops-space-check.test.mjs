@@ -154,6 +154,23 @@ describe('公众号：读页面上实际登录的 gh_ id', () => {
     });
   }
 
+  test('HTML 只有 high_0123456789ab.js 这类资源名 → 不误匹配，uidSeen=null', async () => {
+    const { page } = fakePage({ html: '<script src="/js/high_0123456789ab.js"></script>' });
+    assert.equal((await check(page)).uidSeen, null);
+  });
+
+  test('settingpage 只有 high_… 资源名 → 不误匹配，uidSeen=null', async () => {
+    const { page } = fakePage({ setting: '<link href="/css/high_0123456789ab.css">' });
+    assert.equal((await check(page)).uidSeen, null);
+  });
+
+  for (const [label, html] of [['引号里', `"${OTHER}"`], ['标签之间', `<b>${OTHER}</b>`], ['URL 参数里', `?a=${OTHER}&b=1`]]) {
+    test(`HTML 里正常写法（${label}）仍能取到`, async () => {
+      const { page } = fakePage({ html });
+      assert.equal((await check(page)).uidSeen, OTHER);
+    });
+  }
+
   test('evidence 不含 token 值', async () => {
     for (const opts of [{ wx: { commonData: { data: { user_name: REG } } } }, { html: OTHER }, { html: `${OTHER} ${THIRD}` }, { setting: REG }, { setting: '' }, { setting: REG, settingStatus: 500 }, { wx: { commonData: { user_name: REG, data: { user_name: OTHER } } } }, { token: null }]) {
       const { page } = fakePage(opts);
