@@ -24,11 +24,9 @@ import { initTokens } from './tokens.mjs';
 const HEAD = fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1);
 const USAGE = HEAD.slice(0, HEAD.findIndex((l) => !l.startsWith('//'))).map((l) => l.replace(/^\/\/ ?/, '')).join('\n');
 
-async function defaultRunInSpace(opts) {
-  const runner = await import('../ego-runner/index.mjs');
-  if (typeof runner.runInSpace !== 'function') return { ok: false, reason: 'spawn-failed', error: 'src/ego-runner 还没有 runInSpace', exitCode: 1 };
-  return runner.runInSpace(opts);
-}
+// runner 懒加载：点名不处理的平台、accounts、tokens 都用不到它
+const defaultRunInSpace = async (opts) => (await import('../ego-runner/index.mjs')).runInSpace(opts);
+const defaultFinishSpace = async (space, opts) => (await import('../ego-runner/index.mjs')).finishSpace(space, opts);
 
 // 懒加载 feishu.mjs：它在没有 config.json 时会直接退出进程，所以先自己看一眼
 function defaultNotify(err) {
@@ -90,7 +88,7 @@ export async function main(argv, deps = {}) {
       const accounts = plat ? [getAccount(db, plat.code)].filter(Boolean) : listAccounts(db);
       if (!accounts.length) { err(plat ? `${plat.name} 还没登记，先跑 hub ops accounts seed` : '还没有任何登记，先跑 hub ops accounts seed'); return 2; }
       if (check) {
-        const r = await checkLogin(db, accounts, { runInSpace, now, notify: deps.notify ?? defaultNotify(err), takeBack: flags.has('--take-back') });
+        const r = await checkLogin(db, accounts, { runInSpace, finishSpace: deps.finishSpace ?? defaultFinishSpace, now, notify: deps.notify ?? defaultNotify(err), takeBack: flags.has('--take-back') });
         for (const row of r.rows) json(row);
         return r.exitCode;
       }

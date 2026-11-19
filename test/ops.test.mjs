@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { main } from '../src/ops/cli.mjs';
 import { openOpsDb, listAccounts, getAccount, requireCapability, seedAccounts } from '../src/ops/store.mjs';
+import { checkLogin, startLogin } from '../src/ops/login.mjs';
 import { initTokens, requireToken } from '../src/ops/tokens.mjs';
 import { resolvePlatform } from '../src/ops/accounts.mjs';
 import { CHECKS, detect, openLogin, DETECT_SCRIPT, LOGIN_SCRIPT } from '../src/ops/probe.mjs';
@@ -16,11 +17,14 @@ const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'ops-test-'));
 // 一套测试环境：临时 ops 目录、可拨的时钟、记下调用的假 runInSpace 和 notify
 function env(reply = () => ({ ok: true, result: { state: 'ok', uidSeen: null } })) {
   const dir = tmp();
-  const e = { dir, t: Date.parse('2026-11-19T00:00:00Z'), calls: [], notes: [], lines: [], errs: [] };
+  const e = { dir, t: Date.parse('2026-11-19T00:00:00Z'), calls: [], finishes: [], notes: [], lines: [], errs: [], running: 0 };
+  e.finishReply = () => ({ ok: true, result: { closed: true } });
   e.deps = {
     dir,
     now: () => e.t,
-    runInSpace: async (opts) => { e.calls.push(opts); return reply(opts); },
+    // running：runInSpace 还没返回（还持有 space 锁）的调用数；finishSpace 记下被调时的值
+    runInSpace: async (opts) => { e.running++; try { e.calls.push(opts); await null; return reply(opts); } finally { e.running--; } },
+    finishSpace: async (space, opts) => { e.finishes.push({ space, opts, running: e.running }); return e.finishReply(space); },
     notify: async (text) => { e.notes.push(text); },
     out: (s) => e.lines.push(s),
     err: (s) => e.errs.push(s),
@@ -28,7 +32,7 @@ function env(reply = () => ({ ok: true, result: { state: 'ok', uidSeen: null } }
   e.run = (...argv) => main(argv, e.deps);
   e.rows = () => e.lines.filter((l) => l.startsWith('{')).map((l) => JSON.parse(l));
   e.acct = (code) => { const db = openOpsDb(dir); try { return getAccount(db, code); } finally { db.close(); } };
-  e.reset = () => { e.calls.length = 0; e.lines.length = 0; e.errs.length = 0; };
+  e.reset = () => { e.calls.length = 0; e.finishes.length = 0; e.lines.length = 0; e.errs.length = 0; };
   return e;
 }
 
@@ -200,10 +204,44 @@ describe('login --check', () => {
     assert.equal(yt.length, 1);
     assert.equal(yt[0].uid, 'UCabc_123'); assert.equal(yt[0].spaceName, 'kinso/YouTube/UCabc_123'); assert.equal(yt[0].loginState, 'ok');
     assert.match(e.rows()[0].note, /space 改名：kinso\/YouTube\/pending → kinso\/YouTube\/UCabc_123/);
-    // 下一次检测用新名字，读到同一个 uid 算一致
+    // 下一次检测用新名字，读到同一个 uid 算一致，不再关任何 space
     e.reset();
     assert.equal(await e.run('login', '--check', 'youtube'), 0);
     assert.equal(e.calls[0].space, 'kinso/YouTube/UCabc_123');
+    assert.equal(e.finishes.length, 0);
+  });
+
+  test('X-B7 pending 改名后关旧 space：runInSpace 返回（锁释放）之后才 finishSpace(旧名)', async () => {
+    e.deps.runInSpace = async (o) => { e.running++; try { e.calls.push(o); await null; return { ok: true, result: { state: 'ok', uidSeen: 'v2_finder' } }; } finally { e.running--; } };
+    assert.equal(await e.run('login', '--check', 'channels'), 0);
+    assert.deepEqual(e.finishes.map((f) => [f.space, f.opts.profileId, f.running]), [['kinso/Channels/pending', 'Profile 5', 0]]);
+    const row = e.rows()[0];
+    assert.equal(row.oldSpace, 'closed');
+    assert.match(row.note, /旧 space kinso\/Channels\/pending 已关/);
+  });
+
+  test('X-B7 旧 space 在负责人手里（user-owned）：不碰，输出写明没关，登记照改', async () => {
+    e.deps.runInSpace = async () => ({ ok: true, result: { state: 'ok', uidSeen: 'kinso_x' } });
+    e.finishReply = () => ({ ok: false, reason: 'user-owned', error: 'x', exitCode: 4 });
+    assert.equal(await e.run('login', '--check', 'x'), 0);
+    assert.equal(e.finishes.length, 1);
+    assert.equal(e.acct('X').uid, 'kinso_x');
+    assert.equal(e.rows()[0].oldSpace, 'user-owned');
+    assert.match(e.rows()[0].note, /旧 space kinso\/X\/pending 在你手里，没关/);
+  });
+
+  test('X-B7 关旧 space 失败：登记已改，退出码 1，提示手动关', async () => {
+    e.deps.runInSpace = async () => ({ ok: true, result: { state: 'ok', uidSeen: 'UCzz' } });
+    e.finishReply = () => ({ ok: false, reason: 'timeout', error: 'slow' });
+    assert.equal(await e.run('login', '--check', 'youtube'), 1);
+    assert.equal(e.acct('YouTube').spaceName, 'kinso/YouTube/UCzz');
+    assert.match(e.rows()[0].note, /没关掉（timeout/);
+  });
+
+  test('X-B7 uid 不是 pending 时不关任何 space', async () => {
+    e.deps.runInSpace = async () => ({ ok: true, result: { state: 'ok', uidSeen: '478358005' } });
+    await e.run('login', '--check', 'bili');
+    assert.equal(e.finishes.length, 0);
   });
 
   test('pending 但这次没登录（out）不改名', async () => {
@@ -246,6 +284,25 @@ describe('login --check', () => {
   test('认不出的平台退出码 2', async () => {
     assert.equal(await e.run('login', '--check', 'tiktok'), 2);
     assert.equal(e.calls.length, 0);
+  });
+});
+
+describe('U1 不处理的平台：直接调库函数也不交给 runner', () => {
+  test('checkLogin / startLogin 对 Instagram、知识站不调 runInSpace', async () => {
+    const db = openOpsDb(tmp());
+    seedAccounts(db);
+    let calls = 0;
+    const deps = { runInSpace: async () => { calls++; return { ok: true, result: { state: 'ok' } }; }, finishSpace: async () => { calls++; return { ok: true }; }, notify: async () => {}, now: () => 0 };
+    for (const code of ['Instagram', 'Zhishi']) {
+      const acct = getAccount(db, code);
+      const r = await checkLogin(db, [acct], deps);
+      assert.equal(r.rows[0].result, 'skipped'); assert.equal(r.exitCode, 0);
+      const s = await startLogin(db, acct, deps);
+      assert.equal(s.reason, 'out-of-scope'); assert.equal(s.exitCode, 2);
+      assert.equal(getAccount(db, code).loginState, 'unknown');
+    }
+    assert.equal(calls, 0);
+    db.close();
   });
 });
 
