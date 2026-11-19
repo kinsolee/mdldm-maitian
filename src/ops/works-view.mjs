@@ -36,6 +36,6 @@ export function worksView(db, { platform, nowMs = Date.now() } = {}) {
 /** 按路径只读打开；文件不存在时不建，直接返回空结构。 */
 export function readWorksView(file, opts) {
   if (!fs.existsSync(file)) return worksView(new DatabaseSync(':memory:'), opts);
-  const db = new DatabaseSync(file, { readOnly: true });
+  const db = new DatabaseSync(file, { readOnly: true, timeout: 5000 });   // 采集正在写时等锁，不立刻报 busy
   try { return worksView(db, opts); } finally { db.close(); }
 }
