@@ -2,7 +2,7 @@
 // 请求、签名、翻页照搬 spikes/platform/06-works-xhs.mjs（2026-11-19 实测）。
 // 两个作品列表接口直接 fetch 会 406，要带 X-s/X-t：用页面自己的 window._webmsxyw 在 page.evaluate 里现算、在页面里 fetch，
 // 签名不出页面。粉丝三个接口不用签名。fetchRaw 在 Ego space 里跑；map 是宿主侧纯函数。
-import { DAY, cst, cstMs, cstDate, cstDay0, num, pick, pageProblem } from './fmt.mjs';
+import { DAY, cst, cstMs, cstDate, cstDay0, num, pick, pageProblem, httpOk } from './fmt.mjs';
 
 export const PLATFORM = 'XiaoHongShu';
 export const START_URL = 'https://creator.xiaohongshu.com/new/note-manager';
@@ -62,8 +62,8 @@ export async function fetchRaw(page, { days, nowMs, sleep }) {
   for (let n = 1; n <= MAX_ANALYZE_PAGES; n++) {
     if (n > 1) await sleep(PAGE_GAP_MS);
     let r = await signedGet(page, analyzeUrl(n));
-    // 第一页没读成功等 3 秒重试一次；第一次的结果记在 analyzeFirstTry
-    if (n === 1 && (r.http !== 200 || r.json?.code !== 0)) {
+    // 第一页没读成功（http 不是 2xx 或 code≠0）等 3 秒重试一次；第一次的结果记在 analyzeFirstTry
+    if (n === 1 && (!httpOk(r.http) || r.json?.code !== 0)) {
       raw.analyzeFirstTry = head(r);
       raw.analyzeRetries = 1;
       await sleep(FIRST_PAGE_RETRY_MS);
