@@ -1,7 +1,7 @@
 // KIN-330：ops.db 的粉丝同步进 hub.db.followers、作品页读库、旧采集不覆盖 ops 行。只写临时目录，不碰仓库的 data/。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -63,6 +63,31 @@ describe('粉丝同步 ops.db.fans_daily → hub.db.followers', () => {
     daily(db, 'Douyin', 'ghost', [['2026-11-18', 1, 1]]);   // accounts 表里没有的 uid 不算
     syncFollowers(db, hub);
     assert.deepEqual(hubRows(hub).map((x) => [x.platform, x.total]), [['douyin', 100]]);
+  });
+});
+
+describe('粉丝同步：今天的总数取 account_snapshots', () => {
+  const snap = (db, code, uid, collectedAt, fans, runId = collectedAt) => db.prepare("INSERT INTO account_snapshots (runId, platformCode, uid, collectedAt, fans, loginStatus, record) VALUES (?, ?, ?, ?, ?, '登录有效', '{}')").run(runId, code, uid, collectedAt, fans);
+  test('fans_daily 到昨天 + 今天的快照 → 今天一行（东八区日期、source=ops、gain/loss 为 null）；fans_daily 同一天有总数时 fans_daily 胜出；幂等', () => {
+    const dir = tmp(), db = opsDb(dir), hub = new DatabaseSync(path.join(dir, 'hub.db'));
+    daily(db, 'Douyin', 'd1', [['2026-11-17', 100, null], ['2026-11-18', 103, 3]]);
+    snap(db, 'Douyin', 'd1', '2026-11-18T10:00:00.000Z', 104);
+    snap(db, 'Douyin', 'd1', '2026-11-18T17:30:00.000Z', 108.4);   // 东八区 11-19 01:30，最新
+    snap(db, 'Douyin', 'd1', '2026-11-18T18:00:00.000Z', null);   // fans 为空的不算
+    daily(db, 'Channels', 'c1', [['2026-11-19', 20, -1]], '2026-11-19T02:00:00.000Z');
+    snap(db, 'Channels', 'c1', '2026-11-19T03:00:00.000Z', 999);   // 同一天 fans_daily 有总数：不用快照
+    daily(db, 'Bili', 'b1', [['2026-11-19', null, 2]]);
+    snap(db, 'Bili', 'b1', '2026-11-19T03:00:00.000Z', 7);   // 同一天 fans_daily 没总数：total 取快照，净增照 fans_daily
+    syncFollowers(db, hub);
+    const rows = hubRows(hub);
+    assert.deepEqual(rows.find((x) => x.platform === 'douyin' && x.day === '2026-11-19'),
+      { day: '2026-11-19', platform: 'douyin', total: 108, gain: null, loss: null, source: 'ops', collected_at: '2026-11-18T17:30:00.000Z' });
+    assert.equal(rows.find((x) => x.platform === 'douyin' && x.day === '2026-11-18').total, 103);
+    assert.deepEqual(rows.find((x) => x.platform === 'channels'), { day: '2026-11-19', platform: 'channels', total: 20, gain: null, loss: 1, source: 'ops', collected_at: '2026-11-19T02:00:00.000Z' });
+    assert.deepEqual(rows.find((x) => x.platform === 'bilibili'), { day: '2026-11-19', platform: 'bilibili', total: 7, gain: 2, loss: null, source: 'ops', collected_at: '2026-11-19T03:00:00.000Z' });
+    assert.equal(rows.length, 5);
+    syncFollowers(db, hub);
+    assert.deepEqual(hubRows(hub), rows, '重复运行行数、值不变');
   });
 });
 
@@ -160,24 +185,63 @@ describe('hub ops sync-followers 命令行', () => {
 });
 
 describe('GET /api/ops/works（起真的网页服务）', () => {
-  test('没带口令 401；带口令拿到四个平台的空结构（ops.db 不存在）；/works 页面能打开', async () => {
-    const dir = tmp(), port = 20000 + Math.floor(Math.random() * 20000);
+  async function serve(dir, run) {
+    const port = 20000 + Math.floor(Math.random() * 20000);
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ web: { port, key: 'test-key' }, rootPath: dir }));
-    const { spawn } = await import('node:child_process');
     const p = spawn(process.execPath, ['--input-type=module', '-e', `const { startWeb } = await import(${JSON.stringify(path.join(ROOT, 'src', 'web.mjs'))}); startWeb();`],
       { env: { ...process.env, MAITIAN_CONFIG: path.join(dir, 'config.json'), MAITIAN_DB: path.join(dir, 'hub.db'), MAITIAN_OPS_DB: path.join(dir, 'ops.db') }, stdio: ['ignore', 'pipe', 'pipe'] });
     try {
       await new Promise((ok, bad) => { p.stdout.on('data', (d) => /麦田网页/.test(d) && ok()); p.on('exit', (c) => bad(new Error(`服务退出 ${c}`))); setTimeout(() => bad(new Error('服务没起来')), 10000); });
       const base = `http://127.0.0.1:${port}`;
-      assert.equal((await fetch(`${base}/api/ops/works`)).status, 401);
-      const r = await fetch(`${base}/api/ops/works?platform=xhs`, { headers: { cookie: 'mt_key=test-key' } });
+      const get = (u, key = true) => fetch(base + u, key ? { headers: { cookie: 'mt_key=test-key' } } : {});
+      await run(get);
+    } finally { p.kill(); }
+  }
+
+  test('没带口令 401；带口令拿到四个平台的空结构（ops.db 不存在）；/works 页面能打开', async () => {
+    const dir = tmp();
+    await serve(dir, async (get) => {
+      assert.equal((await get('/api/ops/works', false)).status, 401);
+      const r = await get('/api/ops/works?platform=xhs');
       assert.equal(r.status, 200);
       assert.deepEqual(await r.json(), { platforms: [{ platform: 'xhs', platformCode: XHS, name: '小红书', lastRun: null }], works: [] });
-      const page = await fetch(`${base}/works`, { headers: { cookie: 'mt_key=test-key' } });
+      const page = await get('/works');
       assert.equal(page.status, 200);
       assert.match(await page.text(), /\/api\/ops\/works/);
       assert.ok(!fs.existsSync(path.join(dir, 'ops.db')), '只读：不建 ops.db');
-    } finally { p.kill(); }
+    });
+  });
+
+  test('固定的 ops.db：倒序、null 保留、platforms[].lastRun；?platform=douyin 只给抖音；未带口令 /works 也是 401', async () => {
+    const dir = tmp(), db = opsDb(dir);
+    // 服务用真实时钟算近 30 天，发布时间按现在往回推
+    const ago = (days) => new Date(Date.now() - days * 86400_000 + 8 * 3600_000).toISOString().replace('T', ' ').slice(0, 19);
+    const at = new Date().toISOString(), tB = ago(1);
+    saveCollected(db, { runId: 'r1', platformCode: 'Douyin', uid: 'd1', at, account: { daily: [] }, posts: [
+      { postId: 'a', platform: 'Douyin', title: '旧一点', postTime: ago(5), statusText: '已发布', view: 10, like: null, comment: 1, favorite: null, forward: 0, fansAdd: null },
+      { postId: 'b', platform: 'Douyin', title: '最新', postTime: tB, statusText: '审核中', view: null, like: 2 },
+      { postId: 'old', platform: 'Douyin', title: '超过 30 天', postTime: ago(40), statusText: '已发布' }] });
+    saveCollected(db, { runId: 'r1', platformCode: 'Bili', uid: 'b1', at, account: { daily: [] }, posts: [{ postId: 'BV1', platform: 'Bili', title: 'B站的', postTime: ago(3), statusText: '已发布', view: 5 }] });
+    recordRun(db, { runId: 'r0', platformCode: 'Douyin', uid: 'd1', startedAt: '2026-11-18T01:00:00.000Z', finishedAt: '2026-11-18T01:00:00.000Z', result: 'failed', message: '旧的' });
+    recordRun(db, { runId: 'r1', platformCode: 'Douyin', uid: 'd1', startedAt: at, finishedAt: at, result: 'ok', postCount: 3 });
+    recordRun(db, { runId: 'r1', platformCode: 'Bili', uid: 'b1', startedAt: at, finishedAt: at, result: 'skipped', reason: 'busy', message: '另一个任务正占着这个 space' });
+    db.close();
+    await serve(dir, async (get) => {
+      assert.equal((await get('/works', false)).status, 401);
+      assert.equal((await get('/api/ops/works', false)).status, 401);
+      const all = await (await get('/api/ops/works')).json();
+      assert.deepEqual(all.works.map((w) => [w.platform, w.postId]), [['douyin', 'b'], ['bilibili', 'BV1'], ['douyin', 'a']]);
+      assert.deepEqual(all.works[0], { platform: 'douyin', platformCode: 'Douyin', name: '抖音', postId: 'b', title: '最新', postTime: tB, statusText: '审核中', url: null,
+        view: null, like: 2, comment: null, favorite: null, forward: null, fansAdd: null });
+      assert.deepEqual(all.platforms.map((p) => [p.platform, p.lastRun && p.lastRun.result, p.lastRun && p.lastRun.reason]),
+        [['douyin', 'ok', null], ['xhs', null, null], ['bilibili', 'skipped', 'busy'], ['channels', null, null]]);
+      assert.equal(all.platforms[0].lastRun.finishedAt, at);
+      assert.equal(all.platforms[2].lastRun.message, '另一个任务正占着这个 space');
+      const dy = await (await get('/api/ops/works?platform=douyin')).json();
+      assert.deepEqual(dy.works.map((w) => w.postId), ['b', 'a']);
+      assert.deepEqual(dy.works[1].like, null);
+      assert.deepEqual(dy.platforms.map((p) => p.platform), ['douyin']);
+    });
   });
 });
 
@@ -194,10 +258,11 @@ describe('hub ops collect 之后自动同步粉丝', () => {
     assert.equal(r.status, 0, r.stderr);
     const j = JSON.parse(r.stdout);
     assert.equal(j.followersSync.ok, true);
-    assert.equal(j.followersSync.written, 8);   // 四个平台 × 两天
+    assert.equal(j.followersSync.written, 12);   // 四个平台 × （两天分日 + 今天的快照）
     const hub = new DatabaseSync(path.join(dir, 'hub.db'));
     assert.deepEqual(hub.prepare("SELECT platform, total, gain FROM followers WHERE day = '2026-11-18' ORDER BY platform").all().map((x) => ({ ...x })),
       ['bilibili', 'channels', 'douyin', 'xhs'].map((platform) => ({ platform, total: 100, gain: 2 })));
+    assert.equal(hub.prepare("SELECT count(*) n FROM followers WHERE day = '2026-11-19' AND total = 100 AND source = 'ops'").get().n, 4);
     hub.close();
     fs.writeFileSync(path.join(dir, 'hub.db'), 'not a database');
     for (const f of ['hub.db-wal', 'hub.db-shm']) fs.rmSync(path.join(dir, f), { force: true });
