@@ -11,3 +11,5 @@ demo/
 .env
 integrations/openbot/.env
 integrations/openbot/data/
+integrations/cindy/.env
+integrations/cindy/data/

@@ -297,3 +297,49 @@ node /Applications/OpenBot.app/Contents/Resources/cli/openbot-cli.mjs status 数
 ### 给数据小管家挂麦田 MCP
 
 在 OpenBot「Marketplace → Apps」里加 stdio 服务（只有负责人能把服务分给 bot）：命令 `node`，参数 `<检出>/src/mcp/server.mjs --scope read`，环境变量只放 `MAITIAN_OPS_DB`。不要放 `MAITIAN_ENGAGE_TOKEN` 等写入口令。
+
+## 10. Cindy 接法（KIN-325）
+
+代码在 `integrations/cindy/`。本阶段 **Cindy 只订阅、只做对照**：正式处理和 `ack_event` 都归 OpenBot。Cindy 的结果只写进单独的对照文件 `~/Documents/OPC-vault/10.个人IP/数据/麦田事件对照-Cindy.jsonl`，不写正式记录和待确认文件，也不回执。
+
+```
+麦田发件箱 ──POST──▶ 127.0.0.1:8791/maitian/hook（receiver.mjs：验签、按事件 id 去重进收件箱、马上回 200）
+                        │
+Cindy 定时任务（每 2 分钟）── preRunHook：inbox.mjs check（有事件 exit 0，没有 exit 2 跳过、不花 token）
+                        │
+             agent（只挂麦田 MCP read 组）：inbox.mjs pending → 读评论树或私信 → 分类 → inbox.mjs record
+                        │
+             对照文件（按事件 id 去重追加）写成功后，才把这些事件在收件箱里标成已处理
+```
+
+### 为什么没用 Cindy 原生的 webhook 触发
+
+Cindy 0.1.141 的定时任务支持 webhook 触发，但打包版只走 Cindy 云端：公网地址、要登录 Cindy 账号、有配额，评论私信正文会出本机。本机 `127.0.0.1` 入口只在开发构建里、设了 `XDT_SCHEDULE_WEBHOOK_LOCAL=1` 才开。它验的签名头是 `x-hub-signature-256`，麦田发的是 `X-Maitian-Signature`。所以改用本机接收端加前置检查（preRunHook）。前置检查是 Cindy 给轮询类任务推荐的做法：exit 0 照常跑，exit 2 跳过这一轮。
+
+### 两边同时订阅时要知道的
+
+- 订阅方 id 不同：OpenBot 用 `openbot-engage`（8790），Cindy 用 `cindy-engage`（8791）。
+- 麦田只推**还没回执**的事件。Cindy 的推送失败、等到重试时 OpenBot 已经回执了，这条就不会再推给 Cindy。接收端每 15 分钟用 `list_events`（不带 `unhandled`）补一次漏，保证两边收到的事件集合一致。
+- 「2 小时没回执」提醒看的是全局 `events.handledAt`（`src/daemon/outbox.mjs`）：OpenBot 回执了，Cindy 那边就不会提醒。只有 OpenBot 也超时没回执时，两个订阅方各提醒一次。
+- 以后要让 Cindy 当主处理方：OpenBot 停止回执（或对 `openbot-engage` 调 `unsubscribe_events`），Cindy 这边改 `agent-prompt.md` 加回执和正式记录。麦田不用改。
+
+### 配置（`integrations/cindy/.env`，权限 0600，不进仓库）
+
+见 `integrations/cindy/.env.example`。`MAITIAN_SECRET` 由首次登记自动写入，不打印。验签、`.env` 读写、订阅登记直接复用 `integrations/openbot/` 的代码。
+
+### 启动和查看
+
+```sh
+node integrations/cindy/receiver.mjs                      # 启动：先 subscribe_events（cindy-engage），再监听，再补漏
+curl -s http://127.0.0.1:8791/health                      # 收件箱总数、已处理、待处理
+node integrations/cindy/inbox.mjs check; echo $?          # 0 有待处理，2 没有
+node integrations/cindy/compare.mjs --hours 24            # OpenBot 与 Cindy 的对照报告（只读，打印到终端）
+```
+
+launchd 模板：`integrations/cindy/com.maitian.cindy-receiver.plist`。Cindy 每轮的规则：`integrations/cindy/agent-prompt.md`。
+
+### 在 Cindy 里要做的（负责人在界面上操作）
+
+1. 在 Cindy 里把 `<检出>/integrations/cindy/project` 当项目打开。Cindy 会读到 `.cindy/automations/schedules.json` 里的「麦田事件对照」任务，同意导入。
+2. 在设置里加 MCP 服务（stdio）：命令 `/opt/homebrew/bin/node`，参数 `<检出>/src/mcp/server.mjs --scope read`，环境变量只放 `MAITIAN_OPS_DB`。不要放 `MAITIAN_ENGAGE_TOKEN` 等写入口令。
+3. 给这个任务选执行的伙伴（agent），确认它能用上一步的 MCP。

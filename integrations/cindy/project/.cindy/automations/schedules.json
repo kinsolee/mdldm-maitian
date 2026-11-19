@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "schedules": [
+    {
+      "id": "maitian-events-compare",
+      "name": "麦田事件对照",
+      "prompt": "先完整读 /Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/cindy/agent-prompt.md，严格照它做这一轮。绝不调用 ack_event，不写平台，只用其中写的那条 record 命令写入。",
+      "cronExpr": "*/2 * * * *",
+      "timezone": "Asia/Taipei",
+      "recurring": true,
+      "useWorktree": false,
+      "persistentSession": false,
+      "silentWhenIdle": true,
+      "preRunHook": {
+        "command": "/opt/homebrew/bin/node /Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/cindy/inbox.mjs check",
+        "timeoutMs": 15000
+      },
+      "notify": { "desktop": false, "feishu": false }
+    }
+  ]
+}
