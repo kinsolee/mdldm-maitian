@@ -128,7 +128,9 @@ function targetPrior(db, req, row) {
 function reclaimStale(db, now) {
   const rows = db.prepare(`SELECT id, platformCode FROM actions WHERE status = 'pending' AND createdAt < ?`).all(iso(now() - PENDING_STALE_MS));
   for (const r of rows) finishAction(db, r.id, { status: 'needs_readback', reason: 'interrupted', detail: '上一个进程发到一半没落结果', sendAttempted: true }, now);
-  for (const code of new Set(rows.map((r) => r.platformCode))) maybeTrip(db, code, now);
+  const tripped = new Set();
+  for (const code of new Set(rows.map((r) => r.platformCode))) if (maybeTrip(db, code, now)) tripped.add(code);
+  return tripped;
 }
 
 // ---------- 租约 ----------
@@ -232,12 +234,13 @@ async function sendTripAlerts(db, { notify, now, log }) {
 export async function engageWrite(db, input, deps = {}) {
   const { now = Date.now, runWriter = runWriterInSpace, notify = defaultNotifyLazy, log = (s) => console.error(s) } = deps;
   const req = checkInput(input);
-  tx(db, () => reclaimStale(db, now));
+  // 这次调用回收时触发了本平台的自动关：返回里 writeDisabled 要是 true
+  const trippedNow = tx(db, () => reclaimStale(db, now)).has(req.platformCode);
   await sendTripAlerts(db, { notify, now, log });
   const out = (o) => ({ status: o.status, reason: o.reason ?? null, detail: o.detail ?? null, retryable: RETRYABLE.has(o.reason),
     op: req.op, targetId: req.targetId, accountId: o.accountId ?? null, idempotencyKey: req.idempotencyKey, eventId: req.eventId,
     actionId: o.actionId ?? null, sendAttempted: !!o.sendAttempted, readBack: o.readBack ?? null,
-    ...(o.previousActionId ? { previousActionId: o.previousActionId } : {}), ackedEvents: o.ackedEvents ?? [], writeDisabled: !!o.writeDisabled });
+    ...(o.previousActionId ? { previousActionId: o.previousActionId } : {}), ackedEvents: o.ackedEvents ?? [], writeDisabled: !!o.writeDisabled || trippedNow });
   const done = (fields) => out({ ...fields, actionId: insertAction(db, req, fields, now) });
 
   if (!ENGAGE_PLATFORMS.includes(req.platformCode)) {
@@ -246,9 +249,9 @@ export async function engageWrite(db, input, deps = {}) {
 
   const start = tx(db, () => {
     const since = iso(now() - IDEMPOTENCY_WINDOW_MS);
-    if (otherTarget(db, req, since)) return done({ status: 'rejected', reason: 'idempotency-key-reused', detail: '这个 idempotencyKey 24 小时内用在了别的目标或操作上' });
-    // eventId 先核对，再走幂等分支：duplicate 也会回执事件，不能回执到别的目标上
+    // eventId 最先核对（早于所有幂等检查）：duplicate 也会回执事件，不能回执到别的目标上
     if (!eventMatches(db, req)) return done({ status: 'rejected', reason: 'event-mismatch', detail: `eventId 不存在，或不是 ${req.targetId} 的 ${req.spec.eventType} 事件` });
+    if (otherTarget(db, req, since)) return done({ status: 'rejected', reason: 'idempotency-key-reused', detail: '这个 idempotencyKey 已经用在了别的目标或操作上' });
     const prior = blockingPrior(db, req.idempotencyKey, since);
     if (prior?.status === 'pending' && now() - Date.parse(prior.createdAt) > PENDING_STALE_MS) {
       finishAction(db, prior.id, { status: 'needs_readback', reason: 'interrupted', detail: '上一个进程发到一半没落结果', sendAttempted: true }, now);
@@ -272,10 +275,11 @@ export async function engageWrite(db, input, deps = {}) {
     if (!account.capabilities[req.spec.cap]) {
       return done({ status: 'rejected', reason: 'capability-off', detail: `账号 ${accountId} 的能力位 ${req.spec.cap} 没开（hub ops accounts set-cap ${accountId} ${req.spec.cap} true）`, accountId });
     }
-    const blocked = dbPrecheck(db, req, t.row);
-    if (blocked) return done({ status: 'failed', reason: blocked[0], detail: blocked[1], accountId });
+    // 先看本目标自己的发送记录（needs_readback / pending 不能被库同步后的「已回复」盖掉），再做普通库预检
     const tp = targetPrior(db, req, t.row);
     if (tp) return done({ status: tp[0], reason: tp[1], detail: tp[2], accountId, previousActionId: tp[3] });
+    const blocked = dbPrecheck(db, req, t.row);
+    if (blocked) return done({ status: 'failed', reason: blocked[0], detail: blocked[1], accountId });
     const used = db.prepare(`SELECT count(*) n FROM actions WHERE platformCode = ? AND roundKey = ? AND (sendAttempted = 1 OR status = 'pending')`).get(req.platformCode, roundKeyOf(now())).n;
     if (used >= ROUND_LIMIT) return done({ status: 'rejected', reason: 'round-limit', detail: `${PLATFORM_NAMES[req.platformCode]}这一轮（整点小时）已发 ${used} 条，上限 ${ROUND_LIMIT}`, accountId });
     const actionId = insertAction(db, req, { status: 'pending', accountId }, now);

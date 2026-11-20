@@ -213,6 +213,26 @@ describe('engageWrite：发出、回读、幂等', () => {
     assert.equal(s.notes.length, 1);
   });
 
+  test('X2-B1：同一评论之前 needs_readback，后来库里出现了我的回复：仍返回 target-needs-readback，不被普通预检盖掉', async () => {
+    await engageWrite(s.db, reply({ idempotencyKey: 'n1' }), s.deps(fakeWriter({ uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } })));
+    ingestSnapshot(s.db, getAccount(s.db, BILI), biliComments([comment('r1', { uid: '9001' }), comment('a', { parent: 'r1', root: 'r1', uid: '9002' }),
+      comment('mine', { parent: 'a', root: 'r1', uid: '478358005', isMe: true })]), { now: () => T0 + 2 * MIN });
+    const r = await engageWrite(s.db, reply({ idempotencyKey: 'n2' }), s.deps(fakeWriter(SENT)));
+    assert.deepEqual(pick(r), ['needs_readback', 'target-needs-readback']);
+  });
+
+  test('X2-B1：私信之前 needs_readback，库里会话变成我最后说：仍返回 target-needs-readback', async () => {
+    await engageWrite(s.db, dm({ idempotencyKey: 'm1' }), s.deps(fakeWriter({ uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } })));
+    s.db.prepare("UPDATE conversations SET lastBy = 'me' WHERE id = 'Bili:c1'").run();
+    assert.deepEqual(pick(await engageWrite(s.db, dm({ idempotencyKey: 'm2' }), s.deps(fakeWriter(SENT)))), ['needs_readback', 'target-needs-readback']);
+  });
+
+  test('X2-B2：key 已被别的目标占用、同时 eventId 也对不上 → 先报 event-mismatch', async () => {
+    await engageWrite(s.db, reply({ idempotencyKey: 'k-x2', targetId: 'Bili:r1' }), s.deps(fakeWriter(SENT)));
+    const r = await engageWrite(s.db, reply({ idempotencyKey: 'k-x2', eventId: 'nope' }), s.deps(fakeWriter(SENT)));
+    assert.deepEqual(pick(r), ['rejected', 'event-mismatch']);
+  });
+
   test('同一 key 用在别的目标上 → rejected', async () => {
     await engageWrite(s.db, reply({ idempotencyKey: 'same' }), s.deps(fakeWriter(SENT)));
     const r = await engageWrite(s.db, reply({ idempotencyKey: 'same', targetId: 'Bili:r1' }), s.deps(fakeWriter(SENT)));
@@ -376,6 +396,18 @@ describe('engageWrite：同一平台连续 2 轮写入失败自动关写能力�
     assert.match(s.notes[0], /B站/);
     assert.match(s.notes[0], /set-cap/);
     assert.deepEqual(pick(await engageWrite(s.db, reply({ idempotencyKey: 'f3' }), s.deps(fakeWriter(SENT)))), ['rejected', 'capability-off']);
+  });
+
+  test('X2-B3：回收崩溃留下的 pending 触发自动关 → 这次调用返回 capability-off 且 writeDisabled:true', async () => {
+    const ins = (id, hour) => s.db.prepare(`INSERT INTO actions (id, op, caller, accountId, platformCode, targetId, textHash, idempotencyKey, status, sendAttempted, roundKey, createdAt)
+      VALUES (?, 'reply', 't', ?, 'Bili', 'Bili:a', 'h', ?, 'pending', 0, ?, ?)`).run(id, BILI, `crash-${id}`, `2026-11-19T0${hour}`, `2026-11-19T0${hour}:10:00.000Z`);
+    ins('q1', 3); ins('q2', 4);
+    s.at(Date.parse('2026-11-19T06:00:00Z'));
+    const r = await engageWrite(s.db, dm({ idempotencyKey: 'x2b3' }), s.deps(fakeWriter(SENT)));
+    assert.deepEqual(pick(r), ['rejected', 'capability-off']);
+    assert.equal(r.writeDisabled, true);
+    // 下一次调用不是这次触发的，writeDisabled 回到 false
+    assert.equal((await engageWrite(s.db, dm({ idempotencyKey: 'x2b3b' }), s.deps(fakeWriter(SENT)))).writeDisabled, false);
   });
 
   test('同一轮里有一条成功就不算这轮失败；重读拦下的不算写入失败', async () => {

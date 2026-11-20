@@ -55,7 +55,7 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 | `readBack` | 发后回读的结果：`found`（恰好回读到 1 条才是 `true`）、`count`（回读到几条一样的）、`nativeId`（平台给的新回复 id，拿得到才有）、`detail`。没点发送时为 `null` |
 | `previousActionId` | `duplicate`、`needs_readback`（上次没回读到）、`in-progress` 时，指向之前那次调用 |
 | `ackedEvents` | 这次自动回执成 `replied` 的事件 |
-| `writeDisabled` | 这次失败触发了「连续 2 轮失败自动关写能力位」 |
+| `writeDisabled` | 这次调用触发了「连续 2 轮失败自动关写能力位」（包括这次调用开头回收崩溃留下的记录时触发的） |
 
 | `status` | 含义 | 常见 `reason` |
 |---|---|---|
@@ -83,7 +83,7 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
    - 库里已经有我对这条评论的直接回复。
    - 会话最后一句是我说的。
    - 对方不能收私信（`canSend=false`，例如官方号）。
-   - 这个目标之前用别的 key 发过：评论回过就返回 `failed` / `already-replied`；私信在对方最后一句之后发过就返回 `failed` / `last-is-me`；之前点了发送没确认的返回 `needs_readback` / `target-needs-readback`；正在发的返回 `rejected` / `in-progress`。换 key 也绕不过去。
+   - 这个目标之前用别的 key 发过（这一条最先判，库同步后显示「已回复」也不会盖掉「点了发送没确认」）：评论回过就返回 `failed` / `already-replied`；私信在对方最后一句之后发过就返回 `failed` / `last-is-me`；之前点了发送没确认的返回 `needs_readback` / `target-needs-readback`；正在发的返回 `rejected` / `in-progress`。换 key 也绕不过去。
 5. **每轮上限**：每个平台每轮最多 15 条，超过返回 `rejected` / `round-limit`，下一轮恢复。一轮是一个整点小时（UTC，台湾时间也是整点对齐），只要点过发送就计数。
 6. **平台写入租约**（`engage_write_leases` 表）：同一个平台同一时间只有一个写入方。被别人持有时返回 `rejected` / `lease-busy`。租约时长是写入超时（B站 2 分钟，页面平台 6 分钟）再加 2 分钟，过期后可以接管，写完马上释放。
 7. **在账号的 space 里写**：经 runner（`src/ego-runner`）在 `kinso/<platformCode>/<uid>` 里跑写入脚本。runner 自带 S1 的 space 锁，space 被守护进程或负责人占着时返回 `failed` / `space-busy`，可以重试。写入脚本按这个顺序做：
