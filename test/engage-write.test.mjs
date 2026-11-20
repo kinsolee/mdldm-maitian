@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { openOpsDb } from '../src/ops/db.mjs';
 import { getAccount, setCapability } from '../src/ops/accounts.mjs';
 import { ingestSnapshot } from '../src/ops/engage/store.mjs';
-import { engageWrite, ROUND_LIMIT, LEASE_TABLE } from '../src/ops/engage/write.mjs';
+import { engageWrite, ROUND_LIMIT, LEASE_TABLE, roundKeyOf } from '../src/ops/engage/write.mjs';
 import { freshDb, tmpDbFile, comment, conv, T0, MIN } from './helpers/engage-fixtures.mjs';
 
 const BILI = 'Bili:478358005';
@@ -231,6 +231,52 @@ describe('engageWrite：发出、回读、幂等', () => {
     await engageWrite(s.db, reply({ idempotencyKey: 'k-x2', targetId: 'Bili:r1' }), s.deps(fakeWriter(SENT)));
     const r = await engageWrite(s.db, reply({ idempotencyKey: 'k-x2', eventId: 'nope' }), s.deps(fakeWriter(SENT)));
     assert.deepEqual(pick(r), ['rejected', 'event-mismatch']);
+  });
+
+  // 挑刺复审阻断：平台时间（conversations.lastAt）和本机时钟（actions.createdAt）有偏差时，换 key 不能绕过同一会话
+  const skewTo = (ms) => s.db.prepare("UPDATE conversations SET lastBy = 'peer', lastAt = ? WHERE id = 'Bili:c1'").run(new Date(ms).toISOString());
+  const nowMs = () => T0 + 2 * MIN;
+  for (const [label, first, want] of [
+    ['needs_readback', { uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } }, ['needs_readback', 'target-needs-readback']],
+    ['sent', SENT, ['failed', 'last-is-me']],
+  ]) {
+    test(`时钟偏差：平台 lastAt 比本机快 5 秒，第一次 ${label}，换 key 再发同一会话被拦，writer 只调一次`, async () => {
+      skewTo(nowMs() + 5000);
+      const w = fakeWriter([first, SENT]);
+      await engageWrite(s.db, dm({ idempotencyKey: 'skew1' }), s.deps(w));
+      const r = await engageWrite(s.db, dm({ idempotencyKey: 'skew2' }), s.deps(w));
+      assert.deepEqual(pick(r), want);
+      assert.equal(w.calls.length, 1);
+    });
+  }
+
+  test('时钟偏差：平台 lastAt 比本机快 5 秒，同一会话还有 pending → 换 key 被拦 in-progress', async () => {
+    skewTo(nowMs() + 5000);
+    s.db.prepare(`INSERT INTO actions (id, op, caller, accountId, platformCode, targetId, textHash, idempotencyKey, status, sendAttempted, roundKey, createdAt, targetLastAt)
+      VALUES ('pp1', 'sendDM', 't', ?, 'Bili', 'Bili:c1', 'h', 'pk1', 'pending', 0, ?, ?, ?)`).run(BILI, roundKeyOf(nowMs()), new Date(nowMs() - MIN).toISOString(), new Date(nowMs() + 5000).toISOString());
+    const w = fakeWriter(SENT);
+    assert.deepEqual(pick(await engageWrite(s.db, dm({ idempotencyKey: 'pk2' }), s.deps(w))), ['rejected', 'in-progress']);
+    assert.equal(w.calls.length, 0);
+  });
+
+  test('发信中对方又发了一句（lastAt 推进到 pending 之后），pending 还在 → 拦 in-progress', async () => {
+    let inner;
+    const w = fakeWriter(async () => {
+      skewTo(nowMs() + 30_000);
+      inner = await engageWrite(s.db, dm({ idempotencyKey: 'mid2' }), s.deps(fakeWriter(SENT)));
+      return { ok: true, result: SENT };
+    });
+    await engageWrite(s.db, dm({ idempotencyKey: 'mid1' }), s.deps(w));
+    assert.deepEqual(pick(inner), ['rejected', 'in-progress']);
+  });
+
+  test('保守：私信点了发送没确认（needs_readback），对方之后又说了新的也不放行，直到人工处理', async () => {
+    await engageWrite(s.db, dm({ idempotencyKey: 'cv1' }), s.deps(fakeWriter({ uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } })));
+    s.tick(HOUR);
+    skewTo(nowMs() + 2 * HOUR);
+    const w = fakeWriter(SENT);
+    assert.deepEqual(pick(await engageWrite(s.db, dm({ idempotencyKey: 'cv2' }), s.deps(w))), ['needs_readback', 'target-needs-readback']);
+    assert.equal(w.calls.length, 0);
   });
 
   test('同一 key 用在别的目标上 → rejected', async () => {
@@ -458,6 +504,20 @@ describe('engage-db 升级', () => {
     assert.equal(getAccount(db, BILI).capabilities.reply, true);
     db.close();
     openOpsDb(file).close();   // 再开一次也不报错
+  });
+
+  test('本分支早期建的 actions（没有 targetLastAt 列）打开后补上这一列', () => {
+    const file = tmpDbFile();
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE actions (id TEXT PRIMARY KEY, op TEXT NOT NULL, caller TEXT, accountId TEXT, platformCode TEXT NOT NULL, targetId TEXT NOT NULL,
+      textHash TEXT NOT NULL, idempotencyKey TEXT NOT NULL, eventId TEXT, status TEXT NOT NULL, reason TEXT, detail TEXT, sendAttempted INTEGER NOT NULL DEFAULT 0, readBack TEXT,
+      roundKey TEXT NOT NULL, createdAt TEXT NOT NULL, finishedAt TEXT);
+      INSERT INTO actions (id, op, platformCode, targetId, textHash, idempotencyKey, status, roundKey, createdAt) VALUES ('a1', 'sendDM', 'Bili', 'Bili:c1', 'h', 'k', 'sent', '2026-11-19T00', '2026-11-19T00:00:00.000Z');`);
+    old.close();
+    const db = openOpsDb(file);
+    assert.ok(db.prepare('PRAGMA table_info(actions)').all().some((c) => c.name === 'targetLastAt'));
+    assert.equal(db.prepare('SELECT targetLastAt FROM actions WHERE id = ?').get('a1').targetLastAt, null);
+    db.close();
   });
 });
 

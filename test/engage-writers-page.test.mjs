@@ -184,6 +184,7 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
       assertSent(x, 'nm1');
       assert.deepEqual(x.probe.mine, [{ session: 's_1', text: '你好，在的' }]);
     });
+    test('私信：点开的不是目标会话 → target-not-found，不发', async () => assertNoSend(await dm('swap'), 'target-not-found'));
     test('私信：最后一句是我 → last-is-me', async () => assertNoSend(await dm('lastme'), 'last-is-me'));
     test('私信：没有输入框 → no-input-box', async () => assertNoSend(await dm('nobox'), 'no-input-box'));
     test('私信：回读不到', async () => assertNotReadBack(await dm('silent')));

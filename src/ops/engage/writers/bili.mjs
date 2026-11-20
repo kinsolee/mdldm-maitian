@@ -33,7 +33,7 @@ export async function runInSpace(task, params) {
     async post(url, form, csrfFields) {
       const text = await page.evaluate(async ({ url, form, csrfFields }) => {
         const csrf = (document.cookie.match(/(?:^|;\s*)bili_jct=([^;]+)/) || [])[1];
-        if (!csrf) return JSON.stringify({ code: -111, message: '页面里没有 bili_jct，没发' });
+        if (!csrf) return JSON.stringify({ code: -111, message: '页面里没有 bili_jct，没发', noCsrf: true });
         const body = new URLSearchParams(form);
         for (const k of csrfFields) body.set(k, csrf);
         const r = await fetch(url, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body });
@@ -113,6 +113,8 @@ export async function reply(api, p) {
   let sendError = null, nativeId = null, postError = null;
   try {
     const r = await api.post(`${API}/x/v2/reply/add`, strForm({ oid, type: 1, root: t.rootId, parent: t.commentId, message, plat: 1 }), ['csrf']);
+    // 页面里没有 bili_jct：根本没调发送接口，一定没发
+    if (r.noCsrf) return { uidSeen: me, blocked: 'send-error', detail: String(r.message ?? '页面里没有 bili_jct，没发'), sendAttempted: false };
     if (r.code !== 0) sendError = `reply/add code=${r.code} ${r.message ?? ''}`.trim();
     nativeId = r.data?.rpid_str ?? (r.data?.rpid == null ? null : String(r.data.rpid));
   } catch (e) { postError = errText(e); }
@@ -137,12 +139,13 @@ function confirmed(hits, n, idOf, nativeId, sendError) {
 }
 
 const msgText = (m) => { try { return JSON.parse(m.content)?.content ?? null; } catch { return null; } };
-const seqOf = (m) => Number(m?.msg_seqno ?? 0);
+// msg_seqno 真实样本已有 16 位（bigJson 转成了字符串），按 BigInt 比较，不丢精度
+const seqOf = (m) => { try { return BigInt(m?.msg_seqno ?? 0); } catch { return 0n; } };
 
 export async function sendDM(api, p) {
   const talker = String(p.target.conversationId);
   const url = `${VC}/svr_sync/v1/svr_sync/fetch_session_msgs?talker_id=${encodeURIComponent(talker)}&session_type=1&size=20&build=0&mobi_app=web`;
-  let me, lastSeq = 0, ts;
+  let me, lastSeq = 0n, ts;
   try {
     const who = await whoAmI(api, p.uid);
     if (who.done) return who.done;
@@ -163,6 +166,8 @@ export async function sendDM(api, p) {
       'msg[sender_uid]': me, 'msg[receiver_id]': talker, 'msg[receiver_type]': 1, 'msg[msg_type]': 1, 'msg[msg_status]': 0,
       'msg[content]': JSON.stringify({ content: p.text }), 'msg[timestamp]': ts, 'msg[new_face_version]': 0,
       'msg[dev_id]': devId(), from_firework: 0, build: 0, mobi_app: 'web' }), ['csrf', 'csrf_token']);
+    // 页面里没有 bili_jct：根本没调发送接口，一定没发
+    if (r.noCsrf) return { uidSeen: me, blocked: 'send-error', detail: String(r.message ?? '页面里没有 bili_jct，没发'), sendAttempted: false };
     if (r.code !== 0) sendError = `send_msg code=${r.code} ${r.message ?? ''}`.trim();
     nativeId = r.data?.msg_key == null ? null : String(r.data.msg_key);
   } catch (e) { postError = errText(e); }

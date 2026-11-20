@@ -226,6 +226,25 @@ describe('B站 sendDM（假接口）', () => {
     assert.deepEqual([r.readBack.found, r.readBack.count], [false, 1]);
   });
 
+  test('msg_seqno 超过 2^53：按 BigInt 比较，新消息不会因为丢精度被漏数', async () => {
+    const f = fakeBili({ sendVisible: false, msgs: { 777: [{ msg_seqno: '9007199254740992', sender_uid: 777, msg_type: 1, content: '{"content":"在吗"}', timestamp: 1 }] } });
+    const send = f.api.post;
+    f.api.post = async (url, form, c) => { const r = await send(url, form, c); f.st.msgs[777].push({ msg_seqno: '9007199254740993', sender_uid: Number(ME), msg_type: 1, content: JSON.stringify({ content: '你好' }), timestamp: 9, msg_key: '7400000000000000001' }); return r; };
+    const r = await sendDM(f.api, D());
+    assert.deepEqual([r.readBack.found, r.readBack.count], [true, 1]);
+  });
+
+  test('页面里没有 bili_jct（没调发送接口）：sendAttempted:false，不算一次写入', async () => {
+    for (const run of [(f) => reply(f.api, P(rootTarget)), (f) => sendDM(f.api, D())]) {
+      const f = fakeBili();
+      f.api.post = async () => ({ code: -111, message: '页面里没有 bili_jct，没发', noCsrf: true });
+      const r = await run(f);
+      assert.equal(r.sendAttempted, false);
+      assert.equal(r.blocked, 'send-error');
+      assert.equal(r.readBack, undefined);
+    }
+  });
+
   test('只数这次之后的新消息：历史里有一样的话不算', async () => {
     const f = fakeBili({ msgs: { 777: [{ msg_seqno: 1, sender_uid: Number(ME), msg_type: 1, content: '{"content":"你好"}', timestamp: 1 }, { msg_seqno: 2, sender_uid: 777, msg_type: 1, content: '{"content":"在吗"}', timestamp: 2 }] } });
     const r = await sendDM(f.api, D());

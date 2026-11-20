@@ -84,11 +84,13 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
    - 会话最后一句是我说的。
    - 对方不能收私信（`canSend=false`，例如官方号）。
    - 这个目标之前用别的 key 发过（这一条最先判，库同步后显示「已回复」也不会盖掉「点了发送没确认」）：评论回过就返回 `failed` / `already-replied`；私信在对方最后一句之后发过就返回 `failed` / `last-is-me`；之前点了发送没确认的返回 `needs_readback` / `target-needs-readback`；正在发的返回 `rejected` / `in-progress`。换 key 也绕不过去。
+     - 私信判断「对方之后有没有再说话」时，先比发信当时记下的会话时间（`actions.targetLastAt`，平台时间）和现在的 `lastAt`，相同就是没新话；再退回本机时间比较。所以本机时钟和平台时间有几秒偏差也绕不过去。
+     - 正在发（`pending`）和点了发送没确认（`needs_readback`）不看会话时间，一律拦。**私信也是保守做法**：对方之后又说了新的，也不放行，直到人工处理（见第 4 节「人工处理 needs_readback」）。
 5. **每轮上限**：每个平台每轮最多 15 条，超过返回 `rejected` / `round-limit`，下一轮恢复。一轮是一个整点小时（UTC，台湾时间也是整点对齐），只要点过发送就计数。
 6. **平台写入租约**（`engage_write_leases` 表）：同一个平台同一时间只有一个写入方。被别人持有时返回 `rejected` / `lease-busy`。租约时长是写入超时（B站 2 分钟，页面平台 6 分钟）再加 2 分钟，过期后可以接管，写完马上释放。
 7. **在账号的 space 里写**：经 runner（`src/ego-runner`）在 `kinso/<platformCode>/<uid>` 里跑写入脚本。runner 自带 S1 的 space 锁，space 被守护进程或负责人占着时返回 `failed` / `space-busy`，可以重试。写入脚本按这个顺序做：
    - 先核对页面上登录的是不是这个账号，不是就不动手。
-   - **发前重读**：看评论是不是已删、是不是已有我的回复、会话最后一句是不是我。是就返回 `failed` 和原因。抖音私信点开后要确认聊天区里是这个会话的消息，否则不发（`target-not-found`）。小红书评论只能按「昵称 + 正文」在通知页上定位，昵称或正文为空（纯图片评论）时不发，读不到自己的昵称时也不发（`no-uid`）。楼里的回复读不全（B站超过 10 页、抖音和视频号展开到上限还有没加载的）时也不发，返回 `thread-incomplete`。
+   - **发前重读**：看评论是不是已删、是不是已有我的回复、会话最后一句是不是我。是就返回 `failed` 和原因。抖音、视频号私信点开后要确认聊天区当前就是这个会话（抖音看聊天区消息的 `conversationId`，视频号看聊天区组件带的会话 id），否则不发（`target-not-found`）。B站页面里读不到 `bili_jct` 时不调发送接口，返回 `failed` / `send-error`，`sendAttempted` 为 false。小红书评论只能按「昵称 + 正文」在通知页上定位，昵称或正文为空（纯图片评论）时不发，读不到自己的昵称时也不发（`no-uid`）。楼里的回复读不全（B站超过 10 页、抖音和视频号展开到上限还有没加载的）时也不发，返回 `thread-incomplete`。
    - 发送只触发一次。
    - **发后回读**：发送前没有的、我发的、内容一样的新条目恰好 1 条才算 `sent`；发送接口返回了新 id 的（B站），那一条还必须就是它；发送接口明确报错时，回读到一样的也不算。否则记 `needs_readback`，**绝不重试**。
 8. **回执**：`sent` 之后，`eventId` 和这个目标所有还没回执的同类事件都会自动回执成 `replied`，`actionId` 记进事件。
@@ -114,7 +116,21 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 | `sendAttempted` | 点过发送为 1 |
 | `readBack` | 回读结果，JSON 格式 |
 | `roundKey` | 整点小时，例如 `2026-11-21T03` |
+| `targetLastAt` | `send_dm` 发信时库里会话的 `lastAt`（平台时间）；回复评论为空 |
 | `createdAt`、`finishedAt` | 开始和结束时间 |
+
+### 人工处理 needs_readback
+
+`needs_readback` 的记录会一直拦住同一个 key 和同一个目标（评论、私信会话），换 key 也不行。去平台上看过之后，在库里把那一行改掉：
+
+```sh
+# 平台上确实发出了（只有一条）：记成 sent，之后按已发出处理
+sqlite3 data/ops.db "UPDATE actions SET status = 'sent', reason = 'human-confirmed' WHERE id = '<actionId>' AND status = 'needs_readback'"
+# 平台上确实没发出：记成 failed，之后可以再发
+sqlite3 data/ops.db "UPDATE actions SET status = 'failed', reason = 'human-cleared' WHERE id = '<actionId>' AND status = 'needs_readback'"
+```
+
+`actionId` 在调用返回的 `actionId` 或 `previousActionId` 里，也可以用下面查最近写入的 SQL 找。
 
 另外两张新表：`engage_write_leases`（平台写入租约）和 `engage_write_trips`（自动关能力位的记录，`alertedAt` 是提醒真正发出的时间）。
 

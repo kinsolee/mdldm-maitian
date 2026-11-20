@@ -33,7 +33,7 @@ function renderList() {
     el.className = 'session-item';
     el.textContent = s.sessionInfo.nickname + '：' + s.messageList[0].message.textMsg.content;
     el.__vue__ = { $props: { session: s.sessionInfo } };
-    el.onclick = () => { openId = id; renderPanel(); };
+    el.onclick = () => { openId = mode === 'swap' ? sessionList[1][0] : id; renderPanel(); };
     l.appendChild(el);
   }
 }
@@ -42,6 +42,8 @@ function renderPanel() {
   const s = sessionList.find(([id]) => id === openId)[1];
   const p = sr.querySelector('.chat-panel');
   p.innerHTML = '';
+  // 仿 Vue：聊天区组件的 props 里带当前会话
+  p.__vue__ = { $props: { session: s.sessionInfo } };
   for (const m of [...s.messageList].reverse()) { const d = document.createElement('div'); d.textContent = m.message.textMsg.content; p.appendChild(d); }
   if (mode === 'nobox') return;
   const f = document.createElement('div');

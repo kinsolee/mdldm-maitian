@@ -143,6 +143,16 @@ async function prepareDM({ page, params, t }) {
   const box = await waitFor(() => mark(page, 'box', `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
     const all = [...sr.querySelectorAll('textarea.edit_area')].filter((e) => e.getClientRects().length);
     return all.length === 1 ? all[0] : null;`), t.boxMs);
+  // 点开的必须是这个会话：从输入框往上找聊天区组件，它 props / data 里带的会话 id 要等于 sid（同抖音按 conversationId 核对）
+  const openedSid = await inPage(page, `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
+    const box = sr.querySelector('textarea.edit_area');
+    const idOf = (v) => (v && typeof v === 'object' ? v.sessionId ?? v.sessionInfo?.sessionId ?? null : null);
+    for (let e = box, i = 0; e && i < 12; e = e.parentElement || e.getRootNode()?.host, i++) {
+      const vm = e.__vue__; if (!vm) continue;
+      for (const bag of [vm.$props, vm.$data]) for (const v of Object.values(bag ?? {})) { const id = idOf(v); if (id != null) return String(id); }
+    }
+    return null;`);
+  if (box && openedSid !== sid) return { blocked: 'target-not-found', detail: openedSid ? `点开的是会话 ${openedSid}，不是 ${sid}，没发` : `点开后读不到聊天区当前是哪个会话，核对不了是不是 ${sid}，没发` };
   const now = find(await sessions(page));
   if (now && lastIsMe(now)) return { blocked: 'last-is-me', detail: '打开会话后看到最后一句是我说的' };
   if (!box) return { blocked: 'no-input-box', detail: '打开会话后没有唯一的输入框（textarea.edit_area）' };

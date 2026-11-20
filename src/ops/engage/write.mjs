@@ -90,10 +90,10 @@ function eventMatches(db, req) {
 function insertAction(db, req, fields, now) {
   const id = `act_${randomUUID()}`;
   const at = iso(now());
-  db.prepare(`INSERT INTO actions (id, op, caller, accountId, platformCode, targetId, textHash, idempotencyKey, eventId, status, reason, detail, sendAttempted, readBack, roundKey, createdAt, finishedAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, req.op, req.caller, fields.accountId ?? null, req.platformCode, req.targetId, sha256(req.text),
+  db.prepare(`INSERT INTO actions (id, op, caller, accountId, platformCode, targetId, textHash, idempotencyKey, eventId, status, reason, detail, sendAttempted, readBack, roundKey, createdAt, finishedAt, targetLastAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, req.op, req.caller, fields.accountId ?? null, req.platformCode, req.targetId, sha256(req.text),
     req.idempotencyKey, req.eventId, fields.status, fields.reason ?? null, fields.detail ?? null, fields.sendAttempted ? 1 : 0,
-    fields.readBack ? JSON.stringify(fields.readBack) : null, roundKeyOf(now()), at, fields.status === 'pending' ? null : at);
+    fields.readBack ? JSON.stringify(fields.readBack) : null, roundKeyOf(now()), at, fields.status === 'pending' ? null : at, fields.targetLastAt ?? null);
   return id;
 }
 
@@ -111,17 +111,24 @@ const otherTarget = (db, req, since) => db.prepare(`SELECT id FROM actions WHERE
   .get(req.idempotencyKey, since, req.targetId, req.op);
 
 /**
- * 同一个目标之前（换了别的 key）发过、或点了发送没确认的：评论回过就不再回；私信只看对方最后一句之后的。
- * 返回 [status, reason, detail, previousActionId] 或 null。
+ * 同一个目标之前（换了别的 key）在发、点了发送没确认、或已发过的。返回 [status, reason, detail, previousActionId] 或 null。
+ * - pending：任何时候都拦（in-progress），不看会话时间。
+ * - needs_readback：任何时候都拦，私信也一样，对方之后又说了新的也不放行，要人工处理（见 S7 文档）。
+ * - sent：评论回过就不再回；私信只拦「对方最后一句之前」发的。判断时先比发信时记下的平台时间 targetLastAt（同一个 lastAt 就是没新话），
+ *   再退回本机时间 createdAt >= lastAt；本机时钟和平台时间有偏差也绕不过去。
  */
 function targetPrior(db, req, row) {
-  const after = req.op === 'sendDM' && row.lastBy === 'peer' && row.lastAt ? row.lastAt : '';
-  const p = db.prepare(`SELECT id, status, createdAt FROM actions WHERE op = ? AND targetId = ? AND status IN ('sent', 'needs_readback', 'pending') AND createdAt >= ?
-    ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId, after);
-  if (!p) return null;
-  if (p.status === 'pending') return ['rejected', 'in-progress', '这个目标正在发', p.id];
-  if (p.status === 'needs_readback') return ['needs_readback', 'target-needs-readback', `这个目标 ${p.createdAt} 点了发送没回读到，不再发，请人工去平台上看`, p.id];
-  return ['failed', req.op === 'reply' ? 'already-replied' : 'last-is-me', `这个目标 ${p.createdAt} 已经发过（${p.id}）`, p.id];
+  const p = db.prepare(`SELECT id, status, createdAt FROM actions WHERE op = ? AND targetId = ? AND status IN ('pending', 'needs_readback')
+    ORDER BY status = 'pending' DESC, createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId);
+  if (p?.status === 'pending') return ['rejected', 'in-progress', '这个目标正在发', p.id];
+  if (p) return ['needs_readback', 'target-needs-readback', `这个目标 ${p.createdAt} 点了发送没回读到，不再发，请人工去平台上看`, p.id];
+  const peerAfter = req.op === 'sendDM' && row.lastBy === 'peer' && row.lastAt ? row.lastAt : null;
+  const s = peerAfter
+    ? db.prepare(`SELECT id, createdAt FROM actions WHERE op = ? AND targetId = ? AND status = 'sent' AND (targetLastAt = ? OR createdAt >= ?)
+        ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId, peerAfter, peerAfter)
+    : db.prepare(`SELECT id, createdAt FROM actions WHERE op = ? AND targetId = ? AND status = 'sent' ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId);
+  if (!s) return null;
+  return ['failed', req.op === 'reply' ? 'already-replied' : 'last-is-me', `这个目标 ${s.createdAt} 已经发过（${s.id}）`, s.id];
 }
 
 /** 进程崩溃、被杀留下的 pending：超过 PENDING_STALE_MS 的一律记 needs_readback（不知道点没点发送），并按连续失败判断要不要关写能力位。 */
@@ -282,7 +289,7 @@ export async function engageWrite(db, input, deps = {}) {
     if (blocked) return done({ status: 'failed', reason: blocked[0], detail: blocked[1], accountId });
     const used = db.prepare(`SELECT count(*) n FROM actions WHERE platformCode = ? AND roundKey = ? AND (sendAttempted = 1 OR status = 'pending')`).get(req.platformCode, roundKeyOf(now())).n;
     if (used >= ROUND_LIMIT) return done({ status: 'rejected', reason: 'round-limit', detail: `${PLATFORM_NAMES[req.platformCode]}这一轮（整点小时）已发 ${used} 条，上限 ${ROUND_LIMIT}`, accountId });
-    const actionId = insertAction(db, req, { status: 'pending', accountId }, now);
+    const actionId = insertAction(db, req, { status: 'pending', accountId, targetLastAt: req.op === 'sendDM' ? t.row.lastAt ?? null : null }, now);
     const held = takeLease(db, req.platformCode, actionId, now);
     if (held) {
       finishAction(db, actionId, { status: 'rejected', reason: 'lease-busy', detail: `${PLATFORM_NAMES[req.platformCode]}正有别的写入方在写（到 ${held.expiresAt}）` }, now);

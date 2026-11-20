@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS actions (
   id TEXT PRIMARY KEY, op TEXT NOT NULL, caller TEXT, accountId TEXT, platformCode TEXT NOT NULL, targetId TEXT NOT NULL,
   textHash TEXT NOT NULL, idempotencyKey TEXT NOT NULL, eventId TEXT,
   status TEXT NOT NULL, reason TEXT, detail TEXT, sendAttempted INTEGER NOT NULL DEFAULT 0, readBack TEXT,
-  roundKey TEXT NOT NULL, createdAt TEXT NOT NULL, finishedAt TEXT
+  roundKey TEXT NOT NULL, createdAt TEXT NOT NULL, finishedAt TEXT,
+  targetLastAt TEXT   -- send_dm 发信时库里会话的 lastAt（平台时间），用它判断「对方之后有没有再说话」，不拿本机时钟和平台时间比
 );
 CREATE INDEX IF NOT EXISTS actions_key ON actions (idempotencyKey, createdAt);
 CREATE INDEX IF NOT EXISTS actions_round ON actions (platformCode, roundKey);
@@ -81,4 +82,6 @@ CREATE TABLE IF NOT EXISTS engage_write_trips (id TEXT PRIMARY KEY, platformCode
 INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'comments', min(firstSeenAt) FROM comments GROUP BY accountId;
 INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt) FROM conversations GROUP BY accountId;
 `);
+  // 本分支早期建的 actions 没有 targetLastAt
+  if (!db.prepare('PRAGMA table_info(actions)').all().some((c) => c.name === 'targetLastAt')) db.exec('ALTER TABLE actions ADD COLUMN targetLastAt TEXT');
 }
