@@ -51,11 +51,17 @@ const READ_TOOLS = [
 
 const reply = (value) => ({ content: [{ type: 'text', text: JSON.stringify(value, null, 1) }] });
 
-export function buildServer(db, { scope = 'read', log = (s) => console.error(s) } = {}) {
+export const READ_TOOL_NAMES = READ_TOOLS.map(([name]) => name);
+
+/** tools：只注册这几个工具（不传是 read 组全部）。名字不在 read 组里直接抛错，免得拼错后悄悄少一个。 */
+export function buildServer(db, { scope = 'read', tools = null, log = (s) => console.error(s) } = {}) {
   if (!SCOPES.includes(scope)) throw new Error(`--scope 只能是 ${SCOPES.join('、')}：${scope}`);
   if (scope !== 'read') log(`[maitian-mcp] --scope ${scope}：写工具还没做（S6a 只有 read 组），只注册 read 组`);
+  const unknown = (tools ?? []).filter((t) => !READ_TOOL_NAMES.includes(t));
+  if (unknown.length) throw new Error(`不在 read 组里的工具：${unknown.join('、')}`);
   const server = new McpServer({ name: 'maitian', version: '0.3.0' });
   for (const [name, description, inputSchema, run] of READ_TOOLS) {
+    if (tools && !tools.includes(name)) continue;
     server.registerTool(name, { description, inputSchema }, async (args) => {
       try { return reply(await run(db, args ?? {})); } catch (e) { return { isError: true, content: [{ type: 'text', text: e.message }] }; }
     });
