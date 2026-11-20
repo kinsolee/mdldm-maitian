@@ -29,13 +29,17 @@ export async function probeMcp(url, token, timeoutMs = PROBE_TIMEOUT_MS) {
   const client = new Client({ name: 'maitian-web-probe', version: '1' });
   let timer;
   try {
-    const run = (async () => { await client.connect(transport); return (await client.listTools()).tools.map((t) => t.name).sort(); })();
-    const tools = await Promise.race([run, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('超时')), timeoutMs); })]);
-    const extra = tools.filter((t) => !CINDY_TOOLS.includes(t));
-    return { ok: extra.length === 0 && tools.length === CINDY_TOOLS.length, tools, ...(extra.length ? { error: `多出了工具：${extra.join('、')}` } : {}) };
+    const run = (async () => { await client.connect(transport); return (await client.listTools()).tools.map((t) => String(t.name)); })();
+    const names = await Promise.race([run, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('超时')), timeoutMs); })]);
+    // 三个工具各出现且只出现一次，不多不少；只回报认识的名字，对方返回的任何文字都不进状态接口
+    const want = [...CINDY_TOOLS].sort();
+    const ok = names.length === want.length && [...names].sort().every((n, i) => n === want[i]);
+    const tools = want.filter((t) => names.includes(t));
+    return ok ? { ok: true, tools } : { ok: false, tools, error: '工具列表不是预期的三个只读工具' };
   } catch (e) {
+    // 错误文案固定：MCP 的错误正文可能回显请求头（含 token），一个字都不往外带
     const msg = String(e?.message || e);
-    return { ok: false, error: /ECONNREFUSED|fetch failed/.test(msg) ? '服务没在跑（127.0.0.1 上连不上）' : /401|unauthorized/i.test(msg) ? 'token 对不上' : msg.slice(0, 200) };
+    return { ok: false, error: /ECONNREFUSED|fetch failed/.test(msg) ? '服务没在跑（127.0.0.1 上连不上）' : /401|unauthorized/i.test(msg) ? 'token 对不上' : msg === '超时' ? '连接超时' : '连接失败'};
   } finally {
     clearTimeout(timer);
     await client.close().catch(() => {});
@@ -45,8 +49,10 @@ export async function probeMcp(url, token, timeoutMs = PROBE_TIMEOUT_MS) {
 async function probeReceiver(port) {
   try {
     const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+    if (!r.ok) return { ok: false, error: `接收端不健康（HTTP ${r.status}）` };
     const j = await r.json();
-    return r.ok ? { ok: true, ...j } : { ok: false, error: j.error || String(r.status) };
+    const n = (v) => (Number.isFinite(v) ? v : null);   // 只取三个数字，别的字段一律不带
+    return { ok: true, total: n(j.total), processed: n(j.processed), pending: n(j.pending) };
   } catch { return { ok: false, error: '接收端没在跑' }; }
 }
 

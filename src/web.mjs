@@ -112,13 +112,13 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 // 本机直连：来源是回环地址、Host 是 localhost / 127.0.0.1、没有代理头。cloudflared 也从本机连进来，所以要看 Host 和代理头
 function localOnly(req) {
   const host = String(req.headers.host || '').replace(/:\d+$/, '').toLowerCase();
-  const proxied = ['x-forwarded-for', 'x-forwarded-host', 'cf-connecting-ip', 'cf-ray', 'forwarded'].some((h) => req.headers[h]);
+  const proxied = Object.keys(req.headers).some((h) => /^(x-forwarded-|x-real-ip$|forwarded$|via$|cf-|cdn-loop$|true-client-ip$|x-original-)/.test(h));
   return LOOPBACK.has(req.socket.remoteAddress) && (host === 'localhost' || host === '127.0.0.1') && !proxied;
 }
-// 防跨站：POST 必须带同源的 Origin（浏览器 fetch 都会带）
+// 防跨站：POST 必须带 Origin，且正好是本机 http 页面本身（协议、主机、端口都对上；浏览器 fetch 都会带）
 function sameOrigin(req) {
-  const o = req.headers.origin;
-  try { return !!o && new URL(o).host === req.headers.host; } catch { return false; }
+  const o = String(req.headers.origin || '').toLowerCase();
+  return !!o && o === `http://${String(req.headers.host || '').toLowerCase()}`;
 }
 
 async function handle(req, res) {
@@ -154,6 +154,7 @@ async function handle(req, res) {
   if (u.pathname === '/works') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'works.html')), 'text/html; charset=utf-8');   // KIN-330：ops.db 的作品
   if (u.pathname === '/api/ops/works') return send(res, 200, readWorksView(opsDbPath(), { platform: u.searchParams.get('platform') || undefined }));
   if (u.pathname === '/cindy') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'cindy.html')), 'text/html; charset=utf-8');   // KIN-325：Cindy 接入
+  if (u.pathname === '/api/cindy/status' && req.method !== 'GET') return send(res, 405, { error: '只支持 GET' });
   if (u.pathname === '/api/cindy/status') return send(res, 200, { ...(await cindyStatus()), local: localOnly(req) });
   if (u.pathname === '/api/cindy/token' && req.method === 'POST') {
     // 取 token、换 token 只给本机：MCP 本来就只在 127.0.0.1 上，远程（隧道、局域网）拿到 token 没用，只会多一处泄漏

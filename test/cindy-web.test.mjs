@@ -69,6 +69,55 @@ describe('admin：token 和链路状态', () => {
   });
 });
 
+describe('探测结果不回显对方的内容', () => {
+  // 假 MCP：initialize 照常，tools/list 按 mode 回；mode=leak 时回 500，正文里带 Authorization
+  async function fakeMcp(mode) {
+    return listen(() => (req, res) => {
+      let b = ''; req.on('data', (d) => { b += d; });
+      req.on('end', () => {
+        const m = JSON.parse(b || '{}');
+        const reply = (result) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ jsonrpc: '2.0', id: m.id, result })); };
+        if (m.method === 'initialize') return reply({ protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '0' } });
+        if (!('id' in m)) { res.writeHead(202); return res.end(); }
+        if (mode === 'leak') { res.writeHead(500); return res.end(`boom ${req.headers.authorization}`); }
+        const names = mode === 'dup' ? ['get_comment_thread', 'get_comment_thread', 'get_conversation'] : ['get_comment_thread', 'get_conversation', 'get_work', 'ack_event'];
+        reply({ tools: names.map((name) => ({ name, inputSchema: { type: 'object' } })) });
+      });
+    });
+  }
+
+  test('错误正文里有 token：状态里只有固定文案', async () => {
+    const srv = await fakeMcp('leak');
+    try {
+      const token = 'T'.repeat(43);
+      const r = await probeMcp(`http://127.0.0.1:${srv.port}/mcp`, token);
+      assert.equal(r.ok, false);
+      assert.ok(!JSON.stringify(r).includes(token), JSON.stringify(r));
+    } finally { await srv.close(); }
+  });
+
+  test('重复名字凑够三个、或多出工具：都不算通', async () => {
+    for (const mode of ['dup', 'extra']) {
+      const srv = await fakeMcp(mode);
+      try {
+        const r = await probeMcp(`http://127.0.0.1:${srv.port}/mcp`, 'T'.repeat(43));
+        assert.equal(r.ok, false, mode);
+        assert.ok(!JSON.stringify(r).includes('ack_event'));
+      } finally { await srv.close(); }
+    }
+  });
+
+  test('接收端健康检查只带三个数字', async () => {
+    const dir = tmp();
+    const srv = await listen(() => (req, res) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, total: 3, processed: 1, pending: 2, secret: 'leak' })); });
+    try {
+      fs.writeFileSync(path.join(dir, '.env'), `CINDY_INBOX_DB=${path.join(dir, 'i.db')}\nCINDY_LEDGER_FILE=${path.join(dir, 'l.jsonl')}\nRECEIVER_PORT=${srv.port}\nCINDY_MCP_PORT=1\n`);
+      const st = await cindyStatus({ envFile: path.join(dir, '.env') });
+      assert.deepEqual(st.receiver, { ok: true, total: 3, processed: 1, pending: 2 });
+    } finally { await srv.close(); }
+  });
+});
+
 describe('网页接口（起真的网页服务）', () => {
   async function serve(run) {
     const dir = tmp(), f = envFile(dir, 'CINDY_MCP_PORT=1\n');
@@ -113,6 +162,11 @@ describe('网页接口（起真的网页服务）', () => {
       assert.equal((await req('POST', '/api/cindy/token', { host: 'maitian.example.com', origin: 'https://maitian.example.com' })).status, 403);
       assert.equal((await req('POST', '/api/cindy/token', { ...origin, 'cf-connecting-ip': '1.2.3.4' })).status, 403);
       assert.equal((await req('POST', '/api/cindy/token', { ...origin, 'x-forwarded-for': '1.2.3.4' })).status, 403);
+      assert.equal((await req('POST', '/api/cindy/token', { ...origin, 'x-forwarded-proto': 'https' })).status, 403);
+      assert.equal((await req('POST', '/api/cindy/token', { ...origin, via: '1.1 proxy' })).status, 403);
+      assert.equal((await req('POST', '/api/cindy/token?rotate=1', { origin: `https://localhost:${port}` })).status, 403, '跨协议');
+      assert.equal((await req('POST', '/api/cindy/token?rotate=1', { origin: `http://localhost:${port + 1}` })).status, 403, '跨端口');
+      assert.equal((await req('POST', '/api/cindy/status')).status, 405);
       assert.equal(JSON.parse((await req('GET', '/api/cindy/status', { host: 'maitian.example.com' })).body).local, false);
       assert.equal(readToken(f), token);
 
