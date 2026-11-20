@@ -1,5 +1,6 @@
 // Cindy 侧配置：只从环境变量（integrations/cindy/.env）读。密钥不写日志、不打印。
 // .env 的读写和权限收紧直接用 OpenBot 那份（integrations/openbot/config.mjs），不改它。
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadEnvFile as loadEnv } from '../openbot/config.mjs';
@@ -19,6 +20,13 @@ export const loadEnvFile = (file = ENV_FILE) => loadEnv(file);
 /** 收件箱和对照文件的位置。inbox.mjs（给 Cindy 用）只需要这两样，不碰密钥。对照文件必须是 .jsonl，且不能是 OpenBot 的文件。 */
 export function readPaths(env = process.env) {
   const ledger = path.resolve(env.CINDY_LEDGER_FILE || DEFAULT_LEDGER);
+  // 对照文件本身不能是符号链接（否则 record 会沿链接写到别处，比如 OpenBot 的正式文件）
+  let st = null;
+  try { st = fs.lstatSync(ledger); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (st?.isSymbolicLink()) {
+    const target = fs.realpathSync(ledger);
+    throw new Error(`CINDY_LEDGER_FILE 不能是符号链接（指向 ${OPENBOT_FILES.includes(path.basename(target)) ? 'OpenBot 的文件' : target}）：${ledger}`);
+  }
   if (OPENBOT_FILES.includes(path.basename(ledger)) || path.extname(ledger) !== '.jsonl') {
     throw new Error(`CINDY_LEDGER_FILE 要是单独的 .jsonl 对照文件，不能指向 OpenBot 的记录、待确认或话术文件：${ledger}`);
   }

@@ -73,17 +73,19 @@ export async function backfillOnce({ inbox, listEvents, types, now = Date.now })
   const startedAt = now();
   const mark = inbox.watermark();
   const since = new Date(Number.isFinite(mark) ? mark - BACKFILL_OVERLAP_MS : startedAt - BACKFILL_FIRST_WINDOW_MS).toISOString();
+  // 先把所有页读完、校验完，再一次写进收件箱：任何一页出错，这一轮一条都不收
   let cursor;
-  let accepted = 0;
+  const items = [];
   for (;;) {
     const page = await listEvents({ types, since, limit: BACKFILL_PAGE, ...(cursor ? { cursor } : {}) });
     if (!page || !Array.isArray(page.items)) throw new Error('list_events 返回的不是 { items }');
     const bad = page.items.find((e) => eventProblem(e));
     if (bad) throw new Error(`list_events 返回了不合格的事件（${eventProblem(bad)}）`);
-    accepted += inbox.receive(page.items, now(), 'backfill').accepted;
+    items.push(...page.items);
     if (!page.nextCursor) break;
     cursor = page.nextCursor;
   }
+  const { accepted } = inbox.receive(items, now(), 'backfill');
   inbox.setWatermark(startedAt);
   return accepted;
 }

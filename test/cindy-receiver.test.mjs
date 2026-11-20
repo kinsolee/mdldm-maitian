@@ -557,3 +557,39 @@ describe('第 1 轮评审修复', () => {
     assert.match(md, /读不到：OpenBot 记录文件/);
   });
 });
+
+describe('第 2 轮评审修复', () => {
+  test('补漏跨页：后面一页出错时，前面几页也不进收件箱，水位不动', async () => {
+    const inbox = openInbox(':memory:');
+    inbox.setWatermark(T0);
+    const pages = [{ items: [ev('p1')], nextCursor: 'k1' }, { items: [{ ...ev('p2'), createdAt: 'nope' }], nextCursor: null }];
+    let i = 0;
+    await assert.rejects(backfillOnce({ inbox, types: ['comment.created'], now: at(T0 + MIN), listEvents: async () => pages[i++] }), /createdAt/);
+    i = 0;
+    const throwing = [{ items: [ev('p1')], nextCursor: 'k1' }];
+    await assert.rejects(backfillOnce({ inbox, types: ['comment.created'], now: at(T0 + MIN), listEvents: async () => { if (i < 1) return throwing[i++]; throw new Error('boom'); } }), /boom/);
+    assert.equal(inbox.stats().total, 0);
+    assert.equal(inbox.watermark(), T0);
+    inbox.close();
+  });
+
+  test('对照文件是指向 OpenBot 正式文件的符号链接：配置拒收，record 也不沿链接写', () => {
+    const p = paths();
+    const real = path.join(p.dir, '评论私信回复记录.md');
+    fs.writeFileSync(real, 'OpenBot 原文\n');
+    const link = path.join(p.dir, 'cindy.jsonl');
+    fs.symlinkSync(real, link);
+    assert.throws(() => readPaths({ CINDY_LEDGER_FILE: link }), /CINDY_LEDGER_FILE/);
+    const other = path.join(p.dir, 'other.jsonl');
+    fs.writeFileSync(other, '');
+    const link2 = path.join(p.dir, 'cindy2.jsonl');
+    fs.symlinkSync(other, link2);
+    assert.throws(() => readPaths({ CINDY_LEDGER_FILE: link2 }), /符号链接/);
+    const inbox = openInbox(p.stateDb);
+    inbox.receive([ev('c1')], T0);
+    assert.throws(() => recordResults({ inbox, file: link, results: [{ eventId: 'c1', category: '跳过' }] }));
+    assert.equal(fs.readFileSync(real, 'utf8'), 'OpenBot 原文\n');
+    assert.equal(inbox.pendingCount(), 1);
+    inbox.close();
+  });
+});

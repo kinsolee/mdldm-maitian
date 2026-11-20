@@ -64,7 +64,9 @@ export function recordResults({ inbox, file, results, now = Date.now }) {
 
 function appendDurably(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const fd = fs.openSync(file, 'a+', 0o600);
+  // O_NOFOLLOW：对照文件被换成符号链接时直接报错，不沿链接写
+  const { O_APPEND, O_CREAT, O_RDWR, O_NOFOLLOW } = fs.constants;
+  const fd = fs.openSync(file, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600);
   try {
     // 上次写到一半没换行时，先补一个换行，免得新行接在半行后面
     const { size } = fs.fstatSync(fd);
