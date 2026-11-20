@@ -38,7 +38,7 @@ function renderList() {
     li.innerHTML = `<div class="item-header-h">${c.name}</div><div>${JSON.parse(c.lastMessage.content).text}</div>`;
     // 仿 S0：li 的 fiber 往上 2 层 memoizedProps.item 是 IM SDK 的 Conversation
     li[FK] = { memoizedProps: {}, return: { memoizedProps: {}, return: { memoizedProps: { item: c } } } };
-    li.onclick = () => { openId = c.id; renderPanel(); };
+    li.onclick = () => { openId = mode === 'swap' ? convs[1].id : c.id; renderPanel(); };
     ul.appendChild(li);
   }
 }

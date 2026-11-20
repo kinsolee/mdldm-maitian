@@ -17,19 +17,21 @@
 const mode = new URLSearchParams(location.search).get('mode') || 'ok';
 const ME = 'me_x', ME_NICK = '麦田测试号';
 // 仿主站：页面状态里有当前登录用户（适配器的真实读法之一，不需要测试钩子）
-if (mode !== 'nouid') window.__INITIAL_STATE__ = { user: { userInfo: { user_id: ME, nickname: ME_NICK } } };
+if (mode !== 'nouid') window.__INITIAL_STATE__ = { user: { userInfo: { user_id: ME, nickname: mode === 'nonick' ? null : ME_NICK } } };
 let sendClicks = 0, seq = 0;
 const now = Math.floor(Date.now() / 1000);
 const mentions = [
   { id: 'nt1', type: 'comment/item', title: '评论了你的笔记', time: now - 600, user_info: { userid: 'u1', nickname: '甲' }, comment_info: { id: 'xc1', content: '小红书评论一，写得真好' }, item_info: { id: 'note1', xsec_token: 'tok-should-not-leak' } },
   { id: 'nt2', type: 'comment/item', title: '评论了你的笔记', time: now - 900, user_info: { userid: 'u2', nickname: '乙' }, comment_info: { id: 'xc2', content: '第二条评论' }, item_info: { id: 'note1', xsec_token: 'tok-should-not-leak' } },
 ];
+if (mode === 'img') { mentions[0].comment_info.content = ''; mentions.push({ id: 'nt3', type: 'comment/item', title: '评论了你的笔记', time: now - 1200, user_info: { userid: 'u1', nickname: '甲' }, comment_info: { id: 'xc3', content: '甲的另一条文字评论' }, item_info: { id: 'note1' } }); }
 // 仿挂钩：页面自己发的 you/mentions 响应被 installHook 抄进 window.__engCap（file:// 发不了真请求，直接放进去）
 const cap = (url, body) => (window.__engCap ||= []).push({ url, t: Date.now(), body: JSON.stringify(body) });
 cap('https://edith.xiaohongshu.com/api/sns/web/v1/you/mentions', { code: 0, success: true, data: { has_more: false, message_list: mentions } });
 
 const list = document.querySelector('.notification-list');
 for (const m of mentions) {
+  if (mode === 'img' && !m.comment_info.content) continue;   // 纯图片评论这一行没渲染出来，页面上只有同一人的另一条文字评论
   const el = document.createElement('div');
   el.className = 'container-item';
   const gone = mode === 'gone' && m.comment_info.id === 'xc1';

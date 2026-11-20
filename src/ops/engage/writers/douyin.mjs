@@ -119,8 +119,8 @@ async function prepareReply({ page, params, t, me }) {
   // 展开到上限还没加载全：看不到的那部分可能有我的旧回复，不发
   const r = list.find((x) => x.id === root);
   const loaded = list.filter((x) => x.root === root).length;
-  const unclicked = await inPage(page, `return (${EXPAND_SRC})().filter((e) => !e.dataset.engDead).length`);
-  if ((r?.total != null && loaded < r.total) || (r?.total == null && unclicked > 0)) {
+  const leftButtons = await inPage(page, `return (${EXPAND_SRC})().length`);
+  if ((r?.total != null && loaded < r.total) || (r?.total == null && leftButtons > 0)) {
     return { blocked: 'thread-incomplete', detail: `楼 ${root} 的回复没加载全（已加载 ${loaded}${r?.total != null ? ` / ${r.total}` : ''}），判断不了是否已回复，没发` };
   }
 
@@ -170,6 +170,15 @@ const MSGS_SRC = FIBER + `const out = {};
   }
   return Object.values(out);`;
 
+// 聊天区里有没有 conversationId 等于 arg 的消息对象
+const CONV_OPEN_SRC = FIBER + `for (const el of document.querySelectorAll('body *')) {
+    for (let f = __fiber(el), j = 0; f && j < 6; f = f.return, j++) {
+      const p = f.memoizedProps; if (!p || typeof p !== 'object') continue;
+      for (const v of [p, ...Object.values(p)]) if (v && typeof v === 'object' && typeof v.isFromMe === 'boolean' && v.conversationId != null && String(v.conversationId) === arg) return true;
+    }
+  }
+  return false;`;
+
 async function prepareDM({ page, params, t }) {
   const tg = params.target ?? {};
   await waitFor(async () => (await inPage(page, CONVS_SRC)).length > 0, t.loadMs, 1000);
@@ -178,10 +187,19 @@ async function prepareDM({ page, params, t }) {
   if (!c) return { blocked: 'target-not-found', detail: `私信列表里没有会话 ${tg.conversationId ?? tg.peerUid}（列表只显示最近的会话）` };
   if (c.group) return { blocked: 'cannot-send', detail: '群聊不发' };
   if (c.lastFromMe === true) return { blocked: 'last-is-me', detail: '会话最后一句是我说的' };
-  await mark(page, 'conv', `return document.querySelectorAll('li.semi-list-item')[arg] ?? null;`, c.i);
+  // 按会话 id 现找那一行（不用下标：新私信会把会话顶到前面，下标会指到别人）
+  const row = await mark(page, 'conv', `return [...document.querySelectorAll('li.semi-list-item')].find((li) => {
+    const k = Object.keys(li).find((k) => k.startsWith('__reactFiber'));
+    let f = k && li[k]; for (let j = 0; j < 2 && f; j++) f = f.return;
+    return String(f?.memoizedProps?.item?.id) === arg;
+  }) ?? null;`, c.id);
+  if (!row) return { blocked: 'target-not-found', detail: `会话 ${c.id} 在列表里找不到了` };
   await page.click(markSel('conv'), { label: 'open conversation' });
   const box = await waitFor(() => mark(page, 'box', `const all = [...document.querySelectorAll('[class*=chat-editor-] [contenteditable=true]')].filter((e) => e.getClientRects().length);
     return all.length === 1 ? all[0] : null;`), t.boxMs);
+  // 点开的必须是这个会话：聊天区里要有 conversationId 等于它的消息，否则可能开到了别人的会话
+  const opened = await waitFor(() => inPage(page, CONV_OPEN_SRC, c.id), Math.min(t.boxMs, 10000));
+  if (!opened) return { blocked: 'target-not-found', detail: `点开后聊天区里没有会话 ${c.id} 的消息，可能开错了会话，没发` };
   // 打开后再看一次最后一句（聊天区的消息比列表新）
   const msgs = await inPage(page, MSGS_SRC, c.id);
   const last = [...msgs].filter((m) => m.at != null).sort((a, b) => b.at - a.at)[0];

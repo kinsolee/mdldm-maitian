@@ -89,6 +89,10 @@ async function prepareReply({ page, params, t, me }) {
   const m = find();
   if (!m) return { blocked: 'target-not-found', detail: `通知「评论和@」里没有评论 ${id}` };
   const arg = { nick: m.user_info?.nickname ?? tg.authorNickname ?? '', content: m.comment_info?.content ?? tg.commentText ?? '', myNick: me.nickname ?? params.nickname ?? null };
+  // 页面上只能按「昵称 + 正文」定位通知行：昵称或正文为空（纯图片、表情评论）就分不清是哪条，不发
+  if (!String(arg.nick).trim() || !String(arg.content).trim()) return { blocked: 'target-not-found', detail: `评论 ${id} 的昵称或正文为空（纯图片、表情？），在页面上没法唯一定位，没发` };
+  // 判「已有我的回复」要靠我的昵称
+  if (!String(arg.myNick ?? '').trim()) return { blocked: 'no-uid', detail: '读不到当前账号的昵称，判断不了是否已回复，没发' };
   // 列表渲染不稳，实测有时 30 秒以上才出来（S0），回复入口最长等 loadMs
   await waitFor(() => page.evaluate(() => document.querySelectorAll('.action-reply').length > 0), t.loadMs, 1000);
   const at = await inPage(page, LOCATE_SRC, arg);

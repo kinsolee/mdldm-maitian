@@ -96,7 +96,7 @@ describe('engageWrite：发出、回读、幂等', () => {
     assert.deepEqual(p.params.target, { commentId: 'a', workId: 'BV1xx', parentId: 'r1', rootId: 'r1', authorUid: '9002', authorNickname: '乙', commentText: '评论a' });
   });
 
-  test('同一 idempotencyKey 24 小时内成功过 → duplicate，不再调 writer；过了 24 小时才重新走一遍', async () => {
+  test('同一 idempotencyKey 24 小时内成功过 → duplicate，不再调 writer；过了 24 小时，这条已回过的评论在库里就被拦下（already-replied）', async () => {
     const w = fakeWriter([SENT, { uidSeen: '478358005', sendAttempted: false, blocked: 'already-replied' }]);
     const first = await engageWrite(s.db, reply(), s.deps(w));
     s.tick(23 * HOUR);
@@ -106,7 +106,7 @@ describe('engageWrite：发出、回读、幂等', () => {
     assert.equal(w.calls.length, 1);
     s.tick(2 * HOUR);
     const later = await engageWrite(s.db, reply(), s.deps(w));
-    assert.equal(w.calls.length, 2);
+    assert.equal(w.calls.length, 1, '不再起 writer');
     assert.equal(later.status, 'failed');
     assert.equal(later.reason, 'already-replied');
   });
@@ -159,6 +159,58 @@ describe('engageWrite：发出、回读、幂等', () => {
     const r = await engageWrite(s.db, reply({ idempotencyKey: 'k-b1', eventId: 'comment.created:Bili:r1' }), s.deps(fakeWriter(SENT)));
     assert.deepEqual(pick(r), ['rejected', 'event-mismatch']);
     assert.equal(s.db.prepare('SELECT handledAt FROM events WHERE id = ?').get('comment.created:Bili:r1').handledAt, null);
+  });
+
+  test('G-B1：同一个 key 误用在别的目标上被拒之后，原目标再用这个 key 照样是 duplicate', async () => {
+    await engageWrite(s.db, reply({ idempotencyKey: 'k-g1' }), s.deps(fakeWriter(SENT)));
+    await engageWrite(s.db, reply({ idempotencyKey: 'k-g1-x', targetId: 'Bili:r1' }), s.deps(fakeWriter({ uidSeen: '478358005', sendAttempted: false, blocked: 'comment-gone' })));
+    const w = fakeWriter(SENT);
+    assert.equal((await engageWrite(s.db, reply({ idempotencyKey: 'k-g1', targetId: 'Bili:r1' }), s.deps(w))).reason, 'idempotency-key-reused');
+    assert.equal((await engageWrite(s.db, reply({ idempotencyKey: 'k-g1' }), s.deps(w))).status, 'duplicate');
+    // 只被拒过、没发过的 key 不占用：先在 r1 上被拒，再用到 a 上可以发
+    s.db.prepare("UPDATE accounts SET capabilities = json_set(capabilities, '$.reply', json('false'))").run();
+    await engageWrite(s.db, reply({ idempotencyKey: 'k-g1b', targetId: 'Bili:r1' }), s.deps(w));
+    s.db.prepare("UPDATE accounts SET capabilities = json_set(capabilities, '$.reply', json('true'))").run();
+    assert.notEqual((await engageWrite(s.db, reply({ idempotencyKey: 'k-g1b', targetId: 'Bili:x' }), s.deps(w))).reason, 'idempotency-key-reused');
+  });
+
+  test('G-B3：needs_readback 过了 24 小时，同一个 key 也不再发', async () => {
+    const w = fakeWriter({ uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } });
+    await engageWrite(s.db, reply(), s.deps(w));
+    s.tick(3 * 24 * HOUR);
+    assert.equal((await engageWrite(s.db, reply(), s.deps(w))).status, 'needs_readback');
+    assert.equal(w.calls.length, 1);
+  });
+
+  test('G-B4：同一条评论换了 key：之前 sent → failed already-replied；之前 needs_readback → needs_readback；都不调 writer', async () => {
+    const w = fakeWriter([SENT, { uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } }]);
+    await engageWrite(s.db, reply({ idempotencyKey: 'a1' }), s.deps(w));
+    assert.deepEqual(pick(await engageWrite(s.db, reply({ idempotencyKey: 'a2' }), s.deps(w))), ['failed', 'already-replied']);
+    await engageWrite(s.db, reply({ idempotencyKey: 'b1', targetId: 'Bili:r1' }), s.deps(w));
+    assert.equal((await engageWrite(s.db, reply({ idempotencyKey: 'b2', targetId: 'Bili:r1' }), s.deps(w))).status, 'needs_readback');
+    assert.equal(w.calls.length, 2);
+  });
+
+  test('G-B4：私信换了 key：对方之后没再说话 → 不发；对方又说了新的 → 可以再发', async () => {
+    const w = fakeWriter(SENT);
+    await engageWrite(s.db, dm({ idempotencyKey: 'd1' }), s.deps(w));
+    assert.deepEqual(pick(await engageWrite(s.db, dm({ idempotencyKey: 'd2' }), s.deps(w))), ['failed', 'last-is-me']);
+    s.tick(HOUR);
+    s.db.prepare("UPDATE conversations SET lastBy = 'peer', lastAt = ? WHERE id = 'Bili:c1'").run(new Date(T0 + 3 * HOUR).toISOString());
+    assert.equal((await engageWrite(s.db, dm({ idempotencyKey: 'd3' }), s.deps(w))).status, 'sent');
+    assert.equal(w.calls.length, 2);
+  });
+
+  test('G-B7：进程崩了留下的 pending（不是这次的 key）也会被回收成 needs_readback，并计入连续失败', async () => {
+    const ins = (id, hour) => s.db.prepare(`INSERT INTO actions (id, op, caller, accountId, platformCode, targetId, textHash, idempotencyKey, status, sendAttempted, roundKey, createdAt)
+      VALUES (?, 'reply', 't', ?, 'Bili', 'Bili:a', 'h', ?, 'pending', 0, ?, ?)`).run(id, BILI, `crash-${id}`, `2026-11-19T0${hour}`, `2026-11-19T0${hour}:10:00.000Z`);
+    ins('p1', 3); ins('p2', 4);
+    s.at(Date.parse('2026-11-19T06:00:00Z'));
+    await engageWrite(s.db, dm({ idempotencyKey: 'other' }), s.deps(fakeWriter(SENT)));
+    const rows = s.db.prepare("SELECT status, reason, sendAttempted FROM actions WHERE id IN ('p1','p2')").all();
+    assert.deepEqual(rows.map((r) => [r.status, r.reason, r.sendAttempted]), [['needs_readback', 'interrupted', 1], ['needs_readback', 'interrupted', 1]]);
+    assert.equal(getAccount(s.db, BILI).capabilities.reply, false);
+    assert.equal(s.notes.length, 1);
   });
 
   test('同一 key 用在别的目标上 → rejected', async () => {

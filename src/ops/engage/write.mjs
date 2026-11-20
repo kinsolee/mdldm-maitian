@@ -102,11 +102,34 @@ function finishAction(db, id, o, now) {
     .run(o.status, o.reason ?? null, o.detail ?? null, o.sendAttempted ? 1 : 0, o.readBack ? JSON.stringify(o.readBack) : null, iso(now()), id);
 }
 
-/** 同一个 key 24 小时内最近一次「发了或在发」的记录（sent / needs_readback / pending）。 */
-const blockingPrior = (db, key, since) => db.prepare(`SELECT * FROM actions WHERE idempotencyKey = ? AND createdAt >= ? AND status IN ('sent', 'needs_readback', 'pending')
-  ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(key, since);
-const otherTarget = (db, req, since) => db.prepare('SELECT id FROM actions WHERE idempotencyKey = ? AND createdAt >= ? AND (targetId <> ? OR op <> ?) LIMIT 1')
+// 占用一个 key 的记录：24 小时内 sent 的，以及任何时候的 needs_readback、pending（点了发送没确认的永远不重发）。
+// 被拒、没发出（failed、rejected）的不占用。
+const HOLDS_KEY = `((status = 'sent' AND createdAt >= ?) OR status IN ('needs_readback', 'pending'))`;
+/** 同一个 key 最近一次占用它的记录。 */
+const blockingPrior = (db, key, since) => db.prepare(`SELECT * FROM actions WHERE idempotencyKey = ? AND ${HOLDS_KEY} ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(key, since);
+const otherTarget = (db, req, since) => db.prepare(`SELECT id FROM actions WHERE idempotencyKey = ? AND ${HOLDS_KEY} AND (targetId <> ? OR op <> ?) LIMIT 1`)
   .get(req.idempotencyKey, since, req.targetId, req.op);
+
+/**
+ * 同一个目标之前（换了别的 key）发过、或点了发送没确认的：评论回过就不再回；私信只看对方最后一句之后的。
+ * 返回 [status, reason, detail, previousActionId] 或 null。
+ */
+function targetPrior(db, req, row) {
+  const after = req.op === 'sendDM' && row.lastBy === 'peer' && row.lastAt ? row.lastAt : '';
+  const p = db.prepare(`SELECT id, status, createdAt FROM actions WHERE op = ? AND targetId = ? AND status IN ('sent', 'needs_readback', 'pending') AND createdAt >= ?
+    ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId, after);
+  if (!p) return null;
+  if (p.status === 'pending') return ['rejected', 'in-progress', '这个目标正在发', p.id];
+  if (p.status === 'needs_readback') return ['needs_readback', 'target-needs-readback', `这个目标 ${p.createdAt} 点了发送没回读到，不再发，请人工去平台上看`, p.id];
+  return ['failed', req.op === 'reply' ? 'already-replied' : 'last-is-me', `这个目标 ${p.createdAt} 已经发过（${p.id}）`, p.id];
+}
+
+/** 进程崩溃、被杀留下的 pending：超过 PENDING_STALE_MS 的一律记 needs_readback（不知道点没点发送），并按连续失败判断要不要关写能力位。 */
+function reclaimStale(db, now) {
+  const rows = db.prepare(`SELECT id, platformCode FROM actions WHERE status = 'pending' AND createdAt < ?`).all(iso(now() - PENDING_STALE_MS));
+  for (const r of rows) finishAction(db, r.id, { status: 'needs_readback', reason: 'interrupted', detail: '上一个进程发到一半没落结果', sendAttempted: true }, now);
+  for (const code of new Set(rows.map((r) => r.platformCode))) maybeTrip(db, code, now);
+}
 
 // ---------- 租约 ----------
 
@@ -209,6 +232,7 @@ async function sendTripAlerts(db, { notify, now, log }) {
 export async function engageWrite(db, input, deps = {}) {
   const { now = Date.now, runWriter = runWriterInSpace, notify = defaultNotifyLazy, log = (s) => console.error(s) } = deps;
   const req = checkInput(input);
+  tx(db, () => reclaimStale(db, now));
   await sendTripAlerts(db, { notify, now, log });
   const out = (o) => ({ status: o.status, reason: o.reason ?? null, detail: o.detail ?? null, retryable: RETRYABLE.has(o.reason),
     op: req.op, targetId: req.targetId, accountId: o.accountId ?? null, idempotencyKey: req.idempotencyKey, eventId: req.eventId,
@@ -250,6 +274,8 @@ export async function engageWrite(db, input, deps = {}) {
     }
     const blocked = dbPrecheck(db, req, t.row);
     if (blocked) return done({ status: 'failed', reason: blocked[0], detail: blocked[1], accountId });
+    const tp = targetPrior(db, req, t.row);
+    if (tp) return done({ status: tp[0], reason: tp[1], detail: tp[2], accountId, previousActionId: tp[3] });
     const used = db.prepare(`SELECT count(*) n FROM actions WHERE platformCode = ? AND roundKey = ? AND (sendAttempted = 1 OR status = 'pending')`).get(req.platformCode, roundKeyOf(now())).n;
     if (used >= ROUND_LIMIT) return done({ status: 'rejected', reason: 'round-limit', detail: `${PLATFORM_NAMES[req.platformCode]}这一轮（整点小时）已发 ${used} 条，上限 ${ROUND_LIMIT}`, accountId });
     const actionId = insertAction(db, req, { status: 'pending', accountId }, now);

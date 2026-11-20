@@ -60,7 +60,7 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 | `status` | 含义 | 常见 `reason` |
 |---|---|---|
 | `sent` | 回读确认发出了 | — |
-| `needs_readback` | 点了发送，但没回读到（或回读到不止 1 条）。**绝不重试**，同一个 key 以后也不会再发。请人工去平台上看 | `readback-missing`、`readback-count`、`readback-mismatch`（回读到的那条和发送接口返回的 id 对不上）、`runner-timeout`、`runner-exit-code`、`previous-needs-readback`、`interrupted` |
+| `needs_readback` | 点了发送，但没回读到（或回读到不止 1 条）。**绝不重试**，同一个 key 以后也不会再发。请人工去平台上看 | `readback-missing`、`readback-count`、`readback-mismatch`（回读到的那条和发送接口返回的 id 对不上）、`target-needs-readback`、`runner-timeout`、`runner-exit-code`、`previous-needs-readback`、`interrupted` |
 | `failed` | 没发出。可能是发前重读拦下了，也可能是平台明确报了错 | 重读：`comment-gone`、`already-replied`、`last-is-me`、`cannot-send`、`target-not-found`、`thread-incomplete`（楼里的回复没读全，判断不了是否已回过）、`uid-mismatch`、`no-uid`、`login-lost`、`no-input-box`、`input-mismatch`、`precheck-error`；发送：`send-error`；space：`space-busy`、`space-user-controlled` |
 | `duplicate` | 同一个 `idempotencyKey` 24 小时内已经发出过，这次没发 | — |
 | `rejected` | 按规则拒绝，没碰平台 | `capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unknown-target`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
@@ -69,11 +69,12 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 
 一次调用按下面的顺序走。从第 1 步到第 6 步在同一个 SQLite `BEGIN IMMEDIATE` 事务里完成，所以多个 MCP 进程同时调用时也不会抢到同一个 key 或同一份租约。
 
-1. **幂等**：查同一个 `idempotencyKey` 在 24 小时内的记录。
+0. **回收**：先把超过 30 分钟还是 `pending` 的记录（进程崩了或被杀）一律记成 `needs_readback`（不知道点没点发送），并按第 9 步判断要不要自动关写能力位。
+1. **幂等**：查同一个 `idempotencyKey` 的记录（`sent` 只看 24 小时内；`needs_readback`、`pending` 不限时间）。
    - 已经 `sent`：返回 `duplicate`。如果带了还没回执的 `eventId`，顺手回执成 `replied`。
-   - 已经 `needs_readback`：返回 `needs_readback`，不再发。
+   - 已经 `needs_readback`：返回 `needs_readback`，不再发，过了 24 小时也一样。
    - 还在 `pending`：返回 `rejected` / `in-progress`。如果 `pending` 已经超过 30 分钟，说明上一个进程崩了，这条记成 `needs_readback`。
-   - 同一个 key 在 24 小时内用在了别的目标或别的操作上：返回 `rejected` / `idempotency-key-reused`。
+   - 同一个 key 已经在别的目标或别的操作上发过（或点了发送没确认）：返回 `rejected` / `idempotency-key-reused`。只被拒、没发出的调用不占用 key。
    - 之前只是 `failed` 或 `rejected`：可以再试。
 2. **目标**：评论或会话必须已经在库里（守护进程抓到过）。库里没有就返回 `rejected` / `unknown-target`。这时先调 `refresh_now`，等抓完再试。平台只认抖音、视频号、小红书、B站。
 3. **能力位**：账号的 `reply`（回复评论）或 `sendDM`（私信）能力位必须打开，没开返回 `rejected` / `capability-off`。全部能力位默认都是关的。
@@ -82,11 +83,12 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
    - 库里已经有我对这条评论的直接回复。
    - 会话最后一句是我说的。
    - 对方不能收私信（`canSend=false`，例如官方号）。
+   - 这个目标之前用别的 key 发过：评论回过就返回 `failed` / `already-replied`；私信在对方最后一句之后发过就返回 `failed` / `last-is-me`；之前点了发送没确认的返回 `needs_readback` / `target-needs-readback`；正在发的返回 `rejected` / `in-progress`。换 key 也绕不过去。
 5. **每轮上限**：每个平台每轮最多 15 条，超过返回 `rejected` / `round-limit`，下一轮恢复。一轮是一个整点小时（UTC，台湾时间也是整点对齐），只要点过发送就计数。
 6. **平台写入租约**（`engage_write_leases` 表）：同一个平台同一时间只有一个写入方。被别人持有时返回 `rejected` / `lease-busy`。租约时长是写入超时（B站 2 分钟，页面平台 6 分钟）再加 2 分钟，过期后可以接管，写完马上释放。
 7. **在账号的 space 里写**：经 runner（`src/ego-runner`）在 `kinso/<platformCode>/<uid>` 里跑写入脚本。runner 自带 S1 的 space 锁，space 被守护进程或负责人占着时返回 `failed` / `space-busy`，可以重试。写入脚本按这个顺序做：
    - 先核对页面上登录的是不是这个账号，不是就不动手。
-   - **发前重读**：看评论是不是已删、是不是已有我的回复、会话最后一句是不是我。是就返回 `failed` 和原因。楼里的回复读不全（B站超过 10 页、抖音和视频号展开到上限还有没加载的）时也不发，返回 `thread-incomplete`。
+   - **发前重读**：看评论是不是已删、是不是已有我的回复、会话最后一句是不是我。是就返回 `failed` 和原因。抖音私信点开后要确认聊天区里是这个会话的消息，否则不发（`target-not-found`）。小红书评论只能按「昵称 + 正文」在通知页上定位，昵称或正文为空（纯图片评论）时不发，读不到自己的昵称时也不发（`no-uid`）。楼里的回复读不全（B站超过 10 页、抖音和视频号展开到上限还有没加载的）时也不发，返回 `thread-incomplete`。
    - 发送只触发一次。
    - **发后回读**：发送前没有的、我发的、内容一样的新条目恰好 1 条才算 `sent`；发送接口返回了新 id 的（B站），那一条还必须就是它；发送接口明确报错时，回读到一样的也不算。否则记 `needs_readback`，**绝不重试**。
 8. **回执**：`sent` 之后，`eventId` 和这个目标所有还没回执的同类事件都会自动回执成 `replied`，`actionId` 记进事件。

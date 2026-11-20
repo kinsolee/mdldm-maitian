@@ -133,6 +133,7 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
       assert.deepEqual(x.probe.mine, [{ conv: '0:1:106:601', text: '您好，链接在主页' }]);
     });
     test('私信：最后一句是我 → last-is-me', async () => assertNoSend(await dm('lastme'), 'last-is-me'));
+    test('私信：点开的不是目标会话（列表顺序变了）→ target-not-found，不发', async () => assertNoSend(await dm('swap'), 'target-not-found'));
     test('私信：没有输入框 → no-input-box', async () => assertNoSend(await dm('nobox'), 'no-input-box'));
     test('私信：uid 不符', async () => assertNoSend(await dm('ok', { uid: '999' }), 'uid-mismatch'));
     test('私信：页面报错 → sendError', async () => { const x = await dm('fail'); assertNotReadBack(x); assert.match(x.r.sendError, /发送失败/); });
@@ -218,6 +219,8 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
     test('目标评论已删除：comment-gone', async () => assertNoSend(await reply('gone'), 'comment-gone'));
     test('已有我的回复：already-replied', async () => assertNoSend(await reply('replied'), 'already-replied'));
     test('通知里没有这条：target-not-found', async () => assertNoSend(await reply('ok', { commentId: 'nope' }), 'target-not-found'));
+    test('目标是纯图片评论（正文为空，不能按正文唯一定位）：target-not-found，不发', async () => assertNoSend(await reply('img', { commentText: '' }), 'target-not-found'));
+    test('读不到自己的昵称（判断不了已回复）：no-uid，不发', async () => assertNoSend(await reply('nonick', {}, { nickname: null }), 'no-uid'));
     test('输入框内容不一致：input-mismatch，框已清空', async () => { const x = await reply('mangle'); assertNoSend(x, 'input-mismatch'); assertCleared(x); });
     test('点了发送但回读不到', async () => { const x = await reply('silent'); assertNotReadBack(x); assert.equal(x.r.sendError, undefined); });
     test('接口 code≠0：sendError', async () => { const x = await reply('fail'); assertNotReadBack(x); assert.match(x.r.sendError, /code=-9131|评论失败/); });

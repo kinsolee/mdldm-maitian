@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS actions (
 );
 CREATE INDEX IF NOT EXISTS actions_key ON actions (idempotencyKey, createdAt);
 CREATE INDEX IF NOT EXISTS actions_round ON actions (platformCode, roundKey);
+CREATE INDEX IF NOT EXISTS actions_target ON actions (targetId, op, createdAt);
+CREATE INDEX IF NOT EXISTS actions_status ON actions (status, createdAt);
 -- 平台写入租约：同一平台同一时间只有一个写入方（跨 MCP 进程）。过期的可以接管。
 CREATE TABLE IF NOT EXISTS engage_write_leases (platformCode TEXT PRIMARY KEY, holder TEXT NOT NULL, acquiredAt TEXT NOT NULL, expiresAt TEXT NOT NULL);
 -- 连续 2 轮写入失败自动关写能力位的记录；alertedAt 是提醒真发出的时间（没发出下次调用时补发）

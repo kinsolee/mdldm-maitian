@@ -13,9 +13,15 @@ const GONE_CODES = new Set([12022, -404]);   // 12022：评论已经被删除了
 
 // —— 页面脚本（ego-browser nodejs 里跑）——
 export async function runInSpace(task, params) {
-  const page = await mainPage(task);
-  await open(page, params.urls?.[params.op === 'sendDM' ? 'dms' : 'comments'] ?? PAGES.comments);
-  await sleep(3000);
+  let page;
+  try {
+    page = await mainPage(task);
+    await open(page, params.urls?.[params.op === 'sendDM' ? 'dms' : 'comments'] ?? PAGES.comments);
+    await sleep(3000);
+  } catch (e) {
+    // 还没调任何接口，一定没发：按重读出错返回（框架记 failed、可再试），不抛成 runner 失败
+    return { uidSeen: null, blocked: 'precheck-error', detail: errText(e), sendAttempted: false };
+  }
   const api = {
     sleep,
     async get(url) {
@@ -66,7 +72,10 @@ async function thread(api, oid, root) {
     if (GONE_CODES.has(j.code)) return { gone: true, code: j.code };
     if (j.code !== 0) return { error: `reply/reply code=${j.code} ${j.message ?? ''}`.trim() };
     rootNode = j.data?.root ?? rootNode;
-    const rs = Array.isArray(j.data?.replies) ? j.data.replies : [];
+    const count0 = j.data?.page?.count;
+    // 同读适配器 X3-B1：replies 缺失或为 null 只有 page.count 明确为 0 才是空楼，否则算读不全
+    if (!Array.isArray(j.data?.replies) && !(j.data?.replies === null && count0 === 0)) return { ok: true, root: rootNode, replies, complete: false };
+    const rs = j.data.replies ?? [];
     replies.push(...rs);
     const count = j.data?.page?.count;
     if (rs.length < 20 || (Number.isFinite(count) && pn * 20 >= count)) return { ok: true, root: rootNode, replies, complete: true };

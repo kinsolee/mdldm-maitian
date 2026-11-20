@@ -135,6 +135,22 @@ describe('B站 reply（假接口）', () => {
     assert.deepEqual([r.readBack.found, r.readBack.count], [false, 1]);
   });
 
+  test('G-B6：reply/reply code=0 但 replies 为 null、page.count>0（读不全）→ 不发', async () => {
+    const f = fakeBili();
+    const get = f.api.get;
+    f.api.get = async (url) => { const j = await get(url); if (url.includes('/x/v2/reply/reply')) return { code: 0, data: { page: { count: 3 }, root: j.data.root, replies: null } }; return j; };
+    const r = await reply(f.api, P(rootTarget));
+    assert.equal(r.sendAttempted, false);
+    assert.ok(['thread-incomplete', 'target-not-found'].includes(r.blocked), r.blocked);
+    assert.equal(f.posts.length, 0);
+  });
+
+  test('G-B5：runInSpace 打开页面就出错 → precheck-error、sendAttempted:false（不抛错）', async () => {
+    const { runInSpace } = await import('../src/ops/engage/writers/bili.mjs');
+    const r = await runInSpace({ pages: async () => { throw new Error('导航超时'); } }, P(rootTarget));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false]);
+  });
+
   test('作品找不到 → target-not-found，不发', async () => {
     const f = fakeBili();
     const r = await reply(f.api, P({ ...rootTarget, workId: 'BVnone' }));
