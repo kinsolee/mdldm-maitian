@@ -10,7 +10,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { buildServer } from '../../src/mcp/server.mjs';
-import { openOpsDb } from '../../src/ops/db.mjs';
+import { DatabaseSync } from 'node:sqlite';
 import { opsDbPath } from '../../src/ops/paths.mjs';
 import { ENV_FILE, enforceEnvPerms, loadEnvFile, readEnvFile, writeEnvValue } from './config.mjs';
 
@@ -46,10 +46,15 @@ export function createMcpHttp({ db, token, port, log = defaultLog }) {
   const current = typeof token === 'function' ? token : () => token;
   if (typeof token !== 'function' && (!token || token.length < 32)) throw new Error('CINDY_MCP_TOKEN 太短或没有');
   const allowedHosts = [`127.0.0.1:${port}`, `localhost:${port}`];
-  return async function handler(req, res) {
+  // 处理函数出的任何错都在这里收住：客户端读到一半断开（aborted / ECONNRESET）不能让进程因未处理的拒绝退出
+  return (req, res) => handle(req, res).catch((e) => {
+    if (!req.destroyed && !res.writableEnded) { try { if (!res.headersSent) res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'bad request' })); } catch {} }
+    log(`请求中断：${e.code || e.message}`);
+  });
+  async function handle(req, res) {
     const send = (code, body) => { if (!res.headersSent) res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     const done = (code) => log(`${req.method} ${code}`);
-    if (!allowedHosts.includes(req.headers.host)) { send(403, { error: 'host not allowed' }); done(403); return; }
+    if (!allowedHosts.includes(String(req.headers.host ?? '').toLowerCase())) { send(403, { error: 'host not allowed' }); done(403); return; }
     if (req.url.split('?')[0] !== MCP_PATH) { send(404, { error: 'not found' }); done(404); return; }
     const tok = current();
     if (!tok || tok.length < 32 || !checkBearer(tok, req.headers.authorization)) { send(401, { error: 'unauthorized' }); done(401); return; }
@@ -77,7 +82,13 @@ export function createMcpHttp({ db, token, port, log = defaultLog }) {
       log(`处理失败：${e.message}`);
       send(500, { error: 'internal error' });
     }
-  };
+  }
+}
+
+/** 只读打开 ops.db：不建表、不迁移、不回填，文件不在就报错。三个工具都只查库。 */
+export function openOpsDbReadOnly(file) {
+  if (!fs.existsSync(file)) throw new Error(`找不到麦田库：${file}`);
+  return new DatabaseSync(file, { readOnly: true, timeout: 5000 });
 }
 
 /** token 没有就生成一个写进 .env（0600），不打印。返回 token。 */
@@ -96,7 +107,7 @@ export async function main() {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error(`CINDY_MCP_PORT 不是有效端口：${process.env.CINDY_MCP_PORT}`);
   const created = !process.env.CINDY_MCP_TOKEN;
   const dbFile = process.env.MAITIAN_OPS_DB || opsDbPath();
-  const db = openOpsDb(dbFile);
+  const db = openOpsDbReadOnly(dbFile);
   ensureToken();   // 首次启动生成；之后以 .env 里的为准
   const server = http.createServer(createMcpHttp({ db, token: tokenFromFile(ENV_FILE), port }));
   server.requestTimeout = 30_000;

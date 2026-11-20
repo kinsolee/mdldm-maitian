@@ -9,7 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { ingestSnapshot } from '../src/ops/engage/store.mjs';
 import { buildServer } from '../src/mcp/server.mjs';
-import { createMcpHttp, checkBearer, ensureToken, CINDY_TOOLS, MCP_PATH } from '../integrations/cindy/mcp-http.mjs';
+import { createMcpHttp, checkBearer, ensureToken, openOpsDbReadOnly, CINDY_TOOLS, MCP_PATH } from '../integrations/cindy/mcp-http.mjs';
 import { freshDb, douyin, comment, commentsSnap, T0, MIN, at } from './helpers/engage-fixtures.mjs';
 
 const TOKEN = 'x'.repeat(43);
@@ -104,6 +104,24 @@ describe('Cindy 麦田 MCP（HTTP）', () => {
     assert.ok(!all.includes('Douyin:a'));
   });
 
+  test('Host 大小写不敏感', async () => {
+    const r = await raw(port, { body: initBody, headers: { Authorization: `Bearer ${TOKEN}`, Host: `LOCALHOST:${port}` } });
+    assert.equal(r.status, 200);
+  });
+
+  test('客户端发到一半断开：进程不退出，之后的请求照常处理', async () => {
+    const net = await import('node:net');
+    await new Promise((resolve) => {
+      const s = net.connect(port, '127.0.0.1', () => {
+        s.write(`POST ${MCP_PATH} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{"jsonrpc":`);
+        setTimeout(() => { s.destroy(); setTimeout(resolve, 50); }, 50);
+      });
+    });
+    const c = await connect();
+    await c.close();
+    assert.ok(logs.some((l) => /请求中断/.test(l)));
+  });
+
   test('token 太短拒绝启动', () => {
     assert.throws(() => createMcpHttp({ db, token: 'short', port }), /太短/);
   });
@@ -129,6 +147,16 @@ describe('辅助函数', () => {
     assert.match(fs.readFileSync(file, 'utf8'), /^RECEIVER_PORT=8791\nCINDY_MCP_TOKEN=\S+\n$/);
     assert.equal(ensureToken(env, file), t);
     assert.equal(ensureToken({ CINDY_MCP_TOKEN: 'keep' }, file), 'keep');
+  });
+
+  test('openOpsDbReadOnly：只读、不建库', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-ro-'));
+    assert.throws(() => openOpsDbReadOnly(path.join(dir, 'none.db')), /找不到/);
+    assert.ok(!fs.existsSync(path.join(dir, 'none.db')));
+    const file = path.join(dir, 'ops.db');
+    freshDb(file).close();
+    const ro = openOpsDbReadOnly(file);
+    try { assert.throws(() => ro.exec('CREATE TABLE x (a)'), /readonly/i); } finally { ro.close(); }
   });
 
   test('buildServer 的工具白名单拼错就抛错', () => {
