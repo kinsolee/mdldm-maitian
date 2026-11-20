@@ -84,7 +84,7 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
    - 会话最后一句是我说的。
    - 对方不能收私信（`canSend=false`，例如官方号）。
    - 这个目标之前用别的 key 发过（这一条最先判，库同步后显示「已回复」也不会盖掉「点了发送没确认」）：评论回过就返回 `failed` / `already-replied`；私信在对方最后一句之后发过就返回 `failed` / `last-is-me`；之前点了发送没确认的返回 `needs_readback` / `target-needs-readback`；正在发的返回 `rejected` / `in-progress`。换 key 也绕不过去。
-     - 私信判断「对方之后有没有再说话」时，先比发信当时记下的会话时间（`actions.targetLastAt`，平台时间）和现在的 `lastAt`，相同就是没新话；再退回本机时间比较。所以本机时钟和平台时间有几秒偏差也绕不过去。
+     - 私信判断「对方之后有没有再说话」时，只比发信当时记下的会话时间（`actions.targetLastAt`，平台时间）和现在的 `lastAt`：相同就是没新话，拦；不同就放行。不拿本机时间和平台时间比，所以两边时钟有偏差既不会重发，也不会把对方的新消息一直拦住。发信时会话还没有 `lastAt` 的记成空串，对方之后一说话就放行。`targetLastAt` 为空值（NULL）的是本分支早期建的库升级来的记录，判断不了，保守拦，要人工处理：确认对方之后说的是新话，就把那一行的 `targetLastAt` 改成当时的 `lastAt`，或者按下面「人工处理」改状态。
      - 正在发（`pending`）和点了发送没确认（`needs_readback`）不看会话时间，一律拦。**私信也是保守做法**：对方之后又说了新的，也不放行，直到人工处理（见第 4 节「人工处理 needs_readback」）。
 5. **每轮上限**：每个平台每轮最多 15 条，超过返回 `rejected` / `round-limit`，下一轮恢复。一轮是一个整点小时（UTC，台湾时间也是整点对齐），只要点过发送就计数。
 6. **平台写入租约**（`engage_write_leases` 表）：同一个平台同一时间只有一个写入方。被别人持有时返回 `rejected` / `lease-busy`。租约时长是写入超时（B站 2 分钟，页面平台 6 分钟）再加 2 分钟，过期后可以接管，写完马上释放。
@@ -116,7 +116,7 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 | `sendAttempted` | 点过发送为 1 |
 | `readBack` | 回读结果，JSON 格式 |
 | `roundKey` | 整点小时，例如 `2026-11-21T03` |
-| `targetLastAt` | `send_dm` 发信时库里会话的 `lastAt`（平台时间）；回复评论为空 |
+| `targetLastAt` | `send_dm` 发信时库里会话的 `lastAt`（平台时间；当时没有就是空串）；回复评论、以及旧库升级来的记录为 NULL |
 | `createdAt`、`finishedAt` | 开始和结束时间 |
 
 ### 人工处理 needs_readback

@@ -270,6 +270,33 @@ describe('engageWrite：发出、回读、幂等', () => {
     assert.deepEqual(pick(inner), ['rejected', 'in-progress']);
   });
 
+  test('X4-B1：本机比平台快——对方发了新消息（平台时间早于我的发信时间），照样可以回', async () => {
+    skewTo(nowMs() - 60_000);
+    const w = fakeWriter(SENT);
+    assert.equal((await engageWrite(s.db, dm({ idempotencyKey: 'fast1' }), s.deps(w))).status, 'sent');
+    skewTo(nowMs() - 3000);   // 对方的新消息，平台时间比本机发信时间还早 3 秒
+    assert.equal((await engageWrite(s.db, dm({ idempotencyKey: 'fast2' }), s.deps(w))).status, 'sent');
+    assert.equal(w.calls.length, 2);
+  });
+
+  test('X4-B1：发信时会话还没有 lastAt，对方之后说话了 → 可以回', async () => {
+    s.db.prepare("UPDATE conversations SET lastBy = NULL, lastAt = NULL WHERE id = 'Bili:c1'").run();
+    const w = fakeWriter(SENT);
+    await engageWrite(s.db, dm({ idempotencyKey: 'nl1' }), s.deps(w));
+    assert.equal(s.db.prepare("SELECT targetLastAt FROM actions WHERE idempotencyKey = 'nl1'").get().targetLastAt, '');
+    skewTo(nowMs() + 60_000);
+    assert.equal((await engageWrite(s.db, dm({ idempotencyKey: 'nl2' }), s.deps(w))).status, 'sent');
+  });
+
+  test('X4-B2：旧库升级来的 sent 私信（targetLastAt 为 NULL）判断不了，保守拦，平台时间领先也不放行', async () => {
+    skewTo(nowMs() + 5000);
+    s.db.prepare(`INSERT INTO actions (id, op, caller, accountId, platformCode, targetId, textHash, idempotencyKey, status, sendAttempted, roundKey, createdAt, finishedAt)
+      VALUES ('old1', 'sendDM', 't', ?, 'Bili', 'Bili:c1', 'h', 'oldk', 'sent', 1, ?, ?, ?)`).run(BILI, roundKeyOf(nowMs()), new Date(nowMs()).toISOString(), new Date(nowMs()).toISOString());
+    const w = fakeWriter(SENT);
+    assert.deepEqual(pick(await engageWrite(s.db, dm({ idempotencyKey: 'newk' }), s.deps(w))), ['failed', 'last-is-me']);
+    assert.equal(w.calls.length, 0);
+  });
+
   test('保守：私信点了发送没确认（needs_readback），对方之后又说了新的也不放行，直到人工处理', async () => {
     await engageWrite(s.db, dm({ idempotencyKey: 'cv1' }), s.deps(fakeWriter({ uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } })));
     s.tick(HOUR);
