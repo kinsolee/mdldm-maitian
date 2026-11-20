@@ -306,6 +306,34 @@ describe('engageWrite：发出、回读、幂等', () => {
     assert.equal(w.calls.length, 0);
   });
 
+  // 挑刺复审：needs_readback 被拦时写下的审计行（sendAttempted=0）不能变成新的拦截源
+  for (const [label, fix] of [
+    ['人工改成 failed', (db, id) => db.prepare("UPDATE actions SET status = 'failed', reason = 'human-cleared' WHERE id = ? AND status = 'needs_readback' AND sendAttempted = 1").run(id)],
+    ['人工改成 sent + 对方又发了新消息', (db, id) => {
+      const r = db.prepare("UPDATE actions SET status = 'sent', reason = 'human-confirmed' WHERE id = ? AND status = 'needs_readback' AND sendAttempted = 1").run(id);
+      if (r.changes) db.prepare("UPDATE conversations SET lastBy = 'peer', lastAt = '2026-11-19T05:00:00.000Z' WHERE id = 'Bili:c1'").run();
+      return r;
+    }],
+  ]) {
+    test(`needs_readback 被拦的审计行不锁死会话：同 key、换 key 都指向原记录，${label}后能正常发`, async () => {
+      const w = fakeWriter([{ uidSeen: '478358005', sendAttempted: true, readBack: { found: false, count: 0 } }, SENT, SENT]);
+      const a1 = await engageWrite(s.db, dm({ idempotencyKey: 'sh1' }), s.deps(w));
+      assert.equal(a1.status, 'needs_readback');
+      const same = await engageWrite(s.db, dm({ idempotencyKey: 'sh1' }), s.deps(w));
+      assert.deepEqual([same.status, same.previousActionId], ['needs_readback', a1.actionId]);
+      const other = await engageWrite(s.db, dm({ idempotencyKey: 'sh2' }), s.deps(w));
+      assert.deepEqual([other.status, other.reason, other.previousActionId], ['needs_readback', 'target-needs-readback', a1.actionId]);
+      const again = await engageWrite(s.db, dm({ idempotencyKey: 'sh2' }), s.deps(w));
+      assert.equal(again.previousActionId, a1.actionId, '审计行不会变成新的 previousActionId');
+      assert.equal(fix(s.db, a1.actionId).changes, 1);
+      const okNew = await engageWrite(s.db, dm({ idempotencyKey: 'sh3' }), s.deps(w));
+      assert.equal(okNew.status, 'sent', JSON.stringify(okNew));
+      assert.equal(w.calls.length, 2);
+      // 文档 SQL 带 sendAttempted = 1：拿审计行的 id 改不动
+      assert.equal(fix(s.db, other.actionId).changes, 0);
+    });
+  }
+
   test('同一 key 用在别的目标上 → rejected', async () => {
     await engageWrite(s.db, reply({ idempotencyKey: 'same' }), s.deps(fakeWriter(SENT)));
     const r = await engageWrite(s.db, reply({ idempotencyKey: 'same', targetId: 'Bili:r1' }), s.deps(fakeWriter(SENT)));

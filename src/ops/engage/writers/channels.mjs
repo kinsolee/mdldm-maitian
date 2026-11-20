@@ -145,10 +145,11 @@ async function prepareDM({ page, params, t }) {
     return all.length === 1 ? all[0] : null;`), t.boxMs);
   // 点开的必须是这个会话：从输入框往上找聊天区组件，它 props / data 里带的会话 id 要等于 sid（同抖音按 conversationId 核对）
   const openedSid = await inPage(page, `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
-    const box = sr.querySelector('textarea.edit_area');
+    const box = __marked('box');   // 前面 mark 标出的那个可见输入框
     const idOf = (v) => (v && typeof v === 'object' ? v.sessionId ?? v.sessionInfo?.sessionId ?? null : null);
     for (let e = box, i = 0; e && i < 12; e = e.parentElement || e.getRootNode()?.host, i++) {
       const vm = e.__vue__; if (!vm) continue;
+      for (const bag of [vm.$props, vm.$data]) { const own = idOf(bag); if (own != null) return String(own); }
       for (const bag of [vm.$props, vm.$data]) for (const v of Object.values(bag ?? {})) { const id = idOf(v); if (id != null) return String(id); }
     }
     return null;`);

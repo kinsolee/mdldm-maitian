@@ -121,23 +121,23 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 
 ### 人工处理 needs_readback
 
-`needs_readback` 的记录会一直拦住同一个 key 和同一个目标（评论、私信会话），换 key 也不行。去平台上看过之后，在库里把那一行改掉：
+`needs_readback` 的记录（`sendAttempted = 1`，真点过发送或发到一半中断的）会一直拦住同一个 key 和同一个目标（评论、私信会话），换 key 也不行。之后每次被拦，`actions` 里还会多记一行 `needs_readback`、`sendAttempted = 0` 的审计行，它只是记录，不拦任何调用，也不用处理。去平台上看过之后，把原记录改掉：
 
 ```sh
 # 平台上确实发出了（只有一条）：记成 sent，之后按已发出处理
-sqlite3 data/ops.db "UPDATE actions SET status = 'sent', reason = 'human-confirmed' WHERE id = '<actionId>' AND status = 'needs_readback'"
+sqlite3 data/ops.db "UPDATE actions SET status = 'sent', reason = 'human-confirmed' WHERE id = '<actionId>' AND status = 'needs_readback' AND sendAttempted = 1"
 # 平台上确实没发出：记成 failed，之后可以再发
-sqlite3 data/ops.db "UPDATE actions SET status = 'failed', reason = 'human-cleared' WHERE id = '<actionId>' AND status = 'needs_readback'"
+sqlite3 data/ops.db "UPDATE actions SET status = 'failed', reason = 'human-cleared' WHERE id = '<actionId>' AND status = 'needs_readback' AND sendAttempted = 1"
 ```
 
-`actionId` 在调用返回的 `actionId` 或 `previousActionId` 里，也可以用下面查最近写入的 SQL 找。
+`<actionId>` 取法：第一次返回 `needs_readback` 的那次调用，用它返回的 `actionId`；之后被拦的调用，用返回里的 `previousActionId`（总是指向原记录），**不要**用被拦调用自己的 `actionId`（那是审计行，上面的 SQL 带了 `sendAttempted = 1`，改不动它）。也可以用下面查最近写入的 SQL 找 `sendAttempted = 1` 的那一行。
 
 另外两张新表：`engage_write_leases`（平台写入租约）和 `engage_write_trips`（自动关能力位的记录，`alertedAt` 是提醒真正发出的时间）。
 
 查最近的写入：
 
 ```sh
-sqlite3 data/ops.db "SELECT createdAt, op, targetId, status, reason, json_extract(readBack,'$.count') FROM actions ORDER BY createdAt DESC LIMIT 20"
+sqlite3 data/ops.db "SELECT id, createdAt, op, targetId, status, reason, sendAttempted, json_extract(readBack,'$.count') FROM actions ORDER BY createdAt DESC LIMIT 20"
 ```
 
 ## 5. 各平台现状

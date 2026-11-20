@@ -102,9 +102,11 @@ function finishAction(db, id, o, now) {
     .run(o.status, o.reason ?? null, o.detail ?? null, o.sendAttempted ? 1 : 0, o.readBack ? JSON.stringify(o.readBack) : null, iso(now()), id);
 }
 
-// 占用一个 key 的记录：24 小时内 sent 的，以及任何时候的 needs_readback、pending（点了发送没确认的永远不重发）。
-// 被拒、没发出（failed、rejected）的不占用。
-const HOLDS_KEY = `((status = 'sent' AND createdAt >= ?) OR status IN ('needs_readback', 'pending'))`;
+// 占用一个 key 的记录：24 小时内 sent 的，以及任何时候的 pending、真点过发送的 needs_readback（点了发送没确认的永远不重发）。
+// 被拒、没发出（failed、rejected）的不占用。needs_readback 被拦时也会记一行 needs_readback（sendAttempted=0，只是审计），
+// 它不占用：否则人工把原记录改掉之后，审计行还会一直拦着。真发过或中断回收的 needs_readback 一定是 sendAttempted=1。
+const REAL_NEEDS_READBACK = `(status = 'needs_readback' AND sendAttempted = 1)`;
+const HOLDS_KEY = `((status = 'sent' AND createdAt >= ?) OR status = 'pending' OR ${REAL_NEEDS_READBACK})`;
 /** 同一个 key 最近一次占用它的记录。 */
 const blockingPrior = (db, key, since) => db.prepare(`SELECT * FROM actions WHERE idempotencyKey = ? AND ${HOLDS_KEY} ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(key, since);
 const otherTarget = (db, req, since) => db.prepare(`SELECT id FROM actions WHERE idempotencyKey = ? AND ${HOLDS_KEY} AND (targetId <> ? OR op <> ?) LIMIT 1`)
@@ -118,7 +120,7 @@ const otherTarget = (db, req, since) => db.prepare(`SELECT id FROM actions WHERE
  *   绝不拿本机时间和平台时间比。发信时会话还没有 lastAt 的记成 ''（对方之后一说话就放行）；targetLastAt 为 NULL 的是旧库升级来的、判断不了，保守拦。
  */
 function targetPrior(db, req, row) {
-  const p = db.prepare(`SELECT id, status, createdAt FROM actions WHERE op = ? AND targetId = ? AND status IN ('pending', 'needs_readback')
+  const p = db.prepare(`SELECT id, status, createdAt FROM actions WHERE op = ? AND targetId = ? AND (status = 'pending' OR ${REAL_NEEDS_READBACK})
     ORDER BY status = 'pending' DESC, createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId);
   if (p?.status === 'pending') return ['rejected', 'in-progress', '这个目标正在发', p.id];
   if (p) return ['needs_readback', 'target-needs-readback', `这个目标 ${p.createdAt} 点了发送没回读到，不再发，请人工去平台上看`, p.id];
