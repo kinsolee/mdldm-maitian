@@ -116,6 +116,13 @@ async function prepareReply({ page, params, t, me }) {
   const mine = (x) => x.uid != null && x.uid === String(me.uid);
   const prior = list.find((x) => mine(x) && x.id !== id && directTo(x) === id);
   if (prior) return { blocked: 'already-replied', detail: `评论 ${id} 下已有我的回复 ${prior.id}` };
+  // 展开到上限还没加载全：看不到的那部分可能有我的旧回复，不发
+  const r = list.find((x) => x.id === root);
+  const loaded = list.filter((x) => x.root === root).length;
+  const unclicked = await inPage(page, `return (${EXPAND_SRC})().filter((e) => !e.dataset.engDead).length`);
+  if ((r?.total != null && loaded < r.total) || (r?.total == null && unclicked > 0)) {
+    return { blocked: 'thread-incomplete', detail: `楼 ${root} 的回复没加载全（已加载 ${loaded}${r?.total != null ? ` / ${r.total}` : ''}），判断不了是否已回复，没发` };
+  }
 
   const found = await mark(page, 'reply', FIBER + `return [...document.querySelectorAll('[class*=operations-] > *')]
     .find((e) => e.textContent.trim() === '回复' && String(__findUp(e, __pickComment)?.cid) === arg) || null;`, id);

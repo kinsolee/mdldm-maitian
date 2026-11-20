@@ -154,6 +154,13 @@ describe('engageWrite：发出、回读、幂等', () => {
     assert.match(r.detail, /12015/);
   });
 
+  test('B1：成功过的 key 再调时带了别的目标的 eventId → rejected event-mismatch，不回执那个事件', async () => {
+    await engageWrite(s.db, reply({ idempotencyKey: 'k-b1' }), s.deps(fakeWriter(SENT)));
+    const r = await engageWrite(s.db, reply({ idempotencyKey: 'k-b1', eventId: 'comment.created:Bili:r1' }), s.deps(fakeWriter(SENT)));
+    assert.deepEqual(pick(r), ['rejected', 'event-mismatch']);
+    assert.equal(s.db.prepare('SELECT handledAt FROM events WHERE id = ?').get('comment.created:Bili:r1').handledAt, null);
+  });
+
   test('同一 key 用在别的目标上 → rejected', async () => {
     await engageWrite(s.db, reply({ idempotencyKey: 'same' }), s.deps(fakeWriter(SENT)));
     const r = await engageWrite(s.db, reply({ idempotencyKey: 'same', targetId: 'Bili:r1' }), s.deps(fakeWriter(SENT)));

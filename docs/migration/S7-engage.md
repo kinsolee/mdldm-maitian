@@ -30,7 +30,7 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 
 - `text`：1 到 1000 字，不能全是空白。
 - `idempotencyKey`：1 到 300 字，建议填事件 id。
-- `eventId`：可选。填了就必须是这个目标的事件：`reply_comment` 对应 `comment.created`，`send_dm` 对应 `dm.received`，并且事件的 `subjectId` 等于目标 id。对不上时返回 `rejected` / `event-mismatch`。
+- `eventId`：可选，在幂等判断之前核对。填了就必须是这个目标的事件：`reply_comment` 对应 `comment.created`，`send_dm` 对应 `dm.received`，并且事件的 `subjectId` 等于目标 id。对不上时返回 `rejected` / `event-mismatch`。
 
 ### 返回字段
 
@@ -60,8 +60,8 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 | `status` | 含义 | 常见 `reason` |
 |---|---|---|
 | `sent` | 回读确认发出了 | — |
-| `needs_readback` | 点了发送，但没回读到（或回读到不止 1 条）。**绝不重试**，同一个 key 以后也不会再发。请人工去平台上看 | `readback-missing`、`readback-count`、`runner-timeout`、`runner-exit-code`、`previous-needs-readback`、`interrupted` |
-| `failed` | 没发出。可能是发前重读拦下了，也可能是平台明确报了错 | 重读：`comment-gone`、`already-replied`、`last-is-me`、`cannot-send`、`target-not-found`、`uid-mismatch`、`no-uid`、`login-lost`、`no-input-box`、`input-mismatch`、`precheck-error`；发送：`send-error`；space：`space-busy`、`space-user-controlled` |
+| `needs_readback` | 点了发送，但没回读到（或回读到不止 1 条）。**绝不重试**，同一个 key 以后也不会再发。请人工去平台上看 | `readback-missing`、`readback-count`、`readback-mismatch`（回读到的那条和发送接口返回的 id 对不上）、`runner-timeout`、`runner-exit-code`、`previous-needs-readback`、`interrupted` |
+| `failed` | 没发出。可能是发前重读拦下了，也可能是平台明确报了错 | 重读：`comment-gone`、`already-replied`、`last-is-me`、`cannot-send`、`target-not-found`、`thread-incomplete`（楼里的回复没读全，判断不了是否已回过）、`uid-mismatch`、`no-uid`、`login-lost`、`no-input-box`、`input-mismatch`、`precheck-error`；发送：`send-error`；space：`space-busy`、`space-user-controlled` |
 | `duplicate` | 同一个 `idempotencyKey` 24 小时内已经发出过，这次没发 | — |
 | `rejected` | 按规则拒绝，没碰平台 | `capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unknown-target`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
 
@@ -86,9 +86,9 @@ MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/
 6. **平台写入租约**（`engage_write_leases` 表）：同一个平台同一时间只有一个写入方。被别人持有时返回 `rejected` / `lease-busy`。租约时长是写入超时（B站 2 分钟，页面平台 6 分钟）再加 2 分钟，过期后可以接管，写完马上释放。
 7. **在账号的 space 里写**：经 runner（`src/ego-runner`）在 `kinso/<platformCode>/<uid>` 里跑写入脚本。runner 自带 S1 的 space 锁，space 被守护进程或负责人占着时返回 `failed` / `space-busy`，可以重试。写入脚本按这个顺序做：
    - 先核对页面上登录的是不是这个账号，不是就不动手。
-   - **发前重读**：看评论是不是已删、是不是已有我的回复、会话最后一句是不是我。是就返回 `failed` 和原因。
+   - **发前重读**：看评论是不是已删、是不是已有我的回复、会话最后一句是不是我。是就返回 `failed` 和原因。楼里的回复读不全（B站超过 10 页、抖音和视频号展开到上限还有没加载的）时也不发，返回 `thread-incomplete`。
    - 发送只触发一次。
-   - **发后回读**：我发的、内容一样的新条目恰好 1 条才算 `sent`。否则记 `needs_readback`，**绝不重试**。
+   - **发后回读**：发送前没有的、我发的、内容一样的新条目恰好 1 条才算 `sent`；发送接口返回了新 id 的（B站），那一条还必须就是它；发送接口明确报错时，回读到一样的也不算。否则记 `needs_readback`，**绝不重试**。
 8. **回执**：`sent` 之后，`eventId` 和这个目标所有还没回执的同类事件都会自动回执成 `replied`，`actionId` 记进事件。
 9. **连续失败自动关**：同一个平台最近两个有写入的轮次，如果都没有一条发出，并且都有点了发送却失败的（`failed` 或 `needs_readback`），就关掉这个平台所有账号的写能力位（`reply`、`sendDM`、`likeComment`、`pinComment`），返回里 `writeDisabled: true`，并发一张飞书提醒。提醒走 `src/ops/login.mjs` 的 `defaultNotify`，和掉线提醒用同一个机器人。下面几种情况不影响这个判断：
    - 发前重读拦下的、被拒的、space 被占的，不算写入失败。

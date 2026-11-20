@@ -104,6 +104,7 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
 
     test('目标评论已删除：comment-gone', async () => assertNoSend(await reply('gone'), 'comment-gone'));
     test('目标下已有我的直接回复：already-replied', async () => assertNoSend(await reply('replied'), 'already-replied'));
+    test('展开到上限楼里还没加载全（可能藏着我的旧回复）：thread-incomplete，不发', async () => assertNoSend(await reply('stuck', {}, { maxExpand: 2 }), 'thread-incomplete'));
     test('找不到目标评论：target-not-found', async () => assertNoSend(await reply('ok', { commentId: 'nope', rootId: 'nope' }), 'target-not-found'));
 
     test('输入框内容和正文不一致：清空、不点发送', async () => {
@@ -171,6 +172,7 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
     test('读不到登录账号：no-uid', async () => assertNoSend(await reply('nouid'), 'no-uid'));
     test('目标评论已删除：comment-gone', async () => assertNoSend(await reply('gone'), 'comment-gone'));
     test('已有我的回复（按昵称判）：already-replied', async () => assertNoSend(await reply('replied'), 'already-replied'));
+    test('展开到上限还有「展开更多回复」：thread-incomplete，不发', async () => assertNoSend(await reply('stuck', {}, { maxExpand: 2 }), 'thread-incomplete'));
     test('作品里找不到目标评论：target-not-found', async () => assertNoSend(await reply('ok', { commentId: 'nope' }), 'target-not-found'));
     test('输入框内容不一致：input-mismatch，框已清空', async () => { const x = await reply('mangle'); assertNoSend(x, 'input-mismatch'); assertCleared(x); });
     test('点了发送但回读不到', async () => { const x = await reply('silent'); assertNotReadBack(x); assert.equal(x.r.sendError, undefined); });

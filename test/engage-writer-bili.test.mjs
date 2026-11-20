@@ -109,6 +109,32 @@ describe('B站 reply（假接口）', () => {
     for (const f of [gone, missing, replied]) assert.equal(f.posts.length, 0);
   });
 
+  test('B2：整楼超过 10 页读不全（我的旧回复可能在后面）→ thread-incomplete，不发', async () => {
+    const many = Array.from({ length: 205 }, (_, i) => rp(200 + i, { root: 100, parent: 100, mid: '9100' }));
+    many.push(rp(999, { root: 100, parent: 101, mid: ME, uname: '我', text: '回复 @乙 :早回过' }));
+    const f = fakeBili({ threads: { 100: { root: rp(100), replies: [rp(101, { root: 100, parent: 100, mid: '9002', uname: '乙' }), ...many] } } });
+    const r = await reply(f.api, P(subTarget));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
+    assert.equal(f.posts.length, 0);
+  });
+
+  test('B4：reply/add 报错、但这期间有人用同一账号发了同样的话 → 不算发出', async () => {
+    const f = fakeBili({ addCode: 12015 });
+    const add = f.api.post;
+    f.api.post = async (url, form, c) => { const r = await add(url, form, c); f.st.threads[100].replies.push(rp(4242, { root: 100, parent: 100, mid: ME, uname: '我', text: '谢谢' })); return r; };
+    const r = await reply(f.api, P(rootTarget));
+    assert.equal(r.readBack.found, false);
+    assert.match(r.sendError, /12015/);
+  });
+
+  test('B4：接口给了新 rpid，回读到的那条不是它 → found:false', async () => {
+    const f = fakeBili({ addVisible: false });
+    const add = f.api.post;
+    f.api.post = async (url, form, c) => { const r = await add(url, form, c); f.st.threads[100].replies.push(rp(4242, { root: 100, parent: 100, mid: ME, uname: '我', text: '谢谢' })); return r; };
+    const r = await reply(f.api, P(rootTarget));
+    assert.deepEqual([r.readBack.found, r.readBack.count], [false, 1]);
+  });
+
   test('作品找不到 → target-not-found，不发', async () => {
     const f = fakeBili();
     const r = await reply(f.api, P({ ...rootTarget, workId: 'BVnone' }));
@@ -174,6 +200,14 @@ describe('B站 sendDM（假接口）', () => {
     assert.match(a.sendError, /21046/);
     const b = await sendDM(fakeBili({ sendVisible: false }).api, D());
     assert.equal(b.readBack.found, false);
+  });
+
+  test('B4：send_msg 给的 msg_key 和回读到的那条对不上 → found:false', async () => {
+    const f = fakeBili({ sendVisible: false });
+    const send = f.api.post;
+    f.api.post = async (url, form, c) => { const r = await send(url, form, c); f.st.msgs[777].push({ msg_seqno: 5000, sender_uid: Number(ME), msg_type: 1, content: JSON.stringify({ content: '你好' }), timestamp: 9, msg_key: '1' }); return r; };
+    const r = await sendDM(f.api, D());
+    assert.deepEqual([r.readBack.found, r.readBack.count], [false, 1]);
   });
 
   test('只数这次之后的新消息：历史里有一样的话不算', async () => {

@@ -76,7 +76,7 @@ async function thread(api, oid, root) {
 
 export async function reply(api, p) {
   const t = p.target;
-  let me, oid, message;
+  let me, oid, message, before;
   try {
     const who = await whoAmI(api, p.uid);
     if (who.done) return who.done;
@@ -87,10 +87,13 @@ export async function reply(api, p) {
     const th = await thread(api, oid, t.rootId);
     if (th.gone) return { uidSeen: me, blocked: 'comment-gone', detail: `楼 ${t.rootId} 已被删（code=${th.code}）`, sendAttempted: false };
     if (th.error) return { uidSeen: me, blocked: 'target-not-found', detail: th.error, sendAttempted: false };
+    // 整楼没读全时看不出我是不是已经回过：不发
+    if (!th.complete) return { uidSeen: me, blocked: 'thread-incomplete', detail: `楼 ${t.rootId} 超过 10 页没读全，判断不了是否已回复，没发`, sendAttempted: false };
     const target = rpidOf(th.root) === String(t.commentId) ? th.root : th.replies.find((x) => rpidOf(x) === String(t.commentId));
-    if (!target) return { uidSeen: me, blocked: th.complete ? 'comment-gone' : 'target-not-found', detail: `楼 ${t.rootId} 里没有 ${t.commentId}`, sendAttempted: false };
+    if (!target) return { uidSeen: me, blocked: 'comment-gone', detail: `楼 ${t.rootId} 里没有 ${t.commentId}`, sendAttempted: false };
     const mine = th.replies.find((x) => midOf(x) === me && parentOf(x) === String(t.commentId));
     if (mine) return { uidSeen: me, blocked: 'already-replied', detail: `已有我的回复 ${rpidOf(mine)}`, sendAttempted: false };
+    before = new Set(th.replies.map(rpidOf));
     const isSub = target !== th.root;
     message = isSub ? `回复 @${target.member?.uname ?? t.authorNickname ?? ''} :${p.text}` : p.text;
   } catch (e) {
@@ -108,10 +111,20 @@ export async function reply(api, p) {
   try {
     await api.sleep(2000);
     const after = await thread(api, oid, t.rootId);
-    const n = after.ok ? after.replies.filter((x) => midOf(x) === me && parentOf(x) === String(t.commentId) && x.content?.message === message).length : 0;
-    readBack = { found: n === 1, count: n, nativeId, ...(after.ok ? {} : { detail: after.error ?? '回读时楼已不在' }), ...(postError ? { detail: `reply/add 出错：${postError}` } : {}) };
+    const hits = after.ok ? after.replies.filter((x) => !before.has(rpidOf(x)) && midOf(x) === me && parentOf(x) === String(t.commentId) && x.content?.message === message) : [];
+    const n = hits.length;
+    readBack = { found: confirmed(hits, n, rpidOf, nativeId, sendError), count: n, nativeId, ...(after.ok ? {} : { detail: after.error ?? '回读时楼已不在' }), ...(postError ? { detail: `reply/add 出错：${postError}` } : {}) };
   } catch (e) { readBack = { found: false, count: 0, nativeId, detail: `回读出错：${errText(e)}` }; }
   return { uidSeen: me, sendAttempted: true, ...(sendError ? { sendError } : {}), readBack };
+}
+
+/**
+ * 回读到的算不算这一次发的：发送接口明确报错 → 不算（那条是别人用同一账号发的）；
+ * 接口给了新 id → 恰好 1 条且就是它；接口没给 id（请求出错、不知道发没发）→ 恰好 1 条新的。
+ */
+function confirmed(hits, n, idOf, nativeId, sendError) {
+  if (sendError || n !== 1) return false;
+  return nativeId == null || idOf(hits[0]) === String(nativeId);
 }
 
 const msgText = (m) => { try { return JSON.parse(m.content)?.content ?? null; } catch { return null; } };
@@ -149,8 +162,9 @@ export async function sendDM(api, p) {
     await api.sleep(1500);
     const j = await api.get(url);
     const ok = j.code === 0 && Array.isArray(j.data?.messages);
-    const n = ok ? j.data.messages.filter((m) => seqOf(m) > lastSeq && String(m.sender_uid) === me && Number(m.msg_type) === 1 && msgText(m) === p.text).length : 0;
-    readBack = { found: n === 1, count: n, nativeId, ...(ok ? {} : { detail: `回读 fetch_session_msgs code=${j.code}` }), ...(postError ? { detail: `send_msg 出错：${postError}` } : {}) };
+    const hits = ok ? j.data.messages.filter((m) => seqOf(m) > lastSeq && String(m.sender_uid) === me && Number(m.msg_type) === 1 && msgText(m) === p.text) : [];
+    const n = hits.length;
+    readBack = { found: confirmed(hits, n, (m) => String(m.msg_key ?? ''), nativeId, sendError), count: n, nativeId, ...(ok ? {} : { detail: `回读 fetch_session_msgs code=${j.code}` }), ...(postError ? { detail: `send_msg 出错：${postError}` } : {}) };
   } catch (e) { readBack = { found: false, count: 0, nativeId, detail: `回读出错：${errText(e)}` }; }
   return { uidSeen: me, sendAttempted: true, ...(sendError ? { sendError } : {}), readBack };
 }

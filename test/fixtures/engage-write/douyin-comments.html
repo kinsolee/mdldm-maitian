@@ -28,6 +28,8 @@ let sendClicks = 0, deleteClicks = 0, seq = 0;
 const C = (cid, uid, nick, text, extra = {}) => ({ cid, aweme_id: WORK, user: { uid, nickname: nick }, text, reply_id: '0', reply_to_reply_id: '0', reply_comment_total: 0, ...extra });
 const roots = [C('c1', '501', '甲', '第一条评论', { reply_comment_total: 1 }), C('c2', '503', '丙', '第二条评论')];
 const subs = { c1: [C('c1r1', '502', '乙', '楼中楼一条', { reply_id: 'c1' })] };
+// stuck：楼里还有一条我的旧回复，但「查看回复」点了没反应（展开到上限还没加载全）
+if (mode === 'stuck') { roots[0].reply_comment_total = 2; subs.c1.push(C('c1me', ME, '麦田测试号', '之前回过了', { reply_id: 'c1' })); }
 if (mode === 'replied') { roots[0].reply_comment_total = 2; subs.c1.push(C('c1me', ME, '麦田测试号', '之前回过了', { reply_id: 'c1' })); }
 const expanded = {};
 
@@ -59,7 +61,7 @@ function render() {
       const m = document.createElement('div');
       m.className = 'more-m';
       m.innerHTML = `<span>查看 ${s.length} 条回复</span>`;
-      m.querySelector('span').onclick = () => { expanded[r.cid] = true; render(); };
+      m.querySelector('span').onclick = () => { if (mode === 'stuck') return; expanded[r.cid] = true; render(); };
       wrap.appendChild(m);
     }
     list.appendChild(wrap);

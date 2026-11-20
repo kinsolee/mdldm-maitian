@@ -142,8 +142,10 @@ function classify(r, account) {
   const readBack = rb ? { found: rb.found === true && count === 1, count, ...(rb.nativeId != null ? { nativeId: String(rb.nativeId) } : {}), ...(rb.detail ? { detail: redact(rb.detail) } : {}) } : null;
   if (x.sendError && !(rb?.found === true && count >= 1)) return { status: 'failed', reason: 'send-error', detail: redact(x.sendError), sendAttempted: true, readBack };
   if (readBack?.found) return { status: 'sent', reason: null, detail: null, sendAttempted: true, readBack };
-  return { status: 'needs_readback', reason: count > 1 ? 'readback-count' : 'readback-missing',
-    detail: count > 1 ? `回读到 ${count} 条一样的回复，不能确认是这一次发的` : '发送后没回读到这条回复，不重试，请人工去平台上看', sendAttempted: true, readBack };
+  const [reason, detail] = count > 1 ? ['readback-count', `回读到 ${count} 条一样的回复，不能确认是这一次发的`]
+    : count === 1 ? ['readback-mismatch', '回读到一条一样的回复，但和发送接口返回的 id 对不上，不能确认是这一次发的']
+      : ['readback-missing', '发送后没回读到这条回复，不重试，请人工去平台上看'];
+  return { status: 'needs_readback', reason, detail, sendAttempted: true, readBack };
 }
 
 function ackFor(db, req, actionId, now) {
@@ -151,8 +153,9 @@ function ackFor(db, req, actionId, now) {
   for (const { id } of db.prepare('SELECT id FROM events WHERE subjectId = ? AND type = ? AND handledAt IS NULL ORDER BY createdAt').all(req.targetId, req.spec.eventType)) ids.add(id);
   const acked = [];
   for (const id of ids) {
-    const e = db.prepare('SELECT handledOutcome FROM events WHERE id = ?').get(id);
-    if (!e || e.handledOutcome === 'replied') continue;
+    const e = db.prepare('SELECT handledOutcome, type, subjectId FROM events WHERE id = ?').get(id);
+    // 只回执这个目标的同类事件
+    if (!e || e.type !== req.spec.eventType || e.subjectId !== req.targetId || e.handledOutcome === 'replied') continue;
     ackEvent(db, id, 'replied', `${req.op} ${actionId}`, { now, actionId });
     acked.push(id);
   }
@@ -220,6 +223,8 @@ export async function engageWrite(db, input, deps = {}) {
   const start = tx(db, () => {
     const since = iso(now() - IDEMPOTENCY_WINDOW_MS);
     if (otherTarget(db, req, since)) return done({ status: 'rejected', reason: 'idempotency-key-reused', detail: '这个 idempotencyKey 24 小时内用在了别的目标或操作上' });
+    // eventId 先核对，再走幂等分支：duplicate 也会回执事件，不能回执到别的目标上
+    if (!eventMatches(db, req)) return done({ status: 'rejected', reason: 'event-mismatch', detail: `eventId 不存在，或不是 ${req.targetId} 的 ${req.spec.eventType} 事件` });
     const prior = blockingPrior(db, req.idempotencyKey, since);
     if (prior?.status === 'pending' && now() - Date.parse(prior.createdAt) > PENDING_STALE_MS) {
       finishAction(db, prior.id, { status: 'needs_readback', reason: 'interrupted', detail: '上一个进程发到一半没落结果', sendAttempted: true }, now);
@@ -240,7 +245,6 @@ export async function engageWrite(db, input, deps = {}) {
     const account = getAccount(db, t.accountId);
     if (!account) return done({ status: 'rejected', reason: 'unknown-account', detail: `库里没有账号 ${t.accountId}` });
     const accountId = account.id;
-    if (!eventMatches(db, req)) return done({ status: 'rejected', reason: 'event-mismatch', detail: `eventId 不存在，或不是 ${req.targetId} 的 ${req.spec.eventType} 事件`, accountId });
     if (!account.capabilities[req.spec.cap]) {
       return done({ status: 'rejected', reason: 'capability-off', detail: `账号 ${accountId} 的能力位 ${req.spec.cap} 没开（hub ops accounts set-cap ${accountId} ${req.spec.cap} true）`, accountId });
     }

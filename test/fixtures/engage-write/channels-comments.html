@@ -58,6 +58,8 @@ function render() {
   col.innerHTML = '';
   // 仿 S6a：二楼同时在一楼的 levelTwoComment 里，也单独渲染成一个 .comment-item
   for (const c of comments[current]) { col.appendChild(item(c)); for (const r of c.levelTwoComment) col.appendChild(item(r)); }
+  // stuck：还有没展开的回复（我的旧回复藏在里面），「展开更多回复」点了没反应
+  if (mode === 'stuck') { const m = document.createElement('div'); m.className = 'more'; m.innerHTML = '<span>展开更多回复</span>'; col.appendChild(m); }
 }
 
 function openReply(el, c) {

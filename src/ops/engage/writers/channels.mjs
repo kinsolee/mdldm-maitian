@@ -100,6 +100,9 @@ async function prepareReply({ page, params, t, me }) {
   if (hit.gone) return { blocked: 'comment-gone', detail: `评论 ${id} 显示已删除` };
   const prior = list.find((x) => x.nick === myNick && x.id !== id && directTo(x) === id);
   if (prior) return { blocked: 'already-replied', detail: `评论 ${id} 下已有我的回复 ${prior.id}` };
+  // 展开到上限还有「展开更多回复」：没加载的回复里可能有我的旧回复，不发
+  const more = await inPage(page, `const sr = document.querySelector('wujie-app')?.shadowRoot; return !!sr && [...sr.querySelectorAll('*')].some((e) => e.children.length === 0 && /^展开更多回复$/.test(e.textContent.trim()));`);
+  if (more) return { blocked: 'thread-incomplete', detail: `作品 ${work} 的回复展开到上限还没加载全，判断不了是否已回复，没发` };
 
   const found = await mark(page, 'reply', `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
     const el = [...sr.querySelectorAll('.comment-item')].find((e) => String(e.__vue__?.$props?.dataSource?.commentId) === arg);
