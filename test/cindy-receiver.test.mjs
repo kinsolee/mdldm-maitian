@@ -592,4 +592,18 @@ describe('第 2 轮评审修复', () => {
     assert.equal(inbox.pendingCount(), 1);
     inbox.close();
   });
+
+  test('符号链接指向的文件里已有这个事件 id：不算重复、不标已处理；readLedger 也不沿链接读', () => {
+    const p = paths();
+    const target = path.join(p.dir, 'elsewhere.jsonl');
+    fs.writeFileSync(target, `${JSON.stringify({ eventId: 'c1', category: '跳过' })}\n`);
+    const link = path.join(p.dir, 'cindy.jsonl');
+    fs.symlinkSync(target, link);
+    const inbox = openInbox(p.stateDb);
+    inbox.receive([ev('c1')], T0);
+    assert.throws(() => recordResults({ inbox, file: link, results: [{ eventId: 'c1', category: '跳过' }] }), /ELOOP|EMLINK|symbolic/i);
+    assert.equal(inbox.pendingCount(), 1);
+    assert.throws(() => readLedger(link), /ELOOP|EMLINK|symbolic/i);
+    inbox.close();
+  });
 });

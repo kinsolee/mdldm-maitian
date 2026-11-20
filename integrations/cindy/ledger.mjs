@@ -10,11 +10,27 @@ export const MAX_REPLY_CHARS = 500;
 
 const iso = (ms) => new Date(ms).toISOString();
 
-/** 读对照文件，返回 Map<eventId, 行>。不认识的行跳过。文件不存在返回空 Map。 */
+/** 从已打开的描述符读全文（从头读，不动文件位置）。 */
+function readFd(fd) {
+  const { size } = fs.fstatSync(fd);
+  const buf = Buffer.alloc(size);
+  for (let off = 0; off < size;) {
+    const n = fs.readSync(fd, buf, off, size - off, off);
+    if (!(n > 0)) break;
+    off += n;
+  }
+  return buf.toString('utf8');
+}
+
+/** 读对照文件，返回 Map<eventId, 行>。不认识的行跳过。文件不存在返回空 Map。符号链接直接报错（O_NOFOLLOW），不沿链接读。 */
 export function readLedger(file) {
+  let fd;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (e) { if (e.code === 'ENOENT') return new Map(); throw e; }
+  try { return parseLedger(readFd(fd)); } finally { fs.closeSync(fd); }
+}
+
+function parseLedger(text) {
   const rows = new Map();
-  let text;
-  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return rows; throw e; }
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     try {
@@ -42,7 +58,15 @@ function problem(r, inbox) {
  */
 export function recordResults({ inbox, file, results, now = Date.now }) {
   if (!Array.isArray(results)) throw new Error('结果要是数组');
-  const existing = readLedger(file);
+  // 去重读取和追加写入用同一个 O_NOFOLLOW 描述符：中途把文件换成符号链接，读的和写的也还是同一个真文件
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const { O_APPEND, O_CREAT, O_RDWR, O_NOFOLLOW } = fs.constants;
+  const fd = fs.openSync(file, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600);
+  try { return recordWith(fd, { inbox, results, now }); } finally { fs.closeSync(fd); }
+}
+
+function recordWith(fd, { inbox, results, now }) {
+  const existing = parseLedger(readFd(fd));
   const rejected = [];
   const lines = [];
   const done = [];
@@ -57,17 +81,13 @@ export function recordResults({ inbox, file, results, now = Date.now }) {
     lines.push(JSON.stringify({ eventId: r.eventId, platform: inbox.get(r.eventId).platform, category: r.category, suggestedReply: reply, processedAt: iso(now()) }));
     done.push(r.eventId);
   }
-  if (lines.length) appendDurably(file, `${lines.join('\n')}\n`);
+  if (lines.length) appendDurably(fd, `${lines.join('\n')}\n`);
   inbox.markProcessed(done, now());
   return { appended: lines.length, duplicate, rejected };
 }
 
-function appendDurably(file, text) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  // O_NOFOLLOW：对照文件被换成符号链接时直接报错，不沿链接写
-  const { O_APPEND, O_CREAT, O_RDWR, O_NOFOLLOW } = fs.constants;
-  const fd = fs.openSync(file, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600);
-  try {
+function appendDurably(fd, text) {
+  {
     // 上次写到一半没换行时，先补一个换行，免得新行接在半行后面
     const { size } = fs.fstatSync(fd);
     let prefix = '';
@@ -84,7 +104,5 @@ function appendDurably(file, text) {
       off += n;
     }
     fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
   }
 }
