@@ -20,7 +20,7 @@ async function api(p) { const r = await fetch(p); if (!r.ok) throw new Error((aw
 function toast(t) { const d = document.createElement('div'); d.className = 'toast'; d.textContent = t; document.body.append(d); setTimeout(() => d.remove(), 2600); }
 function topbar(O, on) {
   const h = O.health, today = new Date().toLocaleDateString('zh-CN'), loginOk = Object.values(h.login).every(v => v === 'ok'), checked = h.doctorDay === today, n = new Date();
-  const nav = [['/', '大屏', 'board'], ['/p#/traffic', '流量', 'traffic'], ['/p#/calendar', '日历', 'calendar'], ['/p#/convert', '转化', 'convert'], ['/p#/archive', '档案', 'archive'], ['/p#/system', '系统', 'system']].filter(x => x[2] !== 'convert' || O.siteOn);
+  const nav = [['/', '大屏', 'board'], ['/p#/traffic', '流量', 'traffic'], ['/p#/calendar', '日历', 'calendar'], ['/p#/convert', '转化', 'convert'], ['/p#/archive', '档案', 'archive'], ['/cindy', 'Cindy', 'cindy'], ['/p#/system', '系统', 'system']].filter(x => x[2] !== 'convert' || O.siteOn);
   return `<div class="top"><a class="logo" href="/">麦<i>田</i></a><div class="tag">内容与粉丝监控</div><div class="nav">${nav.map(([u, t, k]) => `<a class="${k === on ? 'on' : ''}" href="${u}">${t}</a>`).join('')}</div>
     <div class="lights"><span class="light ok">守护进程 运行中</span><span class="light ${h.nas ? 'ok' : 'bad'}">NAS ${h.nas ? '已挂载' : '读不到'}</span><span class="light ${h.chrome ? 'ok' : 'bad'}">专用浏览器 ${h.chrome ? '在线' : '没开'}</span><span class="light ${!loginOk ? 'bad' : checked ? 'ok' : 'warn'}">平台登录 ${!loginOk ? '有掉线' : checked ? '今日已检' : '今天还没检'}</span></div>
     <div class="clock"><small>${n.getMonth() + 1}/${n.getDate()} 周${'日一二三四五六'[n.getDay()]}</small>${pad(n.getHours())}:${pad(n.getMinutes())}</div></div>`;

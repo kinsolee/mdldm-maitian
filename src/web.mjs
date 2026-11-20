@@ -6,6 +6,7 @@ import { SITE } from './site.mjs';
 import { review } from './review.mjs';
 import { accessEmail } from './access.mjs';
 import { initLogin, sessionOk, handleLogin } from './login.mjs';
+import { cindyStatus, readToken, rotateToken } from '../integrations/cindy/admin.mjs';
 import { readWorksView } from './ops/works-view.mjs'; import { opsDbPath } from './ops/paths.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url)), ROOT = path.resolve(DIR, '..');
@@ -107,6 +108,19 @@ function thumb(f, w) {
   } catch { return null; }
 }
 
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+// 本机直连：来源是回环地址、Host 是 localhost / 127.0.0.1、没有代理头。cloudflared 也从本机连进来，所以要看 Host 和代理头
+function localOnly(req) {
+  const host = String(req.headers.host || '').replace(/:\d+$/, '').toLowerCase();
+  const proxied = ['x-forwarded-for', 'x-forwarded-host', 'cf-connecting-ip', 'cf-ray', 'forwarded'].some((h) => req.headers[h]);
+  return LOOPBACK.has(req.socket.remoteAddress) && (host === 'localhost' || host === '127.0.0.1') && !proxied;
+}
+// 防跨站：POST 必须带同源的 Origin（浏览器 fetch 都会带）
+function sameOrigin(req) {
+  const o = req.headers.origin;
+  try { return !!o && new URL(o).host === req.headers.host; } catch { return false; }
+}
+
 async function handle(req, res) {
   const u = new URL(req.url, 'http://x');
   // 访问控制：前面挂了 Cloudflare Access（邮箱验证码）就认它的登录凭证；否则用口令（第一次带 ?key= 进来，之后用 cookie）
@@ -139,6 +153,16 @@ async function handle(req, res) {
   if (u.pathname === '/') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'board.html')), 'text/html; charset=utf-8');
   if (u.pathname === '/works') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'works.html')), 'text/html; charset=utf-8');   // KIN-330：ops.db 的作品
   if (u.pathname === '/api/ops/works') return send(res, 200, readWorksView(opsDbPath(), { platform: u.searchParams.get('platform') || undefined }));
+  if (u.pathname === '/cindy') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'cindy.html')), 'text/html; charset=utf-8');   // KIN-325：Cindy 接入
+  if (u.pathname === '/api/cindy/status') return send(res, 200, { ...(await cindyStatus()), local: localOnly(req) });
+  if (u.pathname === '/api/cindy/token' && req.method === 'POST') {
+    // 取 token、换 token 只给本机：MCP 本来就只在 127.0.0.1 上，远程（隧道、局域网）拿到 token 没用，只会多一处泄漏
+    if (!localOnly(req)) return send(res, 403, { error: '只能在麦田这台电脑上用 http://localhost 打开时操作' });
+    if (!sameOrigin(req)) return send(res, 403, { error: '来源不对' });
+    const rotate = u.searchParams.get('rotate') === '1';
+    const token = rotate ? rotateToken() : readToken();
+    return token ? send(res, 200, { token, rotated: rotate }) : send(res, 404, { error: '还没有 token，点「生成」' });
+  }
   if (u.pathname === '/widget') {   // 小组件安装页（已登录才能看）：脚本里填好麦田地址和小组件口令，手机上一键复制
     if (!W.widgetToken) return send(res, 404, '<meta charset="utf-8">没配 config.web.widgetToken', 'text/html; charset=utf-8');
     // 加载器会执行麦田发来的代码：只在 https 下用；http（局域网）明文传输可能被同一网络的人替换，就给完整脚本、不自动更新

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f5f5f7">
+<title>麦田 · Cindy 接入</title>
+<link rel="icon" href="/static/icon-180.png">
+<link rel="stylesheet" href="/static/mt.css">
+<style>
+.flow{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+.step{border-radius:14px;padding:12px 14px;background:rgba(0,0,0,.035);font-size:13px;line-height:1.55}
+.step b{display:block;font-size:14px;margin-bottom:4px}
+.step.ok{background:rgba(52,199,89,.12)}.step.bad{background:rgba(255,59,48,.1)}.step.idle{background:rgba(0,0,0,.035)}
+.field{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid rgba(0,0,0,.06);font-size:13.5px}
+.field:last-child{border-bottom:0}.field .k{width:110px;color:var(--t3)}.field code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:rgba(0,0,0,.05);padding:4px 8px;border-radius:8px;word-break:break-all;flex:1;min-width:0}
+.warn{font-size:13px;color:#b25000;margin-top:10px}
+ol.todo{margin:0;padding-left:20px;font-size:13.5px;line-height:1.9}
+@media (max-width:900px){.flow{grid-template-columns:minmax(0,1fr)}}
+</style>
+</head>
+<body>
+<div class="bgfx"><i></i><i></i><i></i></div>
+<div class="page" id="app"><div class="empty" style="height:60vh">加载中…</div></div>
+<script src="/static/mt.js"></script>
+<script>
+// KIN-325：Cindy 接麦田事件。看整条链路是否通、生成或更换 Cindy 挂 MCP 用的 token。
+// token 不在状态接口里；只有本机打开（http://localhost:8787/cindy）时才能取和换，取到的只放在这一页的内存里。
+const NAV = [['/', '大屏'], ['/p#/traffic', '流量'], ['/p#/calendar', '日历'], ['/p#/archive', '档案'], ['/works', '作品'], ['/cindy', 'Cindy'], ['/p#/system', '系统']];
+let S = null, token = null, shown = false;
+
+function step(title, ok, lines) {
+  return `<div class="step ${ok === true ? 'ok' : ok === false ? 'bad' : 'idle'}"><b>${ok === true ? '✓ ' : ok === false ? '✕ ' : ''}${esc(title)}</b>${lines.filter(Boolean).join('<br>')}</div>`;
+}
+
+function render() {
+  const m = S.mcp, r = S.receiver, ib = S.inbox, lg = S.ledger;
+  const masked = token ? (shown ? esc(token) : '•'.repeat(12) + esc(token.slice(-4))) : (m.hasToken ? '已生成（点「显示」或「复制」取出）' : '还没有');
+  $('#app').innerHTML = `
+  <div class="top"><a class="logo" href="/">麦<i>田</i></a><div class="tag">内容与粉丝监控</div><div class="nav">${NAV.map(([u, t]) => `<a class="${u === '/cindy' ? 'on' : ''}" href="${u}">${t}</a>`).join('')}</div></div>
+  <div class="h1">Cindy 接入</div>
+  <p class="lead">Cindy 只做对照：收麦田的评论私信事件，分类后写进单独的对照文件，不回执、不发消息。正式处理归 OpenBot。</p>
+
+  <div class="sec"><h2>链路</h2><span class="note">每次打开都实测一次</span><span class="note"><a href="#" id="re">重新检测</a></span></div>
+  <div class="panel"><div class="flow">
+    ${step('1 接收端', r.ok, [r.ok ? '127.0.0.1:8791 在跑' : esc(r.error), r.ok ? `收到 ${fmt(r.total)} 条` : ''])}
+    ${step('2 收件箱', ib ? true : null, [ib ? `待处理 ${fmt(ib.pending)} 条` : '还没建', ib ? `已处理 ${fmt(ib.processed)} 条` : ''])}
+    ${step('3 麦田 MCP', m.ok, [m.ok ? `${esc(m.url)} 在跑` : esc(m.error || '不通'), m.tools ? `工具：${m.tools.map(esc).join('、')}` : ''])}
+    ${step('4 Cindy 定时任务', lg.rows ? true : null, ['每 2 分钟，有待处理才跑', lg.rows ? '已经写过对照文件' : '还没写过对照文件：Cindy 里的配置做完后会出现'])}
+    ${step('5 对照文件', lg.exists ? true : null, [lg.exists ? `${fmt(lg.rows)} 行` : '还没有', lg.lastProcessedAt ? `最近一条 ${when(lg.lastProcessedAt)}（${ago(lg.lastProcessedAt)}）` : ''])}
+  </div></div>
+
+  <div class="sec"><h2>在 Cindy 里添加 MCP 服务器</h2><span class="note">设置 → 添加 MCP 服务器，照下面填</span></div>
+  <div class="panel">
+    <div class="field"><span class="k">显示名称</span><code>麦田（只读）</code><button class="btn" data-copy="麦田（只读）">复制</button></div>
+    <div class="field"><span class="k">传输类型</span><code>HTTP</code></div>
+    <div class="field"><span class="k">端点 URL</span><code>${esc(m.url)}</code><button class="btn" data-copy="${esc(m.url)}">复制</button></div>
+    <div class="field"><span class="k">Bearer Token</span><code id="tk">${masked}</code>
+      ${S.local ? `${m.hasToken ? `<button class="btn" id="show">${shown ? '隐藏' : '显示'}</button><button class="btn pri" id="cp">复制</button>` : ''}<button class="btn ${m.hasToken ? '' : 'pri'}" id="gen">${m.hasToken ? '更换' : '生成'}</button>` : ''}</div>
+    <div class="field"><span class="k">请求头</span><code>不用加</code></div>
+    ${S.local ? '' : '<div class="warn">token 只能在麦田这台电脑上取：用 http://localhost:8787/cindy 打开这一页。</div>'}
+    ${m.hasToken ? '<div class="note" style="margin-top:10px">点「更换」后旧 token 立刻失效，要把新的重新填进 Cindy。麦田 MCP 不用重启。</div>' : ''}
+  </div>
+
+  <div class="sec"><h2>Cindy 里还要做的</h2></div>
+  <div class="panel"><ol class="todo">
+    <li>把 <code>integrations/cindy/project</code> 当项目打开，同意导入「麦田事件对照」定时任务。</li>
+    <li>按上面添加 MCP 服务器，保存后新建或重启会话才生效。</li>
+    <li>给定时任务选执行的伙伴，确认它的工具里有 <code>get_comment_thread</code>。</li>
+    <li>点一次「立即运行」，回到这页点「重新检测」，第 4、5 步变绿就通了。</li>
+  </ol></div>`;
+}
+
+async function getToken(rotate) {
+  const r = await fetch(`/api/cindy/token${rotate ? '?rotate=1' : ''}`, { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j.token;
+}
+
+async function load() {
+  try { S = await api('/api/cindy/status'); render(); }
+  catch (e) { $('#app').innerHTML = `<div class="empty" style="height:60vh">读不到状态：${esc(e.message)}</div>`; }
+}
+
+document.addEventListener('click', async (e) => {
+  const t = e.target;
+  try {
+    if (t.id === 're') { e.preventDefault(); await load(); toast('已重新检测'); return; }
+    if (t.dataset.copy) { await navigator.clipboard.writeText(t.dataset.copy); toast('已复制'); return; }
+    if (t.id === 'show') { token ??= await getToken(false); shown = !shown; render(); return; }
+    if (t.id === 'cp') { token ??= await getToken(false); await navigator.clipboard.writeText(token); toast('token 已复制，去 Cindy 里粘贴'); return; }
+    if (t.id === 'gen') {
+      if (S.mcp.hasToken && !confirm('换成新 token？旧的立刻失效，Cindy 里要重新填。')) return;
+      token = await getToken(true); shown = false;
+      await navigator.clipboard.writeText(token).catch(() => {});
+      toast('新 token 已生成并复制');
+      await load();
+    }
+  } catch (err) { toast(`没成功：${err.message}`); }
+});
+
+load();
+</script>
+</body>
+</html>

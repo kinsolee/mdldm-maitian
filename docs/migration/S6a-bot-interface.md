@@ -332,6 +332,13 @@ Cindy 的「添加 MCP 服务器」只收远程 http / sse 型，不收 stdio。
 - 只注册 `get_comment_thread`、`get_conversation`、`get_work` 三个只读工具（`buildServer` 的 `tools` 白名单）。`ack_event`、`list_events`、订阅、`refresh_now` 在这个入口上不存在，提示词以外多一道门。
 - 日志只写方法和状态码，不写参数和结果。
 - launchd 模板：`integrations/cindy/com.maitian.cindy-mcp.plist`。
+- token 每个请求按 `.env` 当前内容比对（按文件 mtime 缓存）：在网页上换了 token，旧的立刻失效，服务不用重启。
+
+### 麦田网页的「Cindy」页（`/cindy`）
+
+- 链路五步实测：接收端 `/health`、收件箱待处理数、用 token 真连一次 MCP（只 initialize + tools/list）、对照文件行数和最近一条时间。
+- 显示 Cindy「添加 MCP 服务器」要填的每一项；token 可以显示、复制、生成或更换。
+- 状态接口 `GET /api/cindy/status` 不返回 token。`POST /api/cindy/token`（`?rotate=1` 是更换）只给本机：来源是回环地址、Host 是 `localhost` / `127.0.0.1`、没有代理头（cloudflared 也从本机连，所以看 Host 和代理头），并且 Origin 要同源。隧道或局域网打开这一页只能看状态。
 
 ### 配置（`integrations/cindy/.env`，权限 0600，不进仓库）
 
@@ -351,5 +358,5 @@ launchd 模板：`integrations/cindy/com.maitian.cindy-receiver.plist`。Cindy �
 ### 在 Cindy 里要做的（负责人在界面上操作）
 
 1. 在 Cindy 里把 `<检出>/integrations/cindy/project` 当项目打开。Cindy 会读到 `.cindy/automations/schedules.json` 里的「麦田事件对照」任务，同意导入。
-2. 在设置里「添加 MCP 服务器」：显示名称 `麦田（只读）`，传输类型 HTTP，端点 URL `http://127.0.0.1:8792/mcp`，Bearer Token 填 `.env` 里的 `CINDY_MCP_TOKEN`。请求头不用加。保存后新建或重启的会话才生效。
+2. 在设置里「添加 MCP 服务器」：显示名称 `麦田（只读）`，传输类型 HTTP，端点 URL `http://127.0.0.1:8792/mcp`，Bearer Token 在麦田网页的「Cindy」页（`http://localhost:8787/cindy`）点「复制」。请求头不用加。保存后新建或重启的会话才生效。
 3. 给这个任务选执行的伙伴（agent），确认它能用上一步的 MCP（工具列表里有 `get_comment_thread`）。

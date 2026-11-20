@@ -8,11 +8,23 @@ import { loadEnvFile as loadEnv } from '../openbot/config.mjs';
 export { writeEnvValue, enforceEnvPerms } from '../openbot/config.mjs';
 
 export const HERE = import.meta.dirname;
-export const ENV_FILE = path.join(HERE, '.env');
+export const ENV_FILE = process.env.CINDY_ENV_FILE || path.join(HERE, '.env');   // 测试里指到临时文件
 export const DEFAULT_TYPES = ['comment.created', 'dm.received'];
 export const DEFAULT_LEDGER = path.join(os.homedir(), 'Documents', 'OPC-vault', '10.个人IP', '数据', '麦田事件对照-Cindy.jsonl');
 /** OpenBot 的正式文件：Cindy 一个字也不能写进去。 */
 export const OPENBOT_FILES = ['评论私信回复记录.md', '评论私信待确认.md', '评论私信回复话术.md'];
+
+/** 直接从 .env 读成对象，不动 process.env：网页里换了 token，读的一方马上看得到。文件不在返回 {}。 */
+export function readEnvFile(file = ENV_FILE) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return {}; throw e; }
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
 
 /** OpenBot 的 loadEnvFile 默认读 openbot/.env，这里默认改成 Cindy 自己的。 */
 export const loadEnvFile = (file = ENV_FILE) => loadEnv(file);
