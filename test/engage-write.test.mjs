@@ -613,3 +613,20 @@ describe('页面写入：点发送之前出错', () => {
     assert.deepEqual([r.status, r.reason, r.retryable], ['failed', 'precheck-error', true]);
   });
 });
+
+describe('S9：writeViaApi', () => {
+  test('能力位开了才传 writeVia=api；接口写法返回码不认识（回读到也不算）→ needs_readback，同 key 不再发', async () => {
+    const s = setup();
+    const unknown = { uidSeen: '478358005', sendAttempted: true, via: 'api', readBack: { found: false, count: 1, nativeId: 'rp-new', detail: '发送接口返回不认识：status_code=0，comments=3' } };
+    const w = fakeWriter([SENT, unknown]);
+    assert.equal((await engageWrite(s.db, reply(), s.deps(w))).status, 'sent');
+    assert.equal(w.calls[0].params.writeVia, 'dom');
+    setCapability(s.db, BILI, 'writeViaApi', true);
+    const r = await engageWrite(s.db, { op: 'reply', targetId: 'Bili:r1', text: '谢谢', idempotencyKey: 'k-api-1', caller: 'test-bot' }, s.deps(w));
+    assert.equal(w.calls[1].params.writeVia, 'api');
+    assert.deepEqual([r.status, r.sendAttempted], ['needs_readback', true]);
+    const again = await engageWrite(s.db, { op: 'reply', targetId: 'Bili:r1', text: '谢谢', idempotencyKey: 'k-api-1', caller: 'test-bot' }, s.deps(w));
+    assert.equal(again.status, 'needs_readback');
+    assert.equal(w.calls.length, 2);
+  });
+});

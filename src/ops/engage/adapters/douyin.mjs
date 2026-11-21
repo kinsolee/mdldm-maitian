@@ -5,12 +5,17 @@
 //        楼中楼（S6a 核实）：reply_id 是所在楼的一楼 cid，reply_to_reply_id 是直接回复的那条（"0" 表示回复一楼），
 //        reply_to_userid / reply_to_username 是被回复的人。
 //   私信：li.semi-list-item 的 React fiber 往上 2 层 memoizedProps.item（IM SDK Conversation），lastMessage.isFromMe 判 last.by。
+//   S9 页面内接口（账号能力位 readViaApi 打开时，params.readVia = 'api'）：作品列表照旧抄页面自己发的 item/list，
+//        一楼、楼中楼改成调页面自己的评论服务（awemeV1CommentListSelect / awemeV1CommentListReply，见 ../inpage-api.mjs），
+//        不再点「选择作品」「查看回复」。翻页上限同 DOM 路径（一楼 maxSelectPages 页、楼中楼共 maxExpand 次请求），原始数据形状不变。
+//        找不到页面服务时退回 DOM 路径（raw.apiFallback 写明原因）。
 // 不点「回复」、不往输入框里写字、不调 Context 上的写函数。
+import { serviceCaller } from '../inpage-api.mjs';
 import { open, atLogin, bigJson, capCount, captured, clickMarked, installHook, mainPage, sleep, waitCaptured } from './page-lib.mjs';
 import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
 export const FILE = 'douyin.mjs';
-export const LIMITS = { maxWorks: 8, maxAgeDays: 30, maxExpand: 25, loadMs: 90000, maxPickerPages: 10 };
+export const LIMITS = { maxWorks: 8, maxAgeDays: 30, maxExpand: 25, loadMs: 90000, maxPickerPages: 10, maxSelectPages: 30, apiGapMs: 800 };
 const COMMENT_PAGE = 'https://creator.douyin.com/creator-micro/interactive/comment';
 const DM_PAGE = 'https://creator.douyin.com/creator-micro/data/following/chat';
 const SELECT = 'comment/list/select';
@@ -54,10 +59,15 @@ async function rawComments(page, o) {
   const itemLists = await bodies(page, 'creator/item/list', 0);
   const itemListCodes = itemLists.map(itemListCodeOf);
   const items = itemLists.filter((j) => itemListCodeOf(j) === 0).flatMap((j) => j.item_info_list).map(slimItem);
+  const { windowStartMs, recent } = recentWorks(items, o);
+  let apiFallback = null;
+  if (o.readVia === 'api') {
+    const call = await serviceCaller(page, 'Douyin', { waitMs: Math.min(o.loadMs, 60000), gapMs: o.apiGapMs });
+    if (call) return { via: 'api', itemListCodes, windowStartMs, items, works: await worksViaApi(call, recent, o) };
+    apiFallback = '页面评论服务没找到，退回 DOM 路径';
+  }
   // 页面渲染很慢（实测 30 秒以上才出「选择作品」按钮）
   for (const end = Date.now() + o.loadMs; Date.now() < end; await sleep(1500)) if (await page.evaluate(new Function(`return !!(${PICKER_SRC})()`))) break;
-  const windowStartMs = o.now - o.maxAgeDays * 86400_000;
-  const recent = items.filter((x) => x.comment_count > 0 && (publishedAt(x.create_time) ?? o.now) >= windowStartMs).slice(0, o.maxWorks);
   // 默认作品的一楼列表比「选择作品」按钮晚到；先切走的话，它晚到的响应会把列表盖回默认作品（2026-11-21 实测）
   if (recent.length) await waitCaptured(page, SELECT, { timeoutMs: 30000 });
   const works = [];
@@ -88,7 +98,55 @@ async function rawComments(page, o) {
     const replies = (await bodies(page, REPLY, from)).map(slimList);
     works.push({ item_id_plain: it.item_id_plain, opened: true, clicks, expandLeft: left.length, expandLeftTexts: left, select, replies, selectErrors });
   }
-  return { itemListCodes, windowStartMs, items, works };
+  return { via: 'dom', ...(apiFallback ? { apiFallback } : {}), itemListCodes, windowStartMs, items, works };
+}
+
+/** 近 maxAgeDays 天、评论数 > 0 的作品，最多 maxWorks 个（DOM、接口两条路径共用）。 */
+export function recentWorks(items, o) {
+  const windowStartMs = o.now - o.maxAgeDays * 86400_000;
+  return { windowStartMs, recent: items.filter((x) => x.comment_count > 0 && (publishedAt(x.create_time) ?? o.now) >= windowStartMs).slice(0, o.maxWorks) };
+}
+
+const more = (j) => j.has_more === 1 || j.has_more === true;
+// 参数同页面自己发的一楼请求（探针看到的：aweme_id、cursor、count=10、comment_select_options=0、sort_options=0、channel_id=618；app_id、aid、device_platform 由页面封装补）
+export const selectArgs = (awemeId, cursor) => ({ aweme_id: String(awemeId), cursor, count: 10, comment_select_options: 0, sort_options: 0, channel_id: 618 });
+export const replyArgs = (cid, cursor) => ({ comment_id: String(cid), cursor, count: 10, channel_id: 618 });
+
+/**
+ * 接口读一楼和楼中楼（S9）。call 是 ../inpage-api.mjs 的 serviceCaller 给的。返回和 DOM 路径一样的 works（parse 不变）：
+ * 一楼最多 maxSelectPages 页，接口出错记进 selectErrors；楼中楼每个作品最多 maxExpand 次请求（同 DOM 路径的「展开」上限），用完还没读完的楼数记 expandLeft。
+ */
+export async function worksViaApi(call, recent, o) {
+  const works = [];
+  for (const it of recent) {
+    const select = [], selectErrors = [], replies = [];
+    let cursor = 0;
+    for (let p = 0; p < o.maxSelectPages; p++) {
+      const r = await call('awemeV1CommentListSelect', selectArgs(it.item_id_plain, cursor));
+      const j = r.ok ? slimList(r.data ?? {}) : null;
+      if (!j || j.status_code !== 0 || !Array.isArray(j.comments)) {
+        selectErrors.push({ status_code: j?.status_code ?? null, comments: Array.isArray(j?.comments) ? 'array' : 'missing', ...(r.ok ? {} : { error: r.error }) });
+        break;
+      }
+      select.push(j);
+      if (!more(j) || j.cursor == null || j.cursor === cursor) break;
+      cursor = j.cursor;
+    }
+    let calls = 0, left = 0;
+    for (const c of select.flatMap((j) => j.comments).filter((c) => Number(c.reply_comment_total) > 0)) {
+      for (let cur = 0; ;) {
+        if (calls >= o.maxExpand) { left++; break; }
+        calls++;
+        const r = await call('awemeV1CommentListReply', replyArgs(c.cid, cur));
+        const j = r.ok ? slimList(r.data ?? {}) : { status_code: null, has_more: null, cursor: null, total: null, comments: null };
+        replies.push(j);
+        if (j.status_code !== 0 || !Array.isArray(j.comments) || !more(j) || j.cursor == null || j.cursor === cur) break;
+        cur = j.cursor;
+      }
+    }
+    works.push({ item_id_plain: it.item_id_plain, opened: true, via: 'api', clicks: calls, expandLeft: left, expandLeftTexts: [], select, replies, selectErrors });
+  }
+  return works;
 }
 
 export const EXPAND_SRC = `() => { const re = /^(查看\\s*\\d+\\s*条回复|展开\\s*\\d*\\s*条?更多回复|展开更多)$/; return [...document.querySelectorAll('div, span, button')].filter((e) => re.test(e.textContent.trim()) && ![...e.children].some((c) => re.test(c.textContent.trim()))); }`;

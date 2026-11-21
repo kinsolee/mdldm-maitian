@@ -304,7 +304,8 @@ export async function engageWrite(db, input, deps = {}) {
   const { account, actionId } = start;
   let r;
   try {
-    r = await runWriter({ account, params: { op: req.op, uid: String(account.uid), nickname: account.nickname ?? null, text: req.text, target: start.target } });
+    r = await runWriter({ account, params: { op: req.op, uid: String(account.uid), nickname: account.nickname ?? null, text: req.text, target: start.target,
+      writeVia: account.capabilities.writeViaApi === true ? 'api' : 'dom' } });
   } catch (e) { r = { ok: false, reason: 'threw', error: e?.message ?? String(e) }; }
   const res = classify(r, account);
 
