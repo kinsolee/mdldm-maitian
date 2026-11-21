@@ -149,6 +149,8 @@ sqlite3 data/ops.db "SELECT id, createdAt, op, targetId, status, reason, sendAtt
 | 视频号 | 页面：`textarea.create-input`（在 wujie shadowRoot 里，只认挂在目标 `.comment-item` 里的那个）；发送是同一个 `.comment-create-content` 里 `.create-ft` 下文字为「评论」、class 不带 `disabled` 的 `.tag-wrap` | 页面：`textarea.edit_area` | 评论：2026-11-21 在真实评论页上核对过回复入口、回复框、发送按钮（填一个占位字看它从 disabled 变可点，随即清空，没点）和回读用的 `replyCommentId`；还没真发过。私信只在本地测试页上验证过 |
 | 小红书 | 页面：`textarea.comment-input` | 页面：`div.xhs-im-input-bar-editor` | 只在本地测试页上验证过 |
 
+抖音、视频号的回复评论另有页面内接口写法（调页面自己的接口封装函数，不点按钮），用能力位 `writeViaApi` 打开，默认关，见 [S9-in-page-api.md](S9-in-page-api.md)。
+
 页面平台用 `Input.insertText` 填写。填完先读回输入框，内容和要发的不一致就清空，返回 `input-mismatch`，不点发送。各平台怎么找目标评论、怎么判断已经回复过、怎么回读，写在 `src/ops/engage/writers/<平台>.mjs` 文件头的注释里。
 
 B站的 csrf（cookie `bili_jct`）只在页面里读取、只在页面里填进表单，不会回到 Node，也不会进日志。

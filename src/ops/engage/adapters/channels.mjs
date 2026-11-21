@@ -6,12 +6,17 @@
 //        replyCommentId 指向谁就挂谁，没有就挂一楼。平台不给评论者 uid，isMe 按昵称等于 finderUser.nickname。
 //   私信：/platform/private_msg，.session-wrap 往上的 Vue 实例 $data.sessionList；messageList 新到旧、只带最近 2 条，
 //        取 ts 最大的判 last.by（fromUsername == sessionInfo.username 是对方）。
+//   S9 页面内接口（账号能力位 readViaApi 打开时，params.readVia = 'api'）：作品列表照旧读组件的 commentFeeds，
+//        评论改成调沙箱 iframe 里页面自己的评论服务 getCommentList（见 ../inpage-api.mjs），不再点作品、不点「展开更多回复」：
+//        一楼 { lastBuff, exportId: objectId }，楼中楼加 rootCommentId 和那条一楼的 lastBuff（同页面自己的 fetchReply）。
+//        不调 updateFeedCommentReadState，所以评论不会被标已读。原始数据形状同 DOM 路径；找不到页面服务时退回 DOM（raw.apiFallback）。
 // 不点 .like-action、不点回复图标、不往任何输入框里写字。
+import { pageEnd, pageMore, serviceCaller } from '../inpage-api.mjs';
 import { open, atLogin, clickMarked, mainPage, sleep } from './page-lib.mjs';
 import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
 export const FILE = 'channels.mjs';
-export const LIMITS = { maxWorks: 10, maxAgeDays: 30, maxExpand: 15, waitMs: 20000 };
+export const LIMITS = { maxWorks: 10, maxAgeDays: 30, maxExpand: 15, waitMs: 20000, maxPages: 10, apiGapMs: 800 };
 const COMMENT_PAGE = 'https://channels.weixin.qq.com/platform/interaction/comment';
 const DM_PAGE = 'https://channels.weixin.qq.com/platform/private_msg';
 
@@ -91,6 +96,12 @@ async function rawComments(page, o) {
     feeds = next;
   }
   const pick = feeds.filter((f) => f.commentCount > 0 && f.createTime >= sinceSec).sort((p, q) => q.createTime - p.createTime).slice(0, o.maxWorks);
+  let apiFallback = null;
+  if (o.readVia === 'api') {
+    const call = await serviceCaller(page, 'Channels', { waitMs: o.waitMs, gapMs: o.apiGapMs });
+    if (call) return { via: 'api', windowStartSec, ...listState('feeds', feeds, false), works: await worksViaApi(call, pick, o) };
+    apiFallback = '页面评论服务没找到，退回 DOM 路径';
+  }
   const works = [];
   for (const f of pick) {
     const ok = await clickMarked(page, `() => document.querySelector('wujie-app').shadowRoot.querySelectorAll('.comment-feed-wrap')[${f.i}]`, 'open post comments');
@@ -103,7 +114,59 @@ async function rawComments(page, o) {
     const left = await inShadow(page, `return [...sr.querySelectorAll('*')].filter((e) => e.children.length === 0 && /^展开更多回复$/.test(e.textContent.trim()) && e.getBoundingClientRect().height > 0).length;`);
     works.push({ objectNonce: f.objectNonce, opened: true, clicks, expandLeft: left, items: await inShadow(page, ITEMS_SRC) });
   }
-  return { windowStartSec, ...listState('feeds', feeds, false), works };
+  return { via: 'dom', ...(apiFallback ? { apiFallback } : {}), windowStartSec, ...listState('feeds', feeds, false), works };
+}
+
+// 同 ITEMS_SRC 里的 one：接口给的评论对象和组件 dataSource 是同一份数据
+export const slimApiComment = (c) => ({ commentId: c.commentId, commentNickname: c.commentNickname, commentContent: c.commentContent, commentCreatetime: c.commentCreatetime,
+  commentLikeCount: c.commentLikeCount, replyCommentId: c.replyCommentId ?? null, downContinueFlag: c.downContinueFlag, visibleFlag: c.visibleFlag, readFlag: c.readFlag,
+  likeFlag: c.likeFlag, username: c.username });
+export const listArgs = (exportId, lastBuff, rootCommentId = null) => ({ lastBuff: lastBuff ?? '', exportId, ...(rootCommentId ? { rootCommentId } : {}), commentSelection: false, forMcn: false });
+/** getCommentList 的返回 → data（errCode 为 0、comment 是数组才算），否则 null。 */
+export const listData = (r) => (r?.ok && r.data?.errCode === 0 && Array.isArray(r.data?.data?.comment) ? r.data.data : null);
+
+/**
+ * 接口读评论（S9）。一楼最多 maxPages 页；楼中楼每个作品最多 maxExpand 次请求（同 DOM 路径「展开更多回复」的上限）。
+ * 返回和 DOM 路径一样的 works：没读全的（一楼还有下一页、楼中楼预算用完或出错）记进 expandLeft，parse 判成楼中楼不全。
+ */
+export async function worksViaApi(call, feeds, o) {
+  const works = [];
+  for (const f of feeds) {
+    const roots = [];
+    let buf = '', topLeft = 0, error = null;
+    for (let p = 0; ; p++) {
+      const d = listData(await call('getCommentList', listArgs(f.objectId, buf)));
+      if (!d) { error = '一楼列表接口没返回 errCode=0 的列表'; break; }
+      // 翻页时有新评论插进来，同一条一楼可能跨页重复：按 commentId 去重
+      for (const c of d.comment) if (!roots.some((x) => String(x.commentId) === String(c.commentId))) roots.push(c);
+      if (pageEnd(d.downContinueFlag)) break;
+      // 还有下一页但到上限、翻不动，或标志缺失：一楼没读全
+      if (!pageMore(d.downContinueFlag) || p + 1 >= o.maxPages || !d.lastBuff || d.lastBuff === buf) { topLeft = 1; break; }
+      buf = d.lastBuff;
+    }
+    if (error) { works.push({ objectNonce: f.objectNonce, opened: false, via: 'api', error }); continue; }
+    let calls = 0, left = 0;
+    for (const root of roots) {
+      // 一楼没带 levelTwoComment 字段：不知道有没有楼中楼，按没读全（不当成空楼）
+      const hasL2 = Array.isArray(root.levelTwoComment);
+      root.levelTwoComment = hasL2 ? [...root.levelTwoComment] : [];
+      if (!hasL2) { left++; continue; }
+      while (!pageEnd(root.downContinueFlag)) {
+        if (!pageMore(root.downContinueFlag)) { left++; break; }   // 标志缺失或不认识：按没读全
+        if (!root.lastBuff) { left++; break; }                       // 说还有下一页却没给游标：不拿空游标去请求
+        if (calls >= o.maxExpand) { left++; break; }
+        calls++;
+        const d = listData(await call('getCommentList', listArgs(f.objectId, root.lastBuff, root.commentId)));
+        if (!d) { left++; break; }
+        root.levelTwoComment.push(...d.comment);
+        if (pageMore(d.downContinueFlag) && (!d.lastBuff || d.lastBuff === root.lastBuff)) { left++; break; }
+        root.lastBuff = d.lastBuff; root.downContinueFlag = d.downContinueFlag;
+      }
+    }
+    const items = roots.map((c) => ({ ...slimApiComment(c), levelTwoComment: c.levelTwoComment.map(slimApiComment) }));
+    works.push({ objectNonce: f.objectNonce, opened: true, via: 'api', clicks: calls, expandLeft: left + topLeft, items });
+  }
+  return works;
 }
 
 async function rawDms(page, o) {
@@ -130,6 +193,10 @@ function requireList(list, emptyState, what, note) {
 
 export function parseComments(raw, { accountUid, nickname, fetchedAt }) {
   requireList(raw.feeds, raw.emptyState, '视频号作品列表', raw.note);
+  // S9 接口读：要扫的作品一个都没读到一楼（接口全报错），整个 kind 失败，同步失败会告警；DOM 路径不变
+  if (raw.via === 'api' && raw.works.length && !raw.works.some((w) => w.opened)) {
+    adapterFail('no-data', `${raw.works.length} 个近期作品的评论接口都没读到：${[...new Set(raw.works.map((w) => w.error).filter(Boolean))].join('；') || '原因不明'}`);
+  }
   const myNick = raw.me?.nickname ?? nickname ?? null;
   const feeds = new Map(raw.feeds.map((f) => [f.objectNonce, f]));
   const works = [], comments = [], scannedWorks = [];

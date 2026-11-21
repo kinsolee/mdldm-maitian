@@ -32,13 +32,15 @@ const fail = (reason, error) => ({ ok: false, reason, error: safeError(error) })
  * @param {string} [o.since]   ISO；私信只打开最后消息比它新的会话（小红书），评论只要这之后的（默认近 7 天）
  * @param {object} [o.options] 透传给页面脚本的上限（maxWorks、maxPages…），见各平台文件
  */
-export async function collect({ account, kind, runner, now = Date.now, since = null, options = {} } = {}) {
+export async function collect({ account, kind, runner, now = Date.now, since = null, options = {}, log = (m) => console.error(m) } = {}) {
   if (kind !== 'comments' && kind !== 'dms') return fail('bad-kind', `kind 只能是 comments 或 dms：${kind}`);
   const adapter = ADAPTERS[account?.platformCode];
   if (!adapter) return fail('unsupported-platform', `没有 ${account?.platformCode} 的评论/私信适配器`);
   const run = runner ?? (await import('../../../ego-runner/index.mjs')).runEgoTask;
   const params = { kind, platformCode: account.platformCode, uid: String(account.uid), nickname: account.nickname ?? null,
-    since, now: now(), moduleUrl: moduleUrl(account.platformCode), ...options };
+    since, now: now(), moduleUrl: moduleUrl(account.platformCode), ...options,
+    // 放在 options 后面：只有能力位能决定走接口，调用方传的 readVia 不算
+    readVia: account.capabilities?.readViaApi === true ? 'api' : 'dom' };
   let r;
   try {
     r = await run({ space: account.spaceName, profileId: account.profileId ?? 'Profile 5', timeoutMs: TIMEOUT_MS[kind], params, script: SCRIPT });
@@ -50,6 +52,8 @@ export async function collect({ account, kind, runner, now = Date.now, since = n
   const raw = r.result;
   if (raw?.loginLost) return fail('login-lost', raw.evidence || '页面落到了登录页');
   if (raw?.failed) return fail(raw.failed, raw.error);
+  // S9：开了 readViaApi 却找不到页面服务、退回了 DOM，写一行日志，试跑期好查
+  if (raw?.apiFallback) log(`[engage] ${account.platformCode}:${account.uid} ${kind} 页面内接口没用上：${safeError(raw.apiFallback)}`);
   // G-B7：页面上实际登录的必须是这个账号（同 src/ops/collect.mjs），不符或读不到都不入库
   const seen = normalizeUid(raw?.uidSeen);
   if (!seen) return fail('no-uid', `页面上没读到登录账号的 uid，没法核对（登记的是 ${account.uid}），没入库`);

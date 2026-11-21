@@ -5,12 +5,17 @@
 //        楼中楼（S6a 核实）：reply_id 是所在楼的一楼 cid，reply_to_reply_id 是直接回复的那条（"0" 表示回复一楼），
 //        reply_to_userid / reply_to_username 是被回复的人。
 //   私信：li.semi-list-item 的 React fiber 往上 2 层 memoizedProps.item（IM SDK Conversation），lastMessage.isFromMe 判 last.by。
+//   S9 页面内接口（账号能力位 readViaApi 打开时，params.readVia = 'api'）：作品列表照旧抄页面自己发的 item/list，
+//        一楼、楼中楼改成调页面自己的评论服务（awemeV1CommentListSelect / awemeV1CommentListReply，见 ../inpage-api.mjs），
+//        不再点「选择作品」「查看回复」。翻页上限同 DOM 路径（一楼 maxSelectPages 页、楼中楼共 maxExpand 次请求），原始数据形状不变。
+//        找不到页面服务时退回 DOM 路径（raw.apiFallback 写明原因）。
 // 不点「回复」、不往输入框里写字、不调 Context 上的写函数。
+import { countOf, pageEnd, pageMore, serviceCaller } from '../inpage-api.mjs';
 import { open, atLogin, bigJson, capCount, captured, clickMarked, installHook, mainPage, sleep, waitCaptured } from './page-lib.mjs';
 import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
 export const FILE = 'douyin.mjs';
-export const LIMITS = { maxWorks: 8, maxAgeDays: 30, maxExpand: 25, loadMs: 90000, maxPickerPages: 10 };
+export const LIMITS = { maxWorks: 8, maxAgeDays: 30, maxExpand: 25, loadMs: 90000, maxPickerPages: 10, maxSelectPages: 30, apiGapMs: 800 };
 const COMMENT_PAGE = 'https://creator.douyin.com/creator-micro/interactive/comment';
 const DM_PAGE = 'https://creator.douyin.com/creator-micro/data/following/chat';
 const SELECT = 'comment/list/select';
@@ -54,10 +59,15 @@ async function rawComments(page, o) {
   const itemLists = await bodies(page, 'creator/item/list', 0);
   const itemListCodes = itemLists.map(itemListCodeOf);
   const items = itemLists.filter((j) => itemListCodeOf(j) === 0).flatMap((j) => j.item_info_list).map(slimItem);
+  const { windowStartMs, recent } = recentWorks(items, o);
+  let apiFallback = null;
+  if (o.readVia === 'api') {
+    const call = await serviceCaller(page, 'Douyin', { waitMs: Math.min(o.loadMs, 60000), gapMs: o.apiGapMs });
+    if (call) return { via: 'api', itemListCodes, windowStartMs, items, works: await worksViaApi(call, recent, o) };
+    apiFallback = '页面评论服务没找到，退回 DOM 路径';
+  }
   // 页面渲染很慢（实测 30 秒以上才出「选择作品」按钮）
   for (const end = Date.now() + o.loadMs; Date.now() < end; await sleep(1500)) if (await page.evaluate(new Function(`return !!(${PICKER_SRC})()`))) break;
-  const windowStartMs = o.now - o.maxAgeDays * 86400_000;
-  const recent = items.filter((x) => x.comment_count > 0 && (publishedAt(x.create_time) ?? o.now) >= windowStartMs).slice(0, o.maxWorks);
   // 默认作品的一楼列表比「选择作品」按钮晚到；先切走的话，它晚到的响应会把列表盖回默认作品（2026-11-21 实测）
   if (recent.length) await waitCaptured(page, SELECT, { timeoutMs: 30000 });
   const works = [];
@@ -88,7 +98,61 @@ async function rawComments(page, o) {
     const replies = (await bodies(page, REPLY, from)).map(slimList);
     works.push({ item_id_plain: it.item_id_plain, opened: true, clicks, expandLeft: left.length, expandLeftTexts: left, select, replies, selectErrors });
   }
-  return { itemListCodes, windowStartMs, items, works };
+  return { via: 'dom', ...(apiFallback ? { apiFallback } : {}), itemListCodes, windowStartMs, items, works };
+}
+
+/** 近 maxAgeDays 天、评论数 > 0 的作品，最多 maxWorks 个（DOM、接口两条路径共用）。 */
+export function recentWorks(items, o) {
+  const windowStartMs = o.now - o.maxAgeDays * 86400_000;
+  return { windowStartMs, recent: items.filter((x) => x.comment_count > 0 && (publishedAt(x.create_time) ?? o.now) >= windowStartMs).slice(0, o.maxWorks) };
+}
+
+// 参数同页面自己发的一楼请求（探针看到的：aweme_id、cursor、count=10、comment_select_options=0、sort_options=0、channel_id=618；app_id、aid、device_platform 由页面封装补）
+export const selectArgs = (awemeId, cursor) => ({ aweme_id: String(awemeId), cursor, count: 10, comment_select_options: 0, sort_options: 0, channel_id: 618 });
+export const replyArgs = (cid, cursor) => ({ comment_id: String(cid), cursor, count: 10, channel_id: 618 });
+
+/**
+ * 接口读一楼和楼中楼（S9）。call 是 ../inpage-api.mjs 的 serviceCaller 给的。返回和 DOM 路径一样的 works（parse 不变）：
+ * 一楼最多 maxSelectPages 页，接口出错记进 selectErrors；楼中楼每个作品最多 maxExpand 次请求（同 DOM 路径的「展开」上限），用完还没读完的楼数记 expandLeft。
+ */
+export async function worksViaApi(call, recent, o) {
+  const works = [];
+  for (const it of recent) {
+    const select = [], selectErrors = [], replies = [];
+    let cursor = 0;
+    for (let p = 0; p < o.maxSelectPages; p++) {
+      const r = await call('awemeV1CommentListSelect', selectArgs(it.item_id_plain, cursor));
+      const j = r.ok ? slimList(r.data ?? {}) : null;
+      if (!j || j.status_code !== 0 || !Array.isArray(j.comments)) {
+        selectErrors.push({ status_code: j?.status_code ?? null, comments: Array.isArray(j?.comments) ? 'array' : 'missing', ...(r.ok ? {} : { error: r.error }) });
+        break;
+      }
+      select.push(j);
+      // 没有明确翻到底（has_more 不是 0）时，最后一页的 has_more 留着，parse 判成没拿全
+      if (pageEnd(j.has_more) || !pageMore(j.has_more) || j.cursor == null || j.cursor === cursor) break;
+      cursor = j.cursor;
+    }
+    // 一楼跨页可能重复（新评论插进来），按 cid 去重后再拉楼中楼；总数读不到的也拉
+    const roots = new Map();
+    for (const c of select.flatMap((j) => j.comments)) { const n = countOf(c.reply_comment_total); if (n == null || n > 0) roots.set(String(c.cid), c); }
+    let calls = 0, left = 0;
+    for (const cid of roots.keys()) {
+      for (let cur = 0; ;) {
+        if (calls >= o.maxExpand) { left++; break; }
+        calls++;
+        const r = await call('awemeV1CommentListReply', replyArgs(cid, cur));
+        const j = r.ok ? slimList(r.data ?? {}) : { status_code: null, has_more: null, cursor: null, total: null, comments: null };
+        replies.push(j);
+        if (j.status_code !== 0 || !Array.isArray(j.comments) || pageEnd(j.has_more)) break;
+        // 还有下一页却翻不动、或 has_more 缺失：这栋楼没读全
+        if (!pageMore(j.has_more) || j.cursor == null || j.cursor === cur) { left++; break; }
+        cur = j.cursor;
+      }
+    }
+    // 一楼一页都没读到的作品记 opened:false，全部作品都这样时 parse 报 no-data（同步失败会告警），不会悄悄记成功
+    works.push({ item_id_plain: it.item_id_plain, opened: select.length > 0, via: 'api', clicks: calls, expandLeft: left, expandLeftTexts: [], select, replies, selectErrors });
+  }
+  return works;
 }
 
 export const EXPAND_SRC = `() => { const re = /^(查看\\s*\\d+\\s*条回复|展开\\s*\\d*\\s*条?更多回复|展开更多)$/; return [...document.querySelectorAll('div, span, button')].filter((e) => re.test(e.textContent.trim()) && ![...e.children].some((c) => re.test(c.textContent.trim()))); }`;
@@ -209,7 +273,13 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
   if (!codes.length) adapterFail('no-data', '没抓到 /aweme/v1/creator/item/list');
   if (!codes.includes(0)) adapterFail('api-error', `/aweme/v1/creator/item/list status_code=${codes.join(',')}`);
   // G-B5a：有近期作品要扫，却一个都没切过去（「选择作品」改版之类），不能报成功
-  if (raw.works.length && !raw.works.some((w) => w.opened)) adapterFail('no-data', `${raw.works.length} 个近期作品一个都没能切过去（「选择作品」或作品列表没找到）`);
+  if (raw.works.length && !raw.works.some((w) => w.opened)) {
+    if (raw.via === 'api') {
+      const errs = [...new Set(raw.works.flatMap((w) => w.selectErrors ?? []).map((e) => e.error ?? `status_code=${e.status_code}，comments ${e.comments}`))];
+      adapterFail('no-data', `${raw.works.length} 个近期作品的一楼评论接口都没读到：${errs.slice(0, 3).join('；') || '原因不明'}`);
+    }
+    adapterFail('no-data', `${raw.works.length} 个近期作品一个都没能切过去（「选择作品」或作品列表没找到）`);
+  }
   const items = new Map(raw.items.map((x) => [x.item_id_plain, x]));
   const works = [], comments = [], scannedWorks = [];
   const author = (u) => ({ uid: str(u?.uid), nickname: u?.nickname ?? '', isMe: str(u?.uid) === me });
@@ -224,7 +294,12 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     if (!w.opened || !w.select.length) { scannedWorks.push({ workNativeId: wid, complete: false, threadsPartial: true }); continue; }
     const seen = new Map();
     const bad = (j) => j.status_code !== 0 || !Array.isArray(j.comments);
-    for (const j of w.select.filter((x) => !bad(x))) for (const c of j.comments) seen.set(String(c.cid), { ...base(c, wid), parentNativeId: null, rootNativeId: String(c.cid), replyTo: null, replyCount: numOrNull(c.reply_comment_total) });
+    // 同一条一楼跨页重复时回复总数取保守值：任一份读不到就当读不到，都读到取大的（不让后一份把「不知道」盖成 0）
+    for (const j of w.select.filter((x) => !bad(x))) for (const c of j.comments) {
+      const id = String(c.cid), n = numOrNull(c.reply_comment_total), prev = seen.get(id);
+      const replyCount = !prev ? n : prev.replyCount == null || n == null ? null : Math.max(prev.replyCount, n);
+      seen.set(id, { ...base(c, wid), parentNativeId: null, rootNativeId: id, replyTo: null, replyCount });
+    }
     const roots = new Map([...seen.values()].map((c) => [c.nativeId, 0]));
     // X-B3：一楼或子回复有任何一条 status_code 非 0 的响应，这个作品拿不全
     const apiError = (w.selectErrors ?? []).length > 0 || w.select.some(bad) || w.replies.some(bad);
@@ -234,9 +309,11 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
       const id = String(c.cid), root = str(c.reply_id) ?? null;
       if (!root || root === '0') continue;
       const to = str(c.reply_to_reply_id);
+      const first = !seen.has(id);
       seen.set(id, { ...base(c, wid), rootNativeId: root, parentNativeId: to && to !== '0' ? to : root,
         replyTo: c.reply_to_userid ? { uid: str(c.reply_to_userid), nickname: c.reply_to_username ?? null } : null, replyCount: null });
-      if (roots.has(root)) roots.set(root, roots.get(root) + 1);
+      // 同一条楼中楼在几页响应里重复出现时只数一次，否则会把没读全的楼数成读全了
+      if (first && roots.has(root)) roots.set(root, roots.get(root) + 1);
     }
     // 子回复数对不上（没展开完、或分页没跟到）的楼算拿不全
     // 子回复总数缺失时不知道拿全没有，算拿不全（X2-S8）
@@ -244,7 +321,7 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     comments.push(...seen.values());
     const lastSelect = w.select.at(-1);
     // has_more 必须明确是 0/false 才算翻到底
-    const lastPage = lastSelect.has_more === 0 || lastSelect.has_more === false;
+    const lastPage = pageEnd(lastSelect.has_more);
     scannedWorks.push({ workNativeId: wid, complete: lastPage && !partial, threadsPartial: partial });
   }
   // G-B11a：窗口内评论数为 0 的作品（作品列表接口成功）也算扫过、拿全，库里这个作品已删的评论才能标 goneAt

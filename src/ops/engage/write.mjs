@@ -353,7 +353,8 @@ export async function engageWrite(db, input, deps = {}) {
   const { account, actionId } = start;
   let r;
   try {
-    const params = { op: req.op, uid: String(account.uid), nickname: account.nickname ?? null, text: req.text, target: start.target };
+    const params = { op: req.op, uid: String(account.uid), nickname: account.nickname ?? null, text: req.text, target: start.target,
+      writeVia: account.capabilities.writeViaApi === true ? 'api' : 'dom' };
     if (req.spec.family === 'moderate') { delete params.text; params.selfUids = selfUids(db, req.platformCode); }
     r = await runWriter({ account, params });
   } catch (e) { r = { ok: false, reason: 'threw', error: e?.message ?? String(e) }; }
