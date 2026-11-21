@@ -73,7 +73,7 @@ describe('账号表与导入', () => {
     const db = freshDb();
     const a = getAccount(db, 'Bili:478358005');
     for (const c of CAPABILITIES) assert.equal(a.capabilities[c], false, c);
-    assert.equal(CAPABILITIES.length, 11);
+    assert.equal(CAPABILITIES.length, 12);
     assert.throws(() => requireCapability(db, 'Bili:478358005', 'reply'), /Bili:478358005.*reply/);
     setCapability(db, 'Bili:478358005', 'reply', true);
     assert.doesNotThrow(() => requireCapability(db, 'Bili:478358005', 'reply'));

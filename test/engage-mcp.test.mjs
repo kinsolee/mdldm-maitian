@@ -93,7 +93,7 @@ describe('MCP read 组', () => {
 });
 
 // engage 组：口令对上才注册，且只注册 reply_comment、send_dm。测试只走到 runner 之前就返回的路径（能力位关着、库里拦下），绝不起浏览器。
-const ENGAGE_TOOLS = ['reply_comment', 'send_dm'];
+const ENGAGE_TOOLS = ['block_user', 'delete_comment', 'delete_conversation', 'reply_comment', 'send_dm'];
 const TOKEN = 'a'.repeat(64);
 const listNames = async (client) => {
   if (!client.getServerCapabilities()?.tools) return [];
@@ -112,7 +112,7 @@ describe('MCP engage 组（--scope engage）', () => {
     fs.writeFileSync(envFile, `MAITIAN_ENGAGE_TOKEN=${TOKEN}\n`, { mode: 0o600 });
   });
 
-  test('口令和 .env 一致：只注册 reply_comment、send_dm，不带 read 组', async () => {
+  test('口令和 .env 一致：只注册 engage 组（回复、私信、B站处置），不带 read 组', async () => {
     const c = await connect(file, ['--scope', 'engage'], { MAITIAN_ENV_FILE: envFile, MAITIAN_ENGAGE_TOKEN: TOKEN });
     try {
       assert.deepEqual(await listNames(c.client), ENGAGE_TOOLS);
@@ -122,6 +122,10 @@ describe('MCP engage 组（--scope engage）', () => {
       assert.deepEqual(rc.inputSchema.required.sort(), ['commentId', 'idempotencyKey', 'text']);
       const sd = tools.find((t) => t.name === 'send_dm');
       assert.deepEqual(Object.keys(sd.inputSchema.properties).sort(), ['conversationId', 'eventId', 'idempotencyKey', 'text']);
+      const props = (n) => Object.keys(tools.find((t) => t.name === n).inputSchema.properties).sort();
+      assert.deepEqual(props('delete_comment'), ['commentId', 'eventId', 'idempotencyKey']);
+      assert.deepEqual(props('block_user'), ['eventId', 'idempotencyKey', 'target']);
+      assert.deepEqual(props('delete_conversation'), ['conversationId', 'eventId', 'idempotencyKey']);
       assert.ok(!c.stderr().includes(TOKEN));
     } finally { await c.client.close(); }
   });
@@ -165,5 +169,15 @@ describe('MCP engage 组（--scope engage）', () => {
       const row = db.prepare('SELECT caller, status, reason FROM actions').get();
       assert.deepEqual({ ...row }, { caller: 'mcp:test', status: 'rejected', reason: 'capability-off' });
     } finally { db.close(); }
+  });
+
+  test('处置工具：非 B站 → rejected unsupported-platform，不起 runner', async () => {
+    const c = await connect(file, ['--scope', 'engage'], { MAITIAN_ENV_FILE: envFile, MAITIAN_ENGAGE_TOKEN: TOKEN });
+    try {
+      for (const [name, args] of [['delete_comment', { commentId: 'Douyin:a' }], ['block_user', { target: 'Douyin:a' }], ['delete_conversation', { conversationId: 'Douyin:c' }]]) {
+        const r = (await call(c.client, name, { ...args, idempotencyKey: `k-${name}` })).value;
+        assert.deepEqual([r.status, r.reason, r.sendAttempted], ['rejected', 'unsupported-platform', false], name);
+      }
+    } finally { await c.client.close(); }
   });
 });
