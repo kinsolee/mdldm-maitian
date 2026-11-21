@@ -140,6 +140,50 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
     test('私信：输入框内容不一致 → input-mismatch', async () => { const x = await dm('mangle'); assertNoSend(x, 'input-mismatch'); assertCleared(x); });
   });
 
+  // 2026-11-21 真实页面（Douyin:106707338905 评论管理页）只读核对后做的测试页：fiber 上是视图模型（没有 cid + text），
+  // 回复按钮是 operations- 下带图标的 div，发送按钮没字时 disabled。旧测试页的结构对不上真实页面，第一次真实调用就找不到「回复」。
+  describe('抖音（真实页面结构）', () => {
+    const s = space('dyr');
+    const base = { uid: '106', nickname: '麦田测试号', test: { loginFromPage: true } };
+    const TEXT = '谢谢支持！';
+    const reply = (mode, target = {}, extra = {}) => write(s, 'douyin.mjs', { ...base, op: 'reply', text: TEXT,
+      target: { commentId: 'c1', workId: '7001', parentId: null, rootId: 'c1', authorUid: '501', authorNickname: '甲', commentText: '第一条评论', ...target },
+      urls: { comments: pageUrl('douyin-comments-real.html', { mode }) }, ...extra });
+    const sub = { commentId: 'c1r1', parentId: 'c1', rootId: 'c1', authorUid: '502', authorNickname: '乙', commentText: '楼中楼一条' };
+    const untouched = (x) => { assert.equal(x.probe.top, ''); assert.equal(x.probe.deleteClicks, 0); assert.equal(x.probe.reportClicks, 0); };
+
+    test('回复一楼：找到「回复」、只点一次发送、回读到一条', async () => {
+      const x = await reply('ok');
+      assertSent(x, 'n1');
+      untouched(x);
+      assert.deepEqual(x.probe.mine, [{ cid: 'n1', text: TEXT, reply_id: 'c1', reply_to_reply_id: '0' }]);
+    });
+    test('回复一楼：没有可抄的写接口响应时，从页面渲染出的新回复回读', async () => {
+      const x = await reply('okdom');
+      assertSent(x, 'n1');
+      untouched(x);
+    });
+    test('回复楼中楼：展开后找到那条楼中楼自己的「回复」', async () => {
+      const x = await reply('ok', sub);
+      assertSent(x, 'n1');
+      untouched(x);
+      assert.deepEqual(x.probe.mine, [{ cid: 'n1', text: TEXT, reply_id: 'c1', reply_to_reply_id: 'c1r1' }]);
+    });
+    test('一楼下已有我的直接回复：already-replied', async () => assertNoSend(await reply('replied'), 'already-replied'));
+    test('我在楼里回的是楼中楼，不算回过一楼：照常发', async () => assertSent(await reply('otherreply'), 'n1'));
+    test('我回过的楼中楼再回一次：already-replied', async () => assertNoSend(await reply('otherreply', sub), 'already-replied'));
+    test('目标评论已删除：comment-gone', async () => assertNoSend(await reply('gone'), 'comment-gone'));
+    test('找不到目标评论：target-not-found', async () => assertNoSend(await reply('ok', { commentId: 'nope', rootId: 'nope' }), 'target-not-found'));
+    test('输入后「发送」仍是 disabled：cannot-send，框已清空，不点', async () => {
+      const x = await reply('locked');
+      assertNoSend(x, 'cannot-send');
+      assertCleared(x);
+    });
+    test('输入框内容不一致：input-mismatch，框已清空', async () => { const x = await reply('mangle'); assertNoSend(x, 'input-mismatch'); assertCleared(x); untouched(x); });
+    test('点了发送但回读不到', async () => { const x = await reply('silent'); assertNotReadBack(x); assert.equal(x.r.sendError, undefined); });
+    test('页面报错：sendError', async () => { const x = await reply('fail'); assertNotReadBack(x); assert.match(x.r.sendError, /回复失败/); });
+  });
+
   describe('视频号', () => {
     const s = space('chw');
     const base = { uid: 'v2_me', nickname: '麦田测试号', test: { loginFromPage: true } };

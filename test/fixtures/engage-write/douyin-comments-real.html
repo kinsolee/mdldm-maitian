@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>抖音评论管理（真实结构写入测试页）</title>
+<style>
+  body { font: 14px sans-serif; margin: 20px; }
+  [contenteditable] { border: 1px solid #999; min-height: 22px; padding: 4px; }
+  .operations-WFV7Am { display: flex; gap: 12px; }
+  .item-M3fSkJ { cursor: pointer; color: #36c; }
+  .container-sXKyMs { display: flex; gap: 8px; padding: 6px; border-bottom: 1px solid #eee; }
+  .reply-list-QwXCb_ { margin-left: 32px; }
+  .load-more-pDyh1o { color: #36c; cursor: pointer; }
+  .semi-toast-wrapper { position: fixed; top: 4px; right: 4px; }
+</style>
+</head>
+<body>
+<!--
+  仿 2026-11-21 在 Douyin:106707338905 的评论管理页上只读导出的结构（昵称、正文已换成占位）：
+  - 评论块 div.container-sXKyMs：自己的 fiber 往上 1 层是评论块组件，props 是视图模型
+      { id, content, uid, levelOneCid, username, canReply, replyComments: { show, count, list, hasMore } }，没有 cid / text。
+  - 操作区 div.operations-WFV7Am > div.item-M3fSkJ（图标 span + 文字「回复」「删除」「举报」），
+      按钮的 fiber 往上 3 层是操作区组件，props { cid, levelOneCid, uid, replyToUserName, digCount, ... }，也没有 text。
+      hover 前后结构不变，按钮一直在。
+  - 点「回复」后，在操作区的父元素里插入 div.reply-content-obcMk0 > div.wrap-NeUN4f >
+      div.container-caZWO6 > div.input-d24X73[contenteditable] 和 footer 里的「取消」「发送」两个 button；
+      「发送」在框里没字时带 disabled。框的 fiber 往上 7 层是目标评论的操作区组件。
+  - 页面顶部另有一个发一级评论的框（同样是 div.input-d24X73，不在 reply-content- 里），还有一条
+      div.operations-o6e97h 的筛选栏（类名也带 operations-）。
+  - 楼中楼在一楼块里的 div.reply-list-QwXCb_ 里，下面一个 div.load-more-pDyh1o「查看 N 条回复」，加载完变「收起」。
+  - 页面自己发 comment/list/select（一楼）和 comment/list/reply（楼中楼）请求，响应里是接口形状的评论对象（cid、text、reply_id、reply_to_reply_id）。
+  模式（?mode=）：ok 发出后渲染我的回复并有写接口响应 | okdom 发出后只渲染、没有可抄的写接口响应
+    | fail 弹「回复失败」 | silent 点了没反应 | mangle 输入后框里内容被改 | locked 输入后「发送」仍是 disabled
+    | gone 目标评论显示已删除 | replied 一楼下已有我的直接回复 | otherreply 我在这楼里回过楼中楼乙（不是直接回一楼）
+    | nouid 页面读不到登录账号
+-->
+<div class="content-wWJcbN"><div class="wrap-NeUN4f"><div class="container-caZWO6"><div class="input-d24X73" contenteditable="true" placeholder="有爱评论，说点好听的~" id="top-box"></div></div>
+  <div class="footer-oZJTJd"><div class="right-zLR6K3"><button class="douyin-creator-interactive-button" disabled type="button"><span class="douyin-creator-interactive-button-content">发送</span></button></div></div></div></div>
+<div class="operations-o6e97h"><div class="container-Pr4RHc"><span>全部评论</span><span>最新发布</span></div></div>
+<div id="list"></div>
+<div id="toast" class="semi-toast-wrapper"></div>
+<script>
+const mode = new URLSearchParams(location.search).get('mode') || 'ok';
+const ME = '106';
+const FK = '__reactFiber$wtest';
+if (mode !== 'nouid') window.__loginUser = { uid: ME, nickname: '麦田测试号' };
+const WORK = '7001';
+const cap = (window.__engCap ||= []);
+const API = 'https://creator.douyin.com/web/api/third_party/aweme/api/comment/';
+let sendClicks = 0, deleteClicks = 0, reportClicks = 0, seq = 0;
+// 接口形状的评论
+const C = (cid, uid, nick, text, extra = {}) => ({ cid, aweme_id: WORK, user: { uid, nickname: nick }, text, reply_id: '0', reply_to_reply_id: '0', reply_comment_total: 0, ...extra });
+const roots = [C('c1', '501', '甲', '第一条评论', { reply_comment_total: 1 }), C('c2', '503', '丙', '第二条评论')];
+const subs = { c1: [C('c1r1', '502', '乙', '楼中楼一条', { reply_id: 'c1' })] };
+if (mode === 'replied') { roots[0].reply_comment_total = 2; subs.c1.push(C('c1me', ME, '麦田测试号', '之前回过了', { reply_id: 'c1' })); }
+if (mode === 'otherreply') { roots[0].reply_comment_total = 2; subs.c1.push(C('c1me', ME, '麦田测试号', '回乙的', { reply_id: 'c1', reply_to_reply_id: 'c1r1' })); }
+const expanded = {};
+// 页面加载时自己拉的一楼列表
+cap.push({ url: API + 'read/aweme/v1/web/comment/list/select/', t: Date.now(), body: JSON.stringify({ status_code: 0, comments: roots, has_more: 0 }) });
+
+// 视图模型（页面组件 props 的形状）
+const itemProps = (c) => ({ keyword: undefined, content: c.text, id: c.cid, uid: c.user.uid, levelOneCid: c.reply_id === '0' ? c.cid : c.reply_id, buried: false, canReply: true,
+  username: c.user.nickname, publishTime: '昨天', digged: false, images: [], isAuthor: c.user.uid === ME, digNum: 0,
+  ...(c.reply_id === '0' ? { replyComments: { show: true, count: c.reply_comment_total, list: [], hasMore: !expanded[c.cid] && c.reply_comment_total > 0 } } : {}) });
+const opsProps = (c) => ({ digCount: 0, digged: false, cid: c.cid, replyToUserName: c.user.nickname, levelOneCid: c.reply_id === '0' ? c.cid : c.reply_id, disabled: false, buried: false, uid: c.user.uid, isAuthor: c.user.uid === ME });
+// 仿 React：元素上挂 __reactFiber$xxx，return 链上第 n 层的 memoizedProps 是 propsList[n]
+function fiberize(el, propsList) { let f = null; for (const p of [...propsList].reverse()) f = { memoizedProps: p, return: f }; el[FK] = f; }
+
+function item(c) {
+  const el = document.createElement('div');
+  el.className = 'container-sXKyMs';
+  fiberize(el, [{ className: el.className }, itemProps(c), { children: null }]);
+  const gone = mode === 'gone' && c.cid === 'c1';
+  el.innerHTML = `<span class="douyin-creator-interactive-avatar"><img></span>
+    <div class="content-FM0UMi"><div>
+      <div class="username-aLgaNB">${c.user.nickname}${c.user.uid === ME ? '<span class="tag-DAEcKE">作者</span>' : ''}</div>
+      <div class="time-NRtTXO">昨天23:45</div>
+      <div class="comment-content-text-JvmAKq">${gone ? '该评论已删除' : c.text}</div>
+      <div class="op-parent"><div class="operations-WFV7Am">
+        <div class="item-M3fSkJ"><span role="img" class="dux-icon"><svg></svg></span> 0</div>
+        <div class="item-M3fSkJ"><div class="tooltip-inner-MlILhi"><span role="img" class="dux-icon"><svg></svg></span></div></div>
+        <div class="item-M3fSkJ" data-op="reply"><span role="img" class="dux-icon"><svg></svg></span>回复</div>
+        <div class="item-M3fSkJ" data-op="delete"><span role="img" class="dux-icon"><svg></svg></span>删除</div>
+        <div class="item-M3fSkJ" data-op="report"><div class="tooltip-inner-MlILhi"><span role="img" class="dux-icon"><svg></svg></span>举报</div></div>
+      </div></div>
+    </div></div>`;
+  const ops = el.querySelector('.operations-WFV7Am');
+  el.querySelector('.op-parent').className = '';
+  const chainOf = (btn) => [{ className: btn.className, onClick() {} }, { className: ops.className }, { className: '' }, opsProps(c), {}, { className: 'content' }, {}, itemProps(c)];
+  for (const b of ops.children) fiberize(b, chainOf(b));
+  fiberize(ops, chainOf(ops).slice(1));
+  ops.querySelector('[data-op=reply]').onclick = () => openReply(ops.parentElement, c);
+  ops.querySelector('[data-op=delete]').onclick = () => { deleteClicks++; };
+  ops.querySelector('[data-op=report]').onclick = () => { reportClicks++; };
+  return el;
+}
+
+function render() {
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  for (const r of roots) {
+    const block = item(r);
+    const s = subs[r.cid] || [];
+    if (s.length) {
+      const rl = document.createElement('div');
+      rl.className = 'reply-list-QwXCb_';
+      if (expanded[r.cid]) for (const x of s) rl.appendChild(item(x));
+      const more = document.createElement('div');
+      more.className = 'load-more-pDyh1o';
+      more.textContent = expanded[r.cid] ? '收起' : `查看 ${s.length} 条回复`;
+      more.onclick = () => {
+        if (expanded[r.cid]) return;
+        expanded[r.cid] = true;
+        cap.push({ url: API + 'read/aweme/v1/web/comment/list/reply/', t: Date.now(), body: JSON.stringify({ status_code: 0, comments: s, has_more: 0 }) });
+        render();
+      };
+      rl.appendChild(more);
+      block.querySelector('.content-FM0UMi > div').appendChild(rl);
+    }
+    list.appendChild(block);
+  }
+}
+
+function openReply(opParent, c) {
+  document.querySelectorAll('.reply-content-obcMk0').forEach((x) => x.remove());
+  const box = document.createElement('div');
+  box.className = 'reply-content-obcMk0';
+  box.innerHTML = `<span class="douyin-creator-interactive-avatar"><img></span><div class="wrap-NeUN4f"><div class="container-caZWO6">
+      <div class="input-d24X73" contenteditable="true" placeholder="回复 ${c.user.nickname}："></div></div>
+    <div class="footer-oZJTJd"><div class="btn-MFRja5"></div><div class="right-zLR6K3">
+      <button type="button" class="douyin-creator-interactive-button cancel-MbZdXf"><span class="douyin-creator-interactive-button-content">取消</span></button>
+      <button type="button" class="douyin-creator-interactive-button send-btn" disabled aria-disabled="true"><span class="douyin-creator-interactive-button-content">发送</span></button>
+    </div></div></div>`;
+  opParent.appendChild(box);
+  const ed = box.querySelector('[contenteditable]');
+  fiberize(ed, [{}, {}, {}, {}, {}, {}, {}, opsProps(c)]);
+  const send = box.querySelector('.send-btn');
+  ed.addEventListener('input', () => {
+    if (mode === 'mangle' && !ed.dataset.m) { ed.dataset.m = '1'; ed.textContent = ed.textContent + '（已过滤）'; }
+    const has = !!ed.innerText.trim() && mode !== 'locked';
+    send.disabled = !has;
+    send.setAttribute('aria-disabled', String(!has));
+  });
+  box.querySelector('.cancel-MbZdXf').onclick = () => box.remove();
+  send.onclick = () => onSend(c, ed);
+}
+
+function toast(msg) { document.getElementById('toast').innerHTML = `<div class="semi-toast-content"><span class="semi-toast-content-text">${msg}</span></div>`; }
+
+function onSend(target, ed) {
+  sendClicks++;
+  const text = ed.innerText;
+  if (mode === 'fail') { setTimeout(() => toast('回复失败，请稍后重试'), 200); return; }
+  if (mode === 'silent') return;
+  const root = target.reply_id && target.reply_id !== '0' ? target.reply_id : target.cid;
+  const n = C('n' + (++seq), ME, '麦田测试号', text, { reply_id: root, reply_to_reply_id: root === target.cid ? '0' : target.cid });
+  setTimeout(() => {
+    (subs[root] ||= []).push(n);
+    expanded[root] = true;
+    render();
+    if (mode !== 'okdom') cap.push({ url: API + 'write/aweme/v1/web/comment/reply/', t: Date.now(), body: JSON.stringify({ status_code: 0, comment: n }) });
+  }, 300);
+}
+
+window.__probe = () => ({
+  sendClicks, deleteClicks, reportClicks,
+  top: document.getElementById('top-box').innerText,
+  boxes: [...document.querySelectorAll('[class*=reply-content-] [contenteditable=true]')].map((b) => b.innerText),
+  mine: Object.values(subs).flat().filter((x) => x.user.uid === ME && x.cid.startsWith('n')).map((x) => ({ cid: x.cid, text: x.text, reply_id: x.reply_id, reply_to_reply_id: x.reply_to_reply_id })),
+});
+render();
+</script>
+</body>
+</html>

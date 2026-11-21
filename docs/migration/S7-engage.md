@@ -145,7 +145,7 @@ sqlite3 data/ops.db "SELECT id, createdAt, op, targetId, status, reason, sendAtt
 | 平台 | 回复评论 | 私信 | 怎么验证过 |
 |---|---|---|---|
 | B站 | 接口：`x/v2/reply/add`（楼中楼的正文前加「回复 @昵称 :」），用 `x/v2/reply/reply` 拉整楼重读和回读 | 接口：`web_im/v1/web_im/send_msg`，用 `svr_sync/v1/svr_sync/fetch_session_msgs` 重读和回读，回读只数这次之后的新消息 | 假 B站接口（`test/engage-writer-bili.test.mjs`）。真实账号还没发过。私信发送的表单字段按网页版写法，没在真实平台上核实 |
-| 抖音 | 页面：评论管理页，回复框 `[class*=reply-content-] [contenteditable=true]` | 页面：`[class*=chat-editor-] [contenteditable=true]` | 只在本地测试页上验证过（`test/engage-writers-page.test.mjs`） |
+| 抖音 | 页面：评论管理页。「回复」是 `[class*=operations-]` 下文字为「回复」的子元素，按 fiber 上操作区组件的 `cid` 认目标；回复框 `[class*=reply-content-] [contenteditable=true]`；发送是同一个 reply-content- 里唯一的、没 disabled 的「发送」button | 页面：`[class*=chat-editor-] [contenteditable=true]` | 评论：2026-11-21 在真实评论管理页上只读核对过结构（找评论、「回复」按钮、回复框、发送按钮、楼中楼），测试页 `test/fixtures/engage-write/douyin-comments-real.html` 按真实结构做；还没真发过，写接口的地址和响应没见过。私信只在本地测试页上验证过 |
 | 视频号 | 页面：`textarea.create-input`（在 wujie shadowRoot 里） | 页面：`textarea.edit_area` | 只在本地测试页上验证过 |
 | 小红书 | 页面：`textarea.comment-input` | 页面：`div.xhs-im-input-bar-editor` | 只在本地测试页上验证过 |
 

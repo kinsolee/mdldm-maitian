@@ -5,7 +5,7 @@
 import { atLogin, capCount, captured, bigJson, installHook, mainPage, open, sleep } from '../adapters/page-lib.mjs';
 import { redact } from '../redact.mjs';
 
-export const DEFAULT_TIMEOUTS = { loadMs: 60000, readbackMs: 10000, settleMs: 3000, boxMs: 10000 };
+export const DEFAULT_TIMEOUTS = { loadMs: 60000, readbackMs: 10000, settleMs: 3000, boxMs: 10000, sendMs: 2000 };
 
 /** 比较用的正文：统一换行、nbsp、零宽字符，去掉末尾换行（contenteditable 的 innerText 常多一个）。 */
 export const norm = (s) => String(s ?? '').replace(/\r\n?/g, '\n').replace(/ /g, ' ').replace(/[​‌‍﻿]/g, '').replace(/\n+$/, '');
@@ -152,9 +152,10 @@ export async function runWrite(task, params, plat) {
     if (step.blocked) return { ...out, blocked: step.blocked, ...(step.detail ? { detail: redact(step.detail) } : {}) };
     const typed = await typeText(page, params.text);
     if (typed.blocked) return { ...out, ...typed };
-    if (step.send !== 'enter' && !(await mark(page, 'send', step.send))) {
+    // 输入后页面要重渲染一下才把发送按钮从 disabled 放开，最多等 sendMs 再找
+    if (step.send !== 'enter' && !(await waitFor(() => mark(page, 'send', step.send), t.sendMs, 250))) {
       await clearBox(page);
-      return { ...out, blocked: 'cannot-send', detail: '输入框旁边没找到发送按钮，已清空输入框，没点发送' };
+      return { ...out, blocked: 'cannot-send', detail: '输入框旁边没找到能点的发送按钮（没有，或一直是 disabled），已清空输入框，没点发送' };
     }
     const before = new Set((await step.items()).map((x) => String(x.id)));
     const toastBefore = new Set(await toasts(page));

@@ -1,10 +1,14 @@
 // 抖音页面写入：回复评论（评论管理页）、发私信（私信页）。和读适配器 adapters/douyin.mjs 用同一套页面。
 //   账号：GET /web/api/media/user/info/ 的 user.uid（同读适配器），status_code=8 算掉线。
-//   回复：评论区元素的 React fiber 往上找 props 里带 cid 的评论对象（同读适配器 switchTo 找 item_id_plain 的做法），
-//        再并上页面自己发的 comment/list/select、comment/list/reply 等响应（installHook 抄回）里的评论对象。
+//   回复：评论区元素的 React fiber 往上找评论，再并上页面自己发的 comment/list/select、comment/list/reply 等响应（installHook 抄回）
+//        里的评论对象；两边对不上时以接口响应为准。真实页面（2026-11-21 只读核对）fiber 上是视图模型，不是接口对象：
+//          评论块 div.container-*：组件 props { id, content, uid, levelOneCid, username, replyComments: { count } }；
+//          操作区 [class*=operations-] > div.item-*（图标 + 「回复」「删除」「举报」）：按钮往上 3 层组件 props { cid, levelOneCid, uid, replyToUserName }。
+//        视图模型里没有「直接回复的是谁」（reply_to_reply_id），这个只能从接口响应拿。
 //        目标不在当前作品就点「选择作品」切过去（读适配器的 switchTo）；目标所在楼没展开完就点「查看 N 条回复」（只读）。
 //        「已有我的回复」：同楼里有 user.uid 是我、reply_to_reply_id 指向目标（目标是一楼时 reply_id 是它、reply_to_reply_id 为 "0"）的。
-//        输入框只用 [class*=reply-content-] [contenteditable=true]（页面顶部另有一个发一级评论的框，绝不碰）。
+//        输入框只用 [class*=reply-content-] [contenteditable=true]（页面顶部另有一个发一级评论的框，类名一样但不在 reply-content- 里，绝不碰）。
+//        发送按钮只认这个 reply-content- 里文字是「发送」、没 disabled 的 button（框里没字时页面给它 disabled）。
 //   私信：li.semi-list-item 的 fiber 往上 2 层 memoizedProps.item（IM SDK Conversation，同读适配器），lastMessage.isFromMe 判最后一句；
 //        点开会话后，再从聊天区元素的 fiber 里找消息对象（isFromMe、content、clientMessageId / serverId、conversationId）复核和回读。
 //        输入框只用 [class*=chat-editor-] [contenteditable=true]。
@@ -46,7 +50,19 @@ const __findUp = (el, pick, levels = 8, depth = 15) => {
   for (let e = el, i = 0; e && i < levels; e = e.parentElement, i++)
     for (let f = __fiber(e), j = 0; f && j < depth; f = f.return, j++) { const p = f.memoizedProps; if (p && typeof p === 'object') { const v = pick(p); if (v) return v; } }
   return null; };
-const __pickComment = (p) => (p.cid != null && 'text' in p ? p : Object.values(p).find((v) => v && typeof v === 'object' && !Array.isArray(v) && v.cid != null && 'text' in v)) || null;
+// 评论对象：接口形状 { cid, text } 原样；评论块的视图模型 { id, content, levelOneCid } 转成接口形状（拿不到 reply_to_reply_id，留空）
+const __asComment = (v) => {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  if (v.cid != null && 'text' in v) return v;
+  if (v.id != null && 'content' in v && 'levelOneCid' in v) {
+    const one = v.levelOneCid == null || String(v.levelOneCid) === String(v.id);
+    return { cid: v.id, text: v.content ?? '', user: v.uid != null ? { uid: v.uid } : null, reply_id: one ? '0' : v.levelOneCid,
+      reply_comment_total: one && v.replyComments && Number.isFinite(Number(v.replyComments.count)) ? Number(v.replyComments.count) : null };
+  }
+  return null; };
+const __pickComment = (p) => __asComment(p) || Object.values(p).map(__asComment).find(Boolean) || null;
+// 元素属于哪条评论：评论对象的 cid，或操作区组件 props 的 cid（按钮、回复框往上先碰到的是它）
+const __pickCid = (p) => { const c = __pickComment(p); if (c) return String(c.cid); return p.cid != null && 'levelOneCid' in p ? String(p.cid) : null; };
 const __GONE = /^(该评论已(被)?删除|评论已(被)?删除)/;
 `;
 
@@ -78,10 +94,18 @@ async function comments(page) {
   const { list, gone } = await inPage(page, COMMENTS_SRC);
   const fromCap = (await capturedJson(page, 'comment')).flatMap((c) => findObjects(c.json, (o) => o.cid != null && 'text' in o && typeof o.text === 'string'));
   const m = new Map();
-  for (const c of [...fromCap, ...list]) { const x = slimComment(c); m.set(x.id, { ...m.get(x.id), ...Object.fromEntries(Object.entries(x).filter(([, v]) => v != null)) }); }
+  // 页面上的在前、接口响应在后：同一条两边都有时接口的字段盖过页面的（视图模型缺 reply_to_reply_id、aweme_id）
+  for (const c of [...list, ...fromCap]) { const x = slimComment(c); m.set(x.id, { ...m.get(x.id), ...Object.fromEntries(Object.entries(x).filter(([, v]) => v != null)) }); }
   for (const id of gone) if (m.has(id)) m.get(id).gone = true;
   return [...m.values()].map((x) => ({ root: null, to: null, uid: null, aweme: null, total: null, gone: false, ...x }));
 }
+
+// 回复框所在 reply-content- 里唯一的、可点的「发送」button（没字时页面给它 disabled，点了没反应却会被记成点过发送）
+const SEND = `const box = __marked('box'); const rc = box && box.closest('[class*=reply-content-]'); if (!rc) return null;
+  const hits = [...rc.querySelectorAll('button')].filter((b) => (b.innerText || b.textContent || '').trim() === '发送');
+  if (hits.length !== 1) return null;
+  const b = hits[0];
+  return b.disabled || b.getAttribute('aria-disabled') === 'true' ? null : b;`;
 
 const PICKER = `return !![...document.querySelectorAll('button, [class*=-button]')].find((e) => e.textContent.trim() === '选择作品');`;
 
@@ -124,17 +148,18 @@ async function prepareReply({ page, params, t, me }) {
     return { blocked: 'thread-incomplete', detail: `楼 ${root} 的回复没加载全（已加载 ${loaded}${r?.total != null ? ` / ${r.total}` : ''}），判断不了是否已回复，没发` };
   }
 
+  // 「回复」：操作区的子元素，文字（去掉空白、图标没有文字）等于「回复」，并且按 fiber 属于目标评论。hover 前后都在，不用 hover
   const found = await mark(page, 'reply', FIBER + `return [...document.querySelectorAll('[class*=operations-] > *')]
-    .find((e) => e.textContent.trim() === '回复' && String(__findUp(e, __pickComment)?.cid) === arg) || null;`, id);
+    .find((e) => (e.textContent || '').replace(/\\s+/g, '') === '回复' && __findUp(e, __pickCid) === arg) || null;`, id);
   if (!found) return { blocked: 'target-not-found', detail: `找到了评论 ${id}，但没找到它的「回复」按钮` };
   await page.click(markSel('reply'), { label: 'open reply box' });
   // 只认 reply-content- 里的框：优先挂在目标评论下的那个，否则页面上唯一的那个
   const box = await waitFor(() => mark(page, 'box', FIBER + `const all = [...document.querySelectorAll('[class*=reply-content-] [contenteditable=true]')].filter((e) => e.getClientRects().length);
-    const own = all.filter((e) => String(__findUp(e, __pickComment)?.cid) === arg);
+    const own = all.filter((e) => __findUp(e, __pickCid) === arg);
     return own.length === 1 ? own[0] : all.length === 1 ? all[0] : null;`, id), t.boxMs);
   if (!box) return { blocked: 'no-input-box', detail: '点了「回复」后没出现唯一的回复框（[class*=reply-content-] [contenteditable=true]）' };
   return {
-    send: sendNearBox('^发送$'),
+    send: SEND,
     items: async () => (await comments(page)).map((x) => ({ id: x.id, mine: mine(x), rel: directTo(x) === id, text: x.text })),
     // 点发送后页面自己发的评论写接口（不是 list 类读接口）返回 status_code≠0
     apiError: async (from) => {
