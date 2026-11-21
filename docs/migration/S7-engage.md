@@ -1,6 +1,6 @@
 # S7 MCP engage 组：回复评论、发私信（KIN-326 第一期）
 
-这一期只做 `reply_comment` 和 `send_dm`，以及它们需要的框架。点赞、置顶（`like_comment` / `unlike_comment` / `pin_comment` / `unpin_comment`）留到后续。
+这一期只做 `reply_comment` 和 `send_dm`，以及它们需要的框架。B站另有处置工具 `delete_comment`、`block_user`、`delete_conversation`，见第 8 节。点赞、置顶（`like_comment` / `unlike_comment` / `pin_comment` / `unpin_comment`）留到后续。
 
 - B站：走接口，回复评论和私信都做了，用假 B站接口测过。**还没有在真实账号上发过**。
 - 抖音、视频号、小红书：页面适配器已经写好，只在本地测试页上验证过。能力位默认关着。
@@ -13,7 +13,7 @@ engage 组单独起一个 stdio 服务，和所有 bot 共用的 read 组分开�
 MAITIAN_OPS_DB=<检出>/data/ops.db MAITIAN_ENGAGE_TOKEN=<口令> node <检出>/src/mcp/server.mjs --scope engage
 ```
 
-- `--scope engage` 只注册 `reply_comment` 和 `send_dm`，不带 read 组工具。要读评论树、会话，请用另一个 `--scope read` 服务。
+- `--scope engage` 只注册 `reply_comment`、`send_dm` 和第 8 节的三个处置工具，不带 read 组工具。要读评论树、会话，请用另一个 `--scope read` 服务。
 - 只有进程环境里的 `MAITIAN_ENGAGE_TOKEN` 和仓库根目录 `.env` 里的值一致时，才注册这两个工具。比较用 `src/ops/tokens.mjs` 的 `checkToken`，是常数时间比较。
 - 口令缺失或对不上时，服务照常启动，但一个工具都不注册（`tools/list` 返回空列表），并往 stderr 写一句原因。口令值不会出现在日志、错误和返回值里。
 - `--scope read` 的行为不变。带着口令起 read 服务，也不会注册写工具。
@@ -205,7 +205,108 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 关掉写入：`node src/hub.mjs ops accounts set-cap <账号 id> reply false`（`sendDM` 同理）。连续 2 轮失败时会自动关掉，并发飞书提醒。
 
-## 8. 后续
+## 8. B站处置：删评论、拉黑、删私信会话
+
+用来处理广告评论和广告私信。只做 B站，其他平台调用返回 `rejected` / `unsupported-platform`。三个工具和 `reply_comment` 在同一个 `--scope engage` 服务里，用同一个口令把关，走第 3 节同一套流程：回收、幂等、目标、能力位、库里预检、每轮上限、平台写入租约、在 space 里写、回执、连续失败自动关。
+
+### 工具
+
+| 工具 | 入参 | 做什么 | B站接口 |
+|---|---|---|---|
+| `delete_comment` | `commentId`、`idempotencyKey`、`eventId?` | 删自己作品下别人的一条评论，一楼和楼中楼都可以 | `x/v2/reply/del`（`oid`、`type=1`、`rpid`） |
+| `block_user` | `target`、`idempotencyKey`、`eventId?` | 拉黑一个人 | `x/relation/modify`（`fid`、`act=5`、`re_src=11`） |
+| `delete_conversation` | `conversationId`、`idempotencyKey`、`eventId?` | 从私信会话列表里删掉一个会话 | `session_svr/v1/session_svr/remove_session`（`talker_id`、`session_type=1`） |
+
+- 三个接口都在 `member.bilibili.com` 页面里调，csrf（cookie `bili_jct`）只在页面里读、只在页面里填，不回到 Node。写入脚本是 `src/ops/engage/writers/bili-moderate.mjs`。
+- `block_user` 的 `target` 有三种写法：`Bili:<mid>`、这个人的评论 id、和这个人的私信会话 id（B站会话 id 就是对方 mid）。框架从库里推出 mid，`actions.targetId` 按 `Bili:<mid>` 记，所以同一个人换一种写法也认得出。只认库里见过的人（评论作者或私信对方），没见过的返回 `rejected` / `unknown-target`。群聊、官方号会话的 id 不是用户 mid，返回 `rejected` / `not-a-user`，绝不拿来拉黑。同一个 id 既是评论 id、又是另一个人的 mid 时返回 `rejected` / `ambiguous-target`。
+- `eventId`：`delete_comment` 填这条评论的 `comment.created`，`delete_conversation` 填这个会话的 `dm.received`，`block_user` 填这个人的任一条 `comment.created` 或 `dm.received`。事件必须是 B站同一个账号下的，别的平台 uid 碰巧一样也不算。对不上时返回 `rejected` / `event-mismatch`。
+- `delete_conversation` 只删用户会话，群聊、官方号会话返回 `failed` / `not-a-user`。它只把会话从列表里移除，聊天记录还在。对方再发消息，会话会回到列表里。所以广告私信要先 `block_user`，再 `delete_conversation`。
+
+### 返回字段
+
+和 `reply_comment` 一样（见第 2 节），另外：
+
+- `status` 用 `sent` 表示「已生效，并且回读确认了」，不另设 `done`。这样幂等、每轮上限、连续失败的判断和回复组用同一套规则。
+- `op`：`delete`、`block`、`deleteConversation`。`actions.op` 也是这三个值。
+- `targetId`：`block_user` 是推出来的 `Bili:<mid>`；入参写的是评论 id 或会话 id 时，多一个 `inputTarget`，原样返回入参。
+- `readBack`：`found`（回读确认生效）、`count`（确认生效时为 1，否则为 0）、`nativeId`（被删的评论 rpid、被拉黑的 mid、被删的会话 talker_id）、`detail`。
+- `ackedEvents`：自动回执的事件。处置组回执成 `ignored`（不是 `replied`），`handledNote` 写 `<op> <actionId>`。
+
+### 发前重读和发后回读
+
+| 工具 | 发前重读（命中就不调接口） | 发后回读（满足才算 `sent`） |
+|---|---|---|
+| `delete_comment` | 核对登录账号；作品的作者是我（`view` 的 `owner.mid`）；拉整楼（`x/v2/reply/reply`，最多 10 页）。楼已删或楼里没有这条 → `already-gone`；作者是我 → `self-target`；删楼中楼时整楼没读全（即使这条在第一页）→ `thread-incomplete`，因为删了也确认不了 | 等 2 秒再拉整楼：楼不在了（`12022` / `-404`），或者楼读全了、里面没有这条 |
+| `block_user` | 核对登录账号；mid 是我 → `self-target`；`x/relation?fid=` 的 `attribute` 是 `128` → `already-blocked` | 等 1.5 秒再读 `x/relation?fid=`，`attribute` 是 `128` |
+| `delete_conversation` | 核对登录账号；对方是我 → `self-target`；翻完整个 `get_sessions` 会话列表（最多 50 页，找到了也要翻完）。翻不完 → `list-incomplete`（删了也确认不了）；翻完了没有这个会话 → `already-gone` | 等 1.5 秒再翻一遍列表：翻完了，并且没有这个会话 |
+
+- 接口只调一次。调过之后出任何错都只回读，不重调。
+- 回读不满足时记 `needs_readback`，**绝不重试**。同一个目标换 key 也会被拦（`target-needs-readback`），人工处理方法同第 4 节。
+- 接口明确报错（`code` 不是 0）时不算生效。和回复组不同，处置组调过接口却没确认生效的，一律记 `needs_readback` / `send-error-unconfirmed`（不记 `failed`），所以换 key 也不会再调第二次。例外：`reply/del` 返回 `12022`（调的时候已经被删了），回读确认不在就算 `sent`。
+- 「读全」要求严格：整楼累计读到的条数要达到接口声明的 `page.count`；会话列表 `has_more` 为真时给了空页、或翻页游标没往前走，都算没翻完。
+
+### 绝不对自己动手
+
+账号自身的 mid（例如 `Bili:478358005`），以及库里登记的所有 B站账号，一律拒绝，有两层：
+
+1. 框架在库里判断：评论是我的（`authorIsMe = 1`，或作者 uid 是本平台账号）、拉黑对象是本平台账号（库里没见过这个 mid 也一样，先于 `unknown-target` 判）、会话对方是本平台账号，都返回 `rejected` / `self-target`。能力位开没开都一样，不起 runner。
+2. 写入脚本在页面上再核一次：评论作者、拉黑 mid、会话 talker 是登录账号或本平台账号时，返回 `failed` / `self-target`，不调接口。
+
+### reason 列表
+
+| `status` | `reason` |
+|---|---|
+| `rejected` | `self-target`、`not-a-user`、`unknown-target`、`ambiguous-target`、`capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
+| `failed`（没调接口） | `already-gone`（评论已不在，或会话已不在列表里；库里已标 `goneAt`、之前已删过的同一目标也是这个）、`already-blocked`（已在黑名单里，或之前已拉黑过这个 mid）、`not-a-user`、`not-my-work`、`thread-incomplete`、`list-incomplete`、`target-not-found`、`self-target`、`uid-mismatch`、`no-uid`、`login-lost`、`precheck-error`、`send-error`（页面里没有 `bili_jct`）；space：`space-busy`、`space-user-controlled` |
+| `needs_readback` | `send-error-unconfirmed`、`readback-missing`、`target-needs-readback`、`previous-needs-readback`、`runner-timeout`、`runner-exit-code`、`interrupted` |
+
+`already-gone`、`already-blocked` 时事件不自动回执，需要时调用方自己 `ack_event`。
+
+### 能力位、每轮上限、连续失败自动关
+
+- 能力位：`deleteComment`（删评论）、`block`（拉黑）、`deleteConversation`（删会话，本次新增）。默认全关，各管各的，例如只开 `block` 不能删评论。
+- 每轮上限：每个平台每轮（整点小时）每种操作分别最多 10 条（`MOD_ROUND_LIMIT`），只要调过接口就计数。处置组的条数不占回复组的 15 条，回复组也不占处置组的。
+- 连续失败自动关：处置组单独判断。B站最近两个有处置的轮次都没有一条生效，并且都有调过接口却失败的，就关掉 `deleteComment`、`block`、`deleteConversation` 这三个能力位（回复的能力位不动），返回 `writeDisabled: true`，并用和第 3 节一样的方式（`defaultNotify`）发提醒。`engage_write_trips` 的 `family` 列记 `moderate`（回复组记 `write`，旧记录为空也当 `write`）。回复组的失败不会关处置能力位，处置组的失败也不会关回复能力位。
+
+打开能力位：
+
+```sh
+node src/hub.mjs ops accounts set-cap Bili:478358005 deleteComment true
+node src/hub.mjs ops accounts set-cap Bili:478358005 block true
+node src/hub.mjs ops accounts set-cap Bili:478358005 deleteConversation true
+```
+
+关掉时把 `true` 改成 `false`。
+
+### 私信能不能删会话
+
+能。依据：B站网页版私信接口文档（SocialSisterYi/bilibili-API-collect 的 `docs/message/private_msg.md`）记有 `POST https://api.vc.bilibili.com/session_svr/v1/session_svr/remove_session`，表单是 `talker_id`、`session_type`（1 是用户）、`csrf`、`csrf_token`，可选 `build`、`mobi_app`；返回 `code` 0 成功、-101 没登录、-400 请求错误。文档说明它只把会话从列表里移除，不删聊天记录。本仓库的读适配器已经在用同一组的 `get_sessions`。**这个接口没有在真实账号上调过**，表单字段按文档写，第一次真删时要核对。
+
+### 首次真发验收（每种操作第一次都要负责人当次同意）
+
+删评论、拉黑、删会话都是对外的写操作，第一次在真实账号上做之前，都要负责人在当次对话里同意，并指定目标。最好用负责人自己的小号留一条评论、发一条私信来测，测完从黑名单里移除小号。每种操作分开验，一种没验过就不打开它的能力位。
+
+以删评论为例：
+
+1. 负责人同意本次在 B站真删一条评论，并指定是哪一条。
+2. 用 `list_comments` 或 `get_comment_thread` 确认它在库里，记下 `commentId`。
+3. 打开能力位：`node src/hub.mjs ops accounts set-cap Bili:478358005 deleteComment true`
+4. 让回评官调用 `delete_comment({ commentId, idempotencyKey: "<事件 id>" })`。
+5. 验收：
+   - 返回 `status: "sent"`、`readBack.found: true`。
+   - 在 B站评论管理页上这条评论已经不在，同楼别的评论都还在。
+   - `actions` 表里有这一行，`op = 'delete'`、`status = 'sent'`。
+   - 对应事件的回执是 `ignored`。
+6. 用同一个 key 再调一次，应该返回 `duplicate`，接口没有再调。
+7. 结果写进 PR 或 Linear（脱敏：昵称、正文都不写）。
+
+拉黑：同样的步骤，打开 `block`，调 `block_user({ target: "<小号的评论 id>", idempotencyKey })`。验收时在 B站「黑名单」里能看到小号，`readBack.nativeId` 是小号的 mid。验完在网页上把小号移出黑名单。
+
+删会话：打开 `deleteConversation`，调 `delete_conversation({ conversationId, idempotencyKey })`。验收时网页版私信列表里这个会话不在了。先核对 `remove_session` 的表单字段和返回是不是和文档一致（看 `readBack` 和 `actions` 的 `detail`）。
+
+任何一步返回 `needs_readback`，先去平台上人工确认，查明原因前不要打开下一种操作。
+
+## 9. 后续
 
 - `like_comment` / `unlike_comment`（回读 `likedByMe`）、`pin_comment` / `unpin_comment`（每个作品只能置顶一条，返回里写明被顶掉的是哪条）。
 - 页面平台要在真实页面上核对：怎么找到目标评论、回读的做法。

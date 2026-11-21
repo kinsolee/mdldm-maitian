@@ -3,6 +3,7 @@
 // → 在账号的 space 里跑写入脚本（runner 自带 space 锁；脚本在页面上重读、只发一次、发后回读）→ 落结果、放租约、成功就回执事件
 // → 写入失败时看是否连续 2 轮失败，是就关掉这个平台的写能力位并发提醒。
 // 每次调用都记 actions（含被拒、重复的），只存正文的 sha256。绝不重试：回读不到记 needs_readback，同一个 key 之后也不再发。
+// 处置组（delete、block、deleteConversation，只做 B站）走同一条流程，库里那一半在 moderate.mjs；每轮上限、连续失败自动关和回复组分开算。
 import { createHash, randomUUID } from 'node:crypto';
 import { getAccount, listAccounts, setCapability, PLATFORM_NAMES } from '../accounts.mjs';
 import { ENGAGE_PLATFORMS } from '../../daemon/schedule.mjs';
@@ -10,6 +11,7 @@ import { splitId } from './ids.mjs';
 import { ackEvent } from './query.mjs';
 import { redact } from './redact.mjs';
 import { runWriterInSpace, WRITE_TIMEOUT_MS } from './writers/index.mjs';
+import { MOD_OPS, MOD_CAPS, MOD_ROUND_LIMIT, MOD_PLATFORMS, resolveBlockTarget, loadModTarget, selfTarget, modEventMatches, modAckSubject, modPrecheck, modTargetAccount, selfUids } from './moderate.mjs';
 
 export const STATUSES = ['sent', 'needs_readback', 'failed', 'duplicate', 'rejected'];
 export const ROUND_LIMIT = 15;
@@ -22,9 +24,16 @@ const PENDING_STALE_MS = 30 * 60_000;
 const LEASE_GRACE_MS = 2 * 60_000;
 
 const OPS = {
-  reply: { cap: 'reply', what: 'commentId', eventType: 'comment.created' },
-  sendDM: { cap: 'sendDM', what: 'conversationId', eventType: 'dm.received' },
+  reply: { cap: 'reply', what: 'commentId', eventType: 'comment.created', family: 'write', ackOutcome: 'replied', needsText: true },
+  sendDM: { cap: 'sendDM', what: 'conversationId', eventType: 'dm.received', family: 'write', ackOutcome: 'replied', needsText: true },
+  ...MOD_OPS,
 };
+// 两组各自算每轮上限、各自连续失败自动关：write 组全平台合计 15 条一轮，moderate 组每种操作分别 10 条一轮
+const FAMILIES = {
+  write: { ops: ['reply', 'sendDM'], caps: WRITE_CAPS, limit: ROUND_LIMIT, perOp: false, label: '评论私信写入' },
+  moderate: { ops: Object.keys(MOD_OPS), caps: MOD_CAPS, limit: MOD_ROUND_LIMIT, perOp: true, label: '评论私信处置（删评论、拉黑、删会话）' },
+};
+const inList = (ops) => ops.map((o) => `'${o}'`).join(', ');
 // runner 在脚本开跑之前就失败的原因：肯定没发
 const BEFORE_SCRIPT = { busy: 'space-busy', 'user-controlled': 'space-user-controlled', 'profile-needed': 'profile-needed',
   'profile-rejected': 'profile-rejected', 'bad-space-name': 'bad-space-name', 'spawn-failed': 'runner-not-started', 'open-space-failed': 'runner-not-started' };
@@ -44,16 +53,19 @@ function checkInput({ op, targetId, text, idempotencyKey, eventId = null, caller
   const spec = OPS[op];
   if (!spec) throw new Error(`op 只能是 ${Object.keys(OPS).join('、')}：${op}`);
   const { platformCode } = splitId(targetId, spec.what);
-  if (typeof text !== 'string' || !text.trim()) throw new Error('text 不能为空');
-  if (text.length > MAX_TEXT) throw new Error(`text 最多 ${MAX_TEXT} 字，收到 ${text.length} 字`);
+  if (spec.needsText) {
+    if (typeof text !== 'string' || !text.trim()) throw new Error('text 不能为空');
+    if (text.length > MAX_TEXT) throw new Error(`text 最多 ${MAX_TEXT} 字，收到 ${text.length} 字`);
+  } else text = '';
   if (typeof idempotencyKey !== 'string' || !idempotencyKey.trim() || idempotencyKey.length > 300) throw new Error('idempotencyKey 要是 1 到 300 字的字符串（建议填事件 id）');
   if (eventId != null && (typeof eventId !== 'string' || !eventId)) throw new Error('eventId 要是字符串');
-  return { op, spec, targetId, platformCode, text, idempotencyKey, eventId, caller: caller == null ? null : String(caller).slice(0, 200) };
+  return { op, spec, targetId, inputId: targetId, platformCode, text, idempotencyKey, eventId, caller: caller == null ? null : String(caller).slice(0, 200) };
 }
 
 // ---------- 库里的目标 ----------
 
 function loadTarget(db, req) {
+  if (req.spec.family === 'moderate') return loadModTarget(db, req);
   if (req.op === 'reply') {
     const c = db.prepare('SELECT * FROM comments WHERE id = ?').get(req.targetId);
     if (!c) return null;
@@ -68,6 +80,7 @@ function loadTarget(db, req) {
 
 /** 库里就能看出不该发的：评论已删、已有我对它的直接回复；对方不能收私信、最后一句已是我。 */
 function dbPrecheck(db, req, row) {
+  if (req.spec.family === 'moderate') return modPrecheck(req, row);
   if (req.op === 'reply') {
     if (row.goneAt) return ['comment-gone', `库里这条评论 ${row.goneAt} 起已不在平台上`];
     const mine = db.prepare('SELECT id FROM comments WHERE parentId = ? AND authorIsMe = 1 AND goneAt IS NULL LIMIT 1').get(req.targetId);
@@ -80,6 +93,7 @@ function dbPrecheck(db, req, row) {
 }
 
 function eventMatches(db, req) {
+  if (req.spec.family === 'moderate') return modEventMatches(db, req);
   if (req.eventId == null) return true;
   const e = db.prepare('SELECT type, subjectId FROM events WHERE id = ?').get(req.eventId);
   return !!e && e.type === req.spec.eventType && e.subjectId === req.targetId;
@@ -124,21 +138,26 @@ function targetPrior(db, req, row) {
     ORDER BY status = 'pending' DESC, createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId);
   if (p?.status === 'pending') return ['rejected', 'in-progress', '这个目标正在发', p.id];
   if (p) return ['needs_readback', 'target-needs-readback', `这个目标 ${p.createdAt} 点了发送没回读到，不再发，请人工去平台上看`, p.id];
-  const peerAfter = req.op === 'sendDM' && row.lastBy === 'peer' && row.lastAt ? row.lastAt : null;
+  // 删会话：会话之后又有新消息（lastAt 变了）就是回来了，可以再删
+  const peerAfter = req.op === 'sendDM' ? (row.lastBy === 'peer' && row.lastAt ? row.lastAt : null) : req.spec.sinceLastAt ? row.lastAt ?? null : null;
   const s = peerAfter
     ? db.prepare(`SELECT id, createdAt FROM actions WHERE op = ? AND targetId = ? AND status = 'sent' AND (targetLastAt IS NULL OR targetLastAt = ?)
         ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId, peerAfter)
     : db.prepare(`SELECT id, createdAt FROM actions WHERE op = ? AND targetId = ? AND status = 'sent' ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(req.op, req.targetId);
   if (!s) return null;
-  return ['failed', req.op === 'reply' ? 'already-replied' : 'last-is-me', `这个目标 ${s.createdAt} 已经发过（${s.id}）`, s.id];
+  const reason = req.spec.sentReason ?? (req.op === 'reply' ? 'already-replied' : 'last-is-me');
+  return ['failed', reason, `这个目标 ${s.createdAt} 已经${req.spec.family === 'moderate' ? '处置' : '发'}过（${s.id}）`, s.id];
 }
 
 /** 进程崩溃、被杀留下的 pending：超过 PENDING_STALE_MS 的一律记 needs_readback（不知道点没点发送），并按连续失败判断要不要关写能力位。 */
 function reclaimStale(db, now) {
-  const rows = db.prepare(`SELECT id, platformCode FROM actions WHERE status = 'pending' AND createdAt < ?`).all(iso(now() - PENDING_STALE_MS));
+  const rows = db.prepare(`SELECT id, op, platformCode FROM actions WHERE status = 'pending' AND createdAt < ?`).all(iso(now() - PENDING_STALE_MS));
   for (const r of rows) finishAction(db, r.id, { status: 'needs_readback', reason: 'interrupted', detail: '上一个进程发到一半没落结果', sendAttempted: true }, now);
   const tripped = new Set();
-  for (const code of new Set(rows.map((r) => r.platformCode))) if (maybeTrip(db, code, now)) tripped.add(code);
+  for (const key of new Set(rows.map((r) => `${r.platformCode}\t${OPS[r.op]?.family ?? 'write'}`))) {
+    const [code, family] = key.split('\t');
+    if (maybeTrip(db, code, now, family)) tripped.add(`${code}\t${family}`);
+  }
   return tripped;
 }
 
@@ -183,14 +202,25 @@ function classify(r, account) {
 }
 
 function ackFor(db, req, actionId, now) {
+  const mod = req.spec.family === 'moderate';
+  const { type, subjectId } = mod ? modAckSubject(req) : { type: req.spec.eventType, subjectId: req.targetId };
+  const outcome = req.spec.ackOutcome;
   const ids = new Set(req.eventId ? [req.eventId] : []);
-  for (const { id } of db.prepare('SELECT id FROM events WHERE subjectId = ? AND type = ? AND handledAt IS NULL ORDER BY createdAt').all(req.targetId, req.spec.eventType)) ids.add(id);
+  if (mod) {
+    // 处置组：只回执同平台、目标所属账号的事件
+    const acct = modTargetAccount(db, req);
+    if (type && subjectId && acct) {
+      for (const { id } of db.prepare('SELECT id FROM events WHERE subjectId = ? AND type = ? AND platformCode = ? AND (accountId = ? OR accountId IS NULL) AND handledAt IS NULL ORDER BY createdAt')
+        .all(subjectId, type, req.platformCode, acct)) ids.add(id);
+    }
+  } else if (type && subjectId) for (const { id } of db.prepare('SELECT id FROM events WHERE subjectId = ? AND type = ? AND handledAt IS NULL ORDER BY createdAt').all(subjectId, type)) ids.add(id);
   const acked = [];
   for (const id of ids) {
     const e = db.prepare('SELECT handledOutcome, type, subjectId FROM events WHERE id = ?').get(id);
-    // 只回执这个目标的同类事件
-    if (!e || e.type !== req.spec.eventType || e.subjectId !== req.targetId || e.handledOutcome === 'replied') continue;
-    ackEvent(db, id, 'replied', `${req.op} ${actionId}`, { now, actionId });
+    if (!e || e.handledOutcome === 'replied' || e.handledOutcome === outcome) continue;
+    // 只回执这个目标的同类事件（处置组的 eventId 已在入口按 modEventMatches 核对过）
+    if (id !== req.eventId || !mod) { if (e.type !== type || e.subjectId !== subjectId) continue; }
+    ackEvent(db, id, outcome, `${req.op} ${actionId}`, { now, actionId });
     acked.push(id);
   }
   return acked;
@@ -199,28 +229,32 @@ function ackFor(db, req, actionId, now) {
 // ---------- 连续失败自动关写能力位 ----------
 
 /** 这个平台最近两个有写入的轮次都没有一条发出、且有点过发送却失败的，就关掉写能力位。只看上一次自动关之后的轮次。 */
-function maybeTrip(db, platformCode, now) {
-  const last = db.prepare('SELECT max(trippedAt) at FROM engage_write_trips WHERE platformCode = ?').get(platformCode).at;
+// family：write（回复、私信）或 moderate（删评论、拉黑、删会话），两组的轮次、自动关各算各的
+function maybeTrip(db, platformCode, now, family = 'write') {
+  const f = FAMILIES[family];
+  const ops = inList(f.ops);
+  const last = db.prepare(`SELECT max(trippedAt) at FROM engage_write_trips WHERE platformCode = ? AND coalesce(family, 'write') = ?`).get(platformCode, family).at;
   const after = last ? roundKeyOf(Date.parse(last)) : '';
   const rounds = db.prepare(`SELECT roundKey, max(status = 'sent') anySent, sum(status IN ('failed', 'needs_readback')) fails
-    FROM actions WHERE platformCode = ? AND sendAttempted = 1 AND status <> 'pending' AND roundKey > ? GROUP BY roundKey ORDER BY roundKey DESC LIMIT 2`).all(platformCode, after);
+    FROM actions WHERE platformCode = ? AND op IN (${ops}) AND sendAttempted = 1 AND status <> 'pending' AND roundKey > ? GROUP BY roundKey ORDER BY roundKey DESC LIMIT 2`).all(platformCode, after);
   if (rounds.length < 2 || rounds.some((r) => r.anySent || !r.fails)) return null;
-  const lastFail = db.prepare(`SELECT reason, detail FROM actions WHERE platformCode = ? AND sendAttempted = 1 AND status IN ('failed', 'needs_readback') ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(platformCode);
+  const lastFail = db.prepare(`SELECT reason, detail FROM actions WHERE platformCode = ? AND op IN (${ops}) AND sendAttempted = 1 AND status IN ('failed', 'needs_readback') ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(platformCode);
   const accounts = listAccounts(db, { platform: platformCode });
-  for (const a of accounts) for (const cap of WRITE_CAPS) if (a.capabilities[cap]) setCapability(db, a.id, cap, false);
+  for (const a of accounts) for (const cap of f.caps) if (a.capabilities[cap]) setCapability(db, a.id, cap, false);
   const id = `trip_${randomUUID()}`;
-  db.prepare('INSERT INTO engage_write_trips (id, platformCode, trippedAt, rounds, detail) VALUES (?, ?, ?, ?, ?)')
-    .run(id, platformCode, iso(now()), JSON.stringify(rounds.map((r) => r.roundKey).reverse()), redact(`${lastFail?.reason ?? ''} ${lastFail?.detail ?? ''}`.trim()));
+  db.prepare('INSERT INTO engage_write_trips (id, platformCode, trippedAt, rounds, detail, family) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(id, platformCode, iso(now()), JSON.stringify(rounds.map((r) => r.roundKey).reverse()), redact(`${lastFail?.reason ?? ''} ${lastFail?.detail ?? ''}`.trim()), family);
   return id;
 }
 
 function tripText(t, db) {
   const name = PLATFORM_NAMES[t.platformCode] ?? t.platformCode;
+  const f = FAMILIES[t.family ?? 'write'] ?? FAMILIES.write;
   const ids = listAccounts(db, { platform: t.platformCode }).map((a) => a.id);
   const rounds = JSON.parse(t.rounds).map((r) => `${r}:00Z`).join('、');
-  return `⛔ ${name}评论私信写入连续 2 轮失败，已自动关掉写能力位（${WRITE_CAPS.join('、')}） | ${ids.join('、')}\n`
+  return `⛔ ${name}${f.label}连续 2 轮失败，已自动关掉能力位（${f.caps.join('、')}） | ${ids.join('、')}\n`
     + `失败的轮次（整点小时）：${rounds}\n最后的错误：${t.detail || '（无）'}\n`
-    + `查明原因后重新打开：hub ops accounts set-cap ${ids[0] ?? `${t.platformCode}:<uid>`} reply true（sendDM 同理）`;
+    + `查明原因后重新打开：hub ops accounts set-cap ${ids[0] ?? `${t.platformCode}:<uid>`} ${f.caps[0]} true（${f.caps.slice(1).join('、')} 同理）`;
 }
 
 /** 关能力位的提醒没真发出的，补发；发出才记 alertedAt。 */
@@ -244,10 +278,10 @@ export async function engageWrite(db, input, deps = {}) {
   const { now = Date.now, runWriter = runWriterInSpace, notify = defaultNotifyLazy, log = (s) => console.error(s) } = deps;
   const req = checkInput(input);
   // 这次调用回收时触发了本平台的自动关：返回里 writeDisabled 要是 true
-  const trippedNow = tx(db, () => reclaimStale(db, now)).has(req.platformCode);
+  const trippedNow = tx(db, () => reclaimStale(db, now)).has(`${req.platformCode}\t${req.spec.family}`);
   await sendTripAlerts(db, { notify, now, log });
   const out = (o) => ({ status: o.status, reason: o.reason ?? null, detail: o.detail ?? null, retryable: RETRYABLE.has(o.reason),
-    op: req.op, targetId: req.targetId, accountId: o.accountId ?? null, idempotencyKey: req.idempotencyKey, eventId: req.eventId,
+    op: req.op, targetId: req.targetId, ...(req.targetId !== req.inputId ? { inputTarget: req.inputId } : {}), accountId: o.accountId ?? null, idempotencyKey: req.idempotencyKey, eventId: req.eventId,
     actionId: o.actionId ?? null, sendAttempted: !!o.sendAttempted, readBack: o.readBack ?? null,
     ...(o.previousActionId ? { previousActionId: o.previousActionId } : {}), ackedEvents: o.ackedEvents ?? [], writeDisabled: !!o.writeDisabled || trippedNow });
   const done = (fields) => out({ ...fields, actionId: insertAction(db, req, fields, now) });
@@ -255,11 +289,22 @@ export async function engageWrite(db, input, deps = {}) {
   if (!ENGAGE_PLATFORMS.includes(req.platformCode)) {
     return tx(db, () => done({ status: 'rejected', reason: 'unsupported-platform', detail: `${req.platformCode} 不在评论私信范围（${ENGAGE_PLATFORMS.join('、')}）` }));
   }
+  const family = FAMILIES[req.spec.family];
+  if (req.spec.family === 'moderate' && !MOD_PLATFORMS.includes(req.platformCode)) {
+    return tx(db, () => done({ status: 'rejected', reason: 'unsupported-platform', detail: `${req.op} 只做 ${MOD_PLATFORMS.join('、')}` }));
+  }
 
   const start = tx(db, () => {
     const since = iso(now() - IDEMPOTENCY_WINDOW_MS);
+    // 拉黑：先把评论 id、会话 id 换成对方的 mid，actions 按 mid 记，同一个人换个入口也认得出
+    if (req.op === 'block') {
+      const b = resolveBlockTarget(db, req);
+      if (b.reject) return done({ status: 'rejected', reason: b.reject[0], detail: b.reject[1] });
+      req.block = b;
+      req.targetId = b.targetId;
+    }
     // eventId 最先核对（早于所有幂等检查）：duplicate 也会回执事件，不能回执到别的目标上
-    if (!eventMatches(db, req)) return done({ status: 'rejected', reason: 'event-mismatch', detail: `eventId 不存在，或不是 ${req.targetId} 的 ${req.spec.eventType} 事件` });
+    if (!eventMatches(db, req)) return done({ status: 'rejected', reason: 'event-mismatch', detail: `eventId 不存在，或不是 ${req.inputId} 的${req.spec.eventType ? ` ${req.spec.eventType}` : '评论或私信'}事件` });
     if (otherTarget(db, req, since)) return done({ status: 'rejected', reason: 'idempotency-key-reused', detail: '这个 idempotencyKey 已经用在了别的目标或操作上' });
     const prior = blockingPrior(db, req.idempotencyKey, since);
     if (prior?.status === 'pending' && now() - Date.parse(prior.createdAt) > PENDING_STALE_MS) {
@@ -281,6 +326,9 @@ export async function engageWrite(db, input, deps = {}) {
     const account = getAccount(db, t.accountId);
     if (!account) return done({ status: 'rejected', reason: 'unknown-account', detail: `库里没有账号 ${t.accountId}` });
     const accountId = account.id;
+    // 处置组：对象是我自己（登记过的本平台账号）一律拒绝，能力位开没开都一样
+    const self = req.spec.family === 'moderate' ? selfTarget(db, req, t) : null;
+    if (self) return done({ status: 'rejected', reason: 'self-target', detail: self, accountId });
     if (!account.capabilities[req.spec.cap]) {
       return done({ status: 'rejected', reason: 'capability-off', detail: `账号 ${accountId} 的能力位 ${req.spec.cap} 没开（hub ops accounts set-cap ${accountId} ${req.spec.cap} true）`, accountId });
     }
@@ -289,9 +337,10 @@ export async function engageWrite(db, input, deps = {}) {
     if (tp) return done({ status: tp[0], reason: tp[1], detail: tp[2], accountId, previousActionId: tp[3] });
     const blocked = dbPrecheck(db, req, t.row);
     if (blocked) return done({ status: 'failed', reason: blocked[0], detail: blocked[1], accountId });
-    const used = db.prepare(`SELECT count(*) n FROM actions WHERE platformCode = ? AND roundKey = ? AND (sendAttempted = 1 OR status = 'pending')`).get(req.platformCode, roundKeyOf(now())).n;
-    if (used >= ROUND_LIMIT) return done({ status: 'rejected', reason: 'round-limit', detail: `${PLATFORM_NAMES[req.platformCode]}这一轮（整点小时）已发 ${used} 条，上限 ${ROUND_LIMIT}`, accountId });
-    const actionId = insertAction(db, req, { status: 'pending', accountId, targetLastAt: req.op === 'sendDM' ? t.row.lastAt ?? '' : null }, now);
+    const counted = family.perOp ? [req.op] : family.ops;
+    const used = db.prepare(`SELECT count(*) n FROM actions WHERE platformCode = ? AND roundKey = ? AND op IN (${inList(counted)}) AND (sendAttempted = 1 OR status = 'pending')`).get(req.platformCode, roundKeyOf(now())).n;
+    if (used >= family.limit) return done({ status: 'rejected', reason: 'round-limit', detail: `${PLATFORM_NAMES[req.platformCode]}这一轮（整点小时）${family.perOp ? `${req.op} ` : ''}已 ${used} 条，上限 ${family.limit}`, accountId });
+    const actionId = insertAction(db, req, { status: 'pending', accountId, targetLastAt: req.op === 'sendDM' || req.spec.sinceLastAt ? t.row.lastAt ?? '' : null }, now);
     const held = takeLease(db, req.platformCode, actionId, now);
     if (held) {
       finishAction(db, actionId, { status: 'rejected', reason: 'lease-busy', detail: `${PLATFORM_NAMES[req.platformCode]}正有别的写入方在写（到 ${held.expiresAt}）` }, now);
@@ -304,10 +353,16 @@ export async function engageWrite(db, input, deps = {}) {
   const { account, actionId } = start;
   let r;
   try {
-    r = await runWriter({ account, params: { op: req.op, uid: String(account.uid), nickname: account.nickname ?? null, text: req.text, target: start.target,
-      writeVia: account.capabilities.writeViaApi === true ? 'api' : 'dom' } });
+    const params = { op: req.op, uid: String(account.uid), nickname: account.nickname ?? null, text: req.text, target: start.target,
+      writeVia: account.capabilities.writeViaApi === true ? 'api' : 'dom' };
+    if (req.spec.family === 'moderate') { delete params.text; params.selfUids = selfUids(db, req.platformCode); }
+    r = await runWriter({ account, params });
   } catch (e) { r = { ok: false, reason: 'threw', error: e?.message ?? String(e) }; }
-  const res = classify(r, account);
+  let res = classify(r, account);
+  // 处置组：调过接口、回读又没确认生效的，一律 needs_readback（含接口报错），换 key 也不再调第二次
+  if (req.spec.family === 'moderate' && res.status === 'failed' && res.sendAttempted) {
+    res = { ...res, status: 'needs_readback', reason: 'send-error-unconfirmed', detail: `${res.detail ?? ''}；接口报错、回读也没确认生效，不再调，请人工去平台上看`.replace(/^；/, '') };
+  }
 
   const fin = tx(db, () => {
     finishAction(db, actionId, res, now);
@@ -316,7 +371,7 @@ export async function engageWrite(db, input, deps = {}) {
     // 调用方没给 eventId 时，把这次回执的事件记进 actions（多个用逗号隔开）
     if (!req.eventId && ackedEvents.length) db.prepare('UPDATE actions SET eventId = ? WHERE id = ?').run(ackedEvents.join(','), actionId);
     const failedWrite = res.sendAttempted && (res.status === 'failed' || res.status === 'needs_readback');
-    return { ackedEvents, tripped: failedWrite ? maybeTrip(db, req.platformCode, now) : null };
+    return { ackedEvents, tripped: failedWrite ? maybeTrip(db, req.platformCode, now, req.spec.family) : null };
   });
   if (fin.tripped) await sendTripAlerts(db, { notify, now, log });
   return out({ ...res, accountId: account.id, actionId, ackedEvents: fin.ackedEvents, writeDisabled: !!fin.tripped });
