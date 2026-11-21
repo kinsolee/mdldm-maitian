@@ -376,6 +376,15 @@ describe('B站 delete（假接口）', () => {
     assert.equal(f.posts.length, 0);
   });
 
+  test('R3 Codex-1：目标是第 1 页最后一条、第 2 页少给（count=40 却只有 1 条）→ 取不到可信的后邻居，发前 thread-incomplete，不调接口', async () => {
+    const f = fakeBili({ threads: seqThread(40) });
+    const get = f.api.get;
+    f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data && new URL(url).searchParams.get('pn') === '2') j.data.replies = j.data.replies.filter((x) => x.rpid === 122); return j; };
+    const r = await deleteComment(f.api, P('delete', subOf(120)));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
+    assert.equal(f.posts.length, 0);
+  });
+
   test('删唯一一条楼中楼（前后都没有）→ 回读第 1 页空、count=0 → found', async () => {
     const f = fakeBili({ threads: seqThread(1) });
     const r = await deleteComment(f.api, P('delete', subOf(101)));
@@ -613,6 +622,24 @@ describe('B站 deleteConversation（假接口）', () => {
       assert.deepEqual([r.blocked, r.sendAttempted], ['list-incomplete', false], `第 ${k + 1} 种`);
       assert.equal(f.posts.length, 0);
     }
+  });
+
+  test('R3 Codex-2：翻页游标是 0 → 下一页照样带 end_ts=0，不会回到第一页', async () => {
+    const f = fakeBili();
+    const ends = [];
+    f.api.get = async (url) => {
+      const u = new URL(url);
+      if (u.pathname === '/x/web-interface/nav') return { code: 0, data: { isLogin: true, mid: Number(ME) } };
+      const type = u.searchParams.get('session_type'), end = u.searchParams.get('end_ts');
+      if (type !== '1') return { code: 0, data: { session_list: [], has_more: 0 } };
+      ends.push(end);
+      if (end == null) return { code: 0, data: { session_list: [{ talker_id: 888, session_type: 1, session_ts: 1 }], has_more: 1 } };
+      if (end === '1') return { code: 0, data: { session_list: [{ talker_id: 889, session_type: 1, session_ts: 0 }], has_more: 1 } };
+      return { code: 0, data: { session_list: [], has_more: 0 } };
+    };
+    const r = await deleteConversation(f.api, C('777'));
+    assert.deepEqual(ends, [null, '1', '0']);
+    assert.deepEqual([r.blocked, r.sendAttempted], ['already-gone', false]);
   });
 
   test('R1 Codex-2：会话条目缺 session_type → precheck-error，不当成用户会话、不调接口', async () => {

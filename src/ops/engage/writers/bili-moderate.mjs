@@ -117,7 +117,8 @@ async function after(page, pn, p) {
   if (p.ids.length < PS) return whole(pn, p) ? END : null;
   const next = await page(pn + 1);
   if (!next.ids) return null;
-  if (next.ids.length) return next.ids[0];
+  // 下一页第 1 条也要来自没少给的页
+  if (next.ids.length) return whole(pn + 1, next) ? next.ids[0] : null;
   return pn * PS >= next.count ? END : null;
 }
 
@@ -349,7 +350,7 @@ async function findInGroup(api, talker, type, budget) {
     if (budget.left <= 0) return { present, complete: false };
     if (budget.used++) await api.sleep(300);
     budget.left--;
-    const j = await api.get(`${VC}/session_svr/v1/session_svr/get_sessions?session_type=${type}&group_fold=1&unfollow_fold=0&sort_rule=2${endTs ? `&end_ts=${endTs}` : ''}&build=0&mobi_app=web`);
+    const j = await api.get(`${VC}/session_svr/v1/session_svr/get_sessions?session_type=${type}&group_fold=1&unfollow_fold=0&sort_rule=2${endTs != null ? `&end_ts=${endTs}` : ''}&build=0&mobi_app=web`);
     if (j.code !== 0) return { error: `get_sessions code=${j.code} ${j.message ?? ''}`.trim() };
     // 文档：没有会话时 session_list 是 null
     if (j.data?.session_list === null && !j.data?.has_more) return { present, complete: true };
