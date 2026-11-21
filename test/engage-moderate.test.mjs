@@ -133,6 +133,17 @@ describe('delete_comment', () => {
     assert.deepEqual([r2.status, r2.reason, r2.sendAttempted], ['failed', 'already-gone', false]);
   });
 
+  test('删一楼、下面有回复：writer 说 deletes-thread（rejected）→ rejected deletes-thread，不算调过接口、不占每轮上限；处理完回复后同一条还能再删', async () => {
+    const DT = { uidSeen: ME, sendAttempted: false, blocked: 'deletes-thread', rejected: true, detail: 'r1 是一楼，下面有 2 条回复' };
+    const r = await engageWrite(s.db, del({ targetId: 'Bili:r1', idempotencyKey: 'del-r1' }), s.deps(fakeWriter(DT)));
+    assert.deepEqual([r.status, r.reason, r.sendAttempted, r.ackedEvents], ['rejected', 'deletes-thread', false, []]);
+    const [row] = actions(s.db);
+    assert.deepEqual([row.status, row.reason, row.sendAttempted], ['rejected', 'deletes-thread', 0]);
+    const w = fakeWriter(DONE);
+    assert.equal((await engageWrite(s.db, del({ targetId: 'Bili:r1', idempotencyKey: 'del-r1-2' }), s.deps(w))).status, 'sent');
+    assert.equal(w.calls.length, 1);
+  });
+
   test('读不回 → needs_readback，同一个 key、换个 key 都不再调 writer', async () => {
     const w = fakeWriter(LOST);
     const r = await engageWrite(s.db, del(), s.deps(w));

@@ -186,7 +186,8 @@ function classify(r, account) {
   const x = r.result ?? {};
   if (x.loginLost) return { status: 'failed', reason: 'login-lost', detail: redact(x.evidence), sendAttempted: false };
   if (!x.sendAttempted) {
-    if (x.blocked) return { status: 'failed', reason: String(x.blocked), detail: redact(x.detail), sendAttempted: false };
+    // 写入脚本说「这件事本身不该做」（rejected:true，如删一楼会连带删整楼）记 rejected，其余没动手的记 failed
+    if (x.blocked) return { status: x.rejected === true ? 'rejected' : 'failed', reason: String(x.blocked), detail: redact(x.detail), sendAttempted: false };
     if (x.uidSeen != null && String(x.uidSeen) !== String(account.uid)) return { status: 'failed', reason: 'uid-mismatch', detail: `页面上登录的是 ${x.uidSeen}`, sendAttempted: false };
     return { status: 'failed', reason: 'not-sent', detail: '写入脚本没点发送，也没说原因', sendAttempted: false };
   }

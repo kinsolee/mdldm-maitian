@@ -213,7 +213,7 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 | 工具 | 入参 | 做什么 | B站接口 |
 |---|---|---|---|
-| `delete_comment` | `commentId`、`idempotencyKey`、`eventId?` | 删自己作品下别人的一条评论，一楼和楼中楼都可以 | `x/v2/reply/del`（`oid`、`type=1`、`rpid`） |
+| `delete_comment` | `commentId`、`idempotencyKey`、`eventId?` | 删自己作品下别人的一条评论。楼中楼都可以删；一楼只在下面没有回复时删（见下文「删一楼」） | `x/v2/reply/del`（`oid`、`type=1`、`rpid`） |
 | `block_user` | `target`、`idempotencyKey`、`eventId?` | 拉黑一个人 | `x/relation/modify`（`fid`、`act=5`、`re_src=11`） |
 | `delete_conversation` | `conversationId`、`idempotencyKey`、`eventId?` | 从私信会话列表里删掉一个会话 | `session_svr/v1/session_svr/remove_session`（`talker_id`、`session_type=1`） |
 
@@ -236,14 +236,39 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 | 工具 | 发前重读（命中就不调接口） | 发后回读（满足才算 `sent`） |
 |---|---|---|
-| `delete_comment` | 核对登录账号；作品的作者是我（`view` 的 `owner.mid`）；拉整楼（`x/v2/reply/reply`，最多 10 页）。楼已删或楼里没有这条 → `already-gone`；作者是我 → `self-target`；删楼中楼时整楼没读全（即使这条在第一页）→ `thread-incomplete`，因为删了也确认不了 | 等 2 秒再拉整楼：楼不在了（`12022` / `-404`），或者楼读全了、里面没有这条 |
+| `delete_comment` | 核对登录账号；作品的作者是我（`view` 的 `owner.mid`）；只定位目标这一条，不读整楼（见下文「删评论怎么定位」）。楼已删（`12022` / `-404`）→ `already-gone`；楼里定位不到这个 rpid、或对上的这条不属于这栋楼 → `target-not-found`；定位不了（`page.count` 不是非负整数、页内 rpid 不递增、读满 30 页、证明不了前后两条是谁）→ `thread-incomplete`；`reply/reply` 报错（如 `-412` 限流）→ `precheck-error`；作者是我 → `self-target`；一楼下面有回复 → `rejected` / `deletes-thread` | 等 2 秒再定位这一条：楼不在了（`12022` / `-404`），或者这条不在了、并且有证据表明它原来前后的两条现在挨着（见下文） |
 | `block_user` | 核对登录账号；mid 是我 → `self-target`；`x/relation?fid=` 的 `attribute` 是 `128` → `already-blocked` | 等 1.5 秒再读 `x/relation?fid=`，`attribute` 是 `128` |
-| `delete_conversation` | 核对登录账号；对方是我 → `self-target`；翻完整个 `get_sessions` 会话列表（最多 50 页，找到了也要翻完）。翻不完 → `list-incomplete`（删了也确认不了）；翻完了没有这个会话 → `already-gone` | 等 1.5 秒再翻一遍列表：翻完了，并且没有这个会话 |
+| `delete_conversation` | 核对登录账号；对方是我 → `self-target`；`get_sessions` 的四组会话列表都翻完（四组加起来最多 50 页，找到了也要翻完，分组见下文）。哪一组读失败 → `precheck-error`；哪一组翻不完 → `list-incomplete`（删了也确认不了）；四组都翻完了都没有这个会话 → `already-gone` | 等 1.5 秒再把四组翻一遍：都翻完了，并且哪一组都没有这个会话（在某一组里看到、或某一组翻不完，就不再读后面几组） |
 
 - 接口只调一次。调过之后出任何错都只回读，不重调。
 - 回读不满足时记 `needs_readback`，**绝不重试**。同一个目标换 key 也会被拦（`target-needs-readback`），人工处理方法同第 4 节。
 - 接口明确报错（`code` 不是 0）时不算生效。和回复组不同，处置组调过接口却没确认生效的，一律记 `needs_readback` / `send-error-unconfirmed`（不记 `failed`），所以换 key 也不会再调第二次。例外：`reply/del` 返回 `12022`（调的时候已经被删了），回读确认不在就算 `sent`。
-- 「读全」要求严格：整楼累计读到的条数要达到接口声明的 `page.count`；会话列表 `has_more` 为真时给了空页、或翻页游标没往前走，都算没翻完。
+- 「翻完」要求严格：会话列表 `has_more` 为真时给了空页、`session_ts` 不是数字、页内不是从新到旧、比上一页的游标还新、或游标没往更早的方向走，都算没翻完。
+
+#### 删评论怎么定位
+
+删评论不需要判重（判重是回复才要的），所以不读整楼，只确认目标这一条。以前要求整楼读全（最多 10 页），热门大楼里的楼中楼广告因此永远是 `thread-incomplete`，删不掉（2026-11-21 第一次真实调用，两条都是这样）。
+
+- 用的接口：`GET x/v2/reply/reply?oid=<aid>&type=1&root=<一楼 rpid>&ps=20&pn=<页码>`，和读适配器、回复写入脚本是同一个接口。接口文档（bilibili-API-collect `docs/comment/list.md`）写的是「按照回复顺序排序」，楼中楼的 rpid 随时间递增，所以可以按 rpid 二分页码：先读第 1 页拿 `page.count`，再二分，十来页就落到目标那一页，然后按 rpid 精确对上，并核对这条的 `root` 是这栋楼、`oid` 是这个作品、作者不是我。一次定位最多读 30 页。`page.count` 偏小（最后一页是满的、后面还有回复）时，往后加倍再找。
+- 没用的接口：`x/v2/reply/info`（按 rpid 查单条）文档标注「已经弃用」；`x/v2/reply/wbi/main` 的 `seek_rpid` 要 Wbi 签名，而且是一楼列表，不是楼中楼；`x/v2/reply/dialog/cursor` 要对话树根 rpid，库里没有。
+- 不猜：页内 rpid 不是递增的、第 1 页的 `page.count` 不是非负整数（缺失、负数、小数、`false`、空白串都算）、第 1 页是空的而 `page.count` 大于 0，都按「定位不了」报 `thread-incomplete`，不调接口。二分落空（按 rpid 该在的那一页没有它）报 `target-not-found`，不当成 `already-gone`，因为定位规则本身可能不准。
+- 发前记下目标前后两条的 rpid（邻居，可以跨页，可以是「楼的开头」「楼的末尾」），读不到邻居也报 `thread-incomplete`。
+- 发后回读：同样二分定位。这条还在 → 没删掉；这条不在了，并且有证据表明它原来前后的两条现在挨着 → 删掉了（原来后面是楼的末尾的，删完又来了新回复也算）；邻居变了（比如同时有别的删除）→ 确认不了。确认不了的一律 `needs_readback`，不重调。
+- 「挨着」的证据只认这几种，并且用到的每一页都不能少给（满页，或者前面各页加本页的条数够得上这次读到的 `page.count`，B站隐藏、折叠了目标时页会对不上）：同一次读到的同一页里两条相邻；跨页时，不用定位时的缓存，先重读后一页、再重读前一页（删除只会让后面的评论往前挪，这个顺序拼不出假的「挨着」），并且前一页是满的；「楼的开头」就是第 1 页。「楼的末尾」要本页不满、并且前面各页加本页的条数够得上这次读到的 `page.count`，或者下一页是空的、`page.count` 也到这一页为止。接口少给、给空页时，凑不出这些证据，只会 `needs_readback`。
+- 发前目标所在的页也要不少给，否则 `thread-incomplete`。如果 B站把还在的目标隐藏了、又从后面补了一条把页填满，这里分不出来（已知限制）。
+- 发前取邻居用同一套规则：发后一定确认不了的（比如 `page.count` 偏大，删整楼最后一条），发前就报 `thread-incomplete`，不调接口。
+
+#### 删一楼
+
+B站删一楼，会把它下面的整楼回复一起删掉（别人的、我自己的都会没）。所以删一楼时先读第 1 页：`page.count`、本页条数、一楼的 `rcount` / `count` 里有一个大于 0，就返回 `rejected` / `deletes-thread`，不调接口，也不占每轮上限。`page.count` 读不到时判断不了，报 `failed` / `thread-incomplete`。一楼下面没有回复时照常删，回读看一楼还在不在（楼不在了才算删掉）。下面的回复删干净后，可以换一个 key 再删这个一楼。
+
+写入脚本返回 `rejected: true` 时，框架记 `rejected`（不是 `failed`）。目前只有 `deletes-thread` 这样返回。
+
+#### 私信会话的分组
+
+`get_sessions` 的 `session_type` 是「读哪一组会话」，不是会话本身的类型。接口文档列了：1 用户与系统、2 未关注人、3 粉丝团、4 所有、5 被拦截、6 花火商单、7 所有系统消息、8 陌生人（不含官方消息）、9 关注的人与系统。以前只读 1 组，广告私信常落在未关注人、被拦截里，可能被误报成 `already-gone`（2026-11-21 删会话 `13030183` 就是这样，原因还没在平台上确认）。
+
+现在发前、发后都把 1、2、5、8 四组翻完（四组加起来最多 50 页，发前发后各一次，留在 120 秒写入超时里），参数一样（`group_fold=1&unfollow_fold=0&sort_rule=2`），四组都没有才报 `already-gone`，`detail` 里写明读了哪几组。不读 3、7（粉丝团、系统消息，不是用户会话，也不删），不读 4（文档说 `sort_rule` 对 4 无效，按 `end_ts` 翻页的顺序没有保证），不读 6、9（6 是商单；9 是关注的人，按文档的说法应该已在 1 组里）。会话条目里的 `session_type` 仍要是 1（用户）才算对上。
 
 ### 绝不对自己动手
 
@@ -256,8 +281,8 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 | `status` | `reason` |
 |---|---|
-| `rejected` | `self-target`、`not-a-user`、`unknown-target`、`ambiguous-target`、`capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
-| `failed`（没调接口） | `already-gone`（评论已不在，或会话已不在列表里；库里已标 `goneAt`、之前已删过的同一目标也是这个）、`already-blocked`（已在黑名单里，或之前已拉黑过这个 mid）、`not-a-user`、`not-my-work`、`thread-incomplete`、`list-incomplete`、`target-not-found`、`self-target`、`uid-mismatch`、`no-uid`、`login-lost`、`precheck-error`、`send-error`（页面里没有 `bili_jct`）；space：`space-busy`、`space-user-controlled` |
+| `rejected` | `deletes-thread`（删一楼会连整楼回复一起删）、`self-target`、`not-a-user`、`unknown-target`、`ambiguous-target`、`capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
+| `failed`（没调接口） | `already-gone`（评论已不在，或会话已不在列表里；库里已标 `goneAt`、之前已删过的同一目标也是这个）、`already-blocked`（已在黑名单里，或之前已拉黑过这个 mid）、`not-a-user`、`not-my-work`、`thread-incomplete`（定位不了这条评论）、`list-incomplete`、`target-not-found`（楼里定位不到这条）、`self-target`、`uid-mismatch`、`no-uid`、`login-lost`、`precheck-error`、`send-error`（页面里没有 `bili_jct`）；space：`space-busy`、`space-user-controlled` |
 | `needs_readback` | `send-error-unconfirmed`、`readback-missing`、`target-needs-readback`、`previous-needs-readback`、`runner-timeout`、`runner-exit-code`、`interrupted` |
 
 `already-gone`、`already-blocked` 时事件不自动回执，需要时调用方自己 `ack_event`。
@@ -302,7 +327,9 @@ node src/hub.mjs ops accounts set-cap Bili:478358005 deleteConversation true
 
 拉黑：同样的步骤，打开 `block`，调 `block_user({ target: "<小号的评论 id>", idempotencyKey })`。验收时在 B站「黑名单」里能看到小号，`readBack.nativeId` 是小号的 mid。验完在网页上把小号移出黑名单。
 
-删会话：打开 `deleteConversation`，调 `delete_conversation({ conversationId, idempotencyKey })`。验收时网页版私信列表里这个会话不在了。先核对 `remove_session` 的表单字段和返回是不是和文档一致（看 `readBack` 和 `actions` 的 `detail`）。
+删会话：打开 `deleteConversation`，调 `delete_conversation({ conversationId, idempotencyKey })`。验收时网页版私信列表里这个会话不在了。先核对 `remove_session` 的表单字段和返回是不是和文档一致（看 `readBack` 和 `actions` 的 `detail`），并核对 `get_sessions` 的 2、5、8 组在真实账号上返回的是不是对应分组。
+
+删评论第一次真删时，还要核对：`x/v2/reply/reply` 楼中楼是不是真的按 rpid 递增（`detail` 里不该出现「不是按 rpid 递增」），以及大楼里翻到 30 页以内能不能定位到。
 
 任何一步返回 `needs_readback`，先去平台上人工确认，查明原因前不要打开下一种操作。
 
