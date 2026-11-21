@@ -58,7 +58,7 @@ describe('compact', () => {
     assert.throws(() => q.getCommentThread(db, 'Douyin:b', { around: 'Douyin:e' }), /compact/);
     assert.throws(() => q.getCommentThread(db, 'Douyin:b', { compact: true, around: 'Douyin:e', n: 0 }), /n 要是正整数/);
     assert.throws(() => q.getCommentThread(db, 'Douyin:b', { compact: true, n: 3 }), /n 只能和 around 一起用/);
-    // n 比楼长大：全给，omitted 0；n 超过 50 按 50 算
+    // n 比楼长大（也超过上限 50）：全给，omitted 0
     const big = q.getCommentThread(db, 'Douyin:b', { compact: true, around: 'Douyin:e', n: 999 });
     assert.equal(big.items.length, 9);
     assert.equal(big.omitted, 0);
