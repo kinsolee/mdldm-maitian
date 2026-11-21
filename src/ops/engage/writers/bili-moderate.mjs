@@ -74,7 +74,7 @@ async function whoAmI(api, uid) {
 // x/v2/reply/reply 按回复顺序（时间正序）给楼中楼，rpid 跟着时间递增。按 rpid 二分页码，十来页就能落到目标那一页，
 // 再按 rpid 精确对上。页内 rpid 不是递增的就不猜（thread-incomplete）。
 // 回读不靠「整楼读全」：发前记下目标前后的两条（邻居），发后这条不见了、并且这两条现在挨着，才算删掉。
-// 「挨着」的证据只认两种：同一次读到的同一页里两条相邻；或者跨页时先读后一页、再读前一页（删除只会让后面的往前挪，
+// 「挨着」的证据只认两种（用到的每一页都要没少给：满页，或条数够得上 page.count）：同一次读到的同一页里两条相邻；或者跨页时先读后一页、再读前一页（删除只会让后面的往前挪，
 // 这个顺序拼不出假的「挨着」），前一页还得是满的。「楼的末尾」要本页不满、条数和 page.count 对得上，或下一页空、count 也到这儿为止。
 const PS = 20;
 const MAX_LOCATE_PAGES = 30;               // 一次定位最多读这么多页（二分 2^25 页的楼也够）
@@ -108,10 +108,13 @@ function threadReader(api, oid, root) {
   };
 }
 
+/** 这一页本身没少给：满页，或者前面各页加本页的条数够得上这次读到的 page.count（隐藏、折叠、少给的页不算）。 */
+const whole = (pn, p) => p.ids.length === PS || (pn - 1) * PS + p.ids.length >= p.count;
+
 /** 第 pn 页（p 是这一页）后面那一条：下一页第 1 条、END（有证据到底了），或 null（证明不了）。 */
 async function after(page, pn, p) {
   // 本页不满：本页就是最后一页，但条数要和 page.count 对得上（少给的页不算到底）
-  if (p.ids.length < PS) return (pn - 1) * PS + p.ids.length >= p.count ? END : null;
+  if (p.ids.length < PS) return whole(pn, p) ? END : null;
   const next = await page(pn + 1);
   if (!next.ids) return null;
   if (next.ids.length) return next.ids[0];
@@ -198,6 +201,7 @@ async function precheckComment(api, p, me, oid) {
   if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
   // 邻居按发后回读同一套规则取（前一页要满、末尾要和 count 对得上），发前能过的，发后才确认得了
   const here = await page(s.at.pn);
+  if (!whole(s.at.pn, here)) return stop('thread-incomplete', `目标所在的第 ${s.at.pn} 页只有 ${here.ids.length} 条，和 page.count=${here.count} 对不上，删了也确认不了，没删`);
   const prev = s.at.i > 0 ? here.ids[s.at.i - 1] : await before(page, s.at.pn);
   const next = s.at.i < here.ids.length - 1 ? here.ids[s.at.i + 1] : await after(page, s.at.pn, here);
   if (prev == null || next == null) return stop('thread-incomplete', `定位到了 ${t.commentId}（第 ${s.at.pn} 页），但读不到它前后的两条，删了也确认不了，没删`);
@@ -223,7 +227,8 @@ async function readBackComment(api, p, oid, check) {
   if (s.slot.i > 0) {
     // 目标该在的位置在一页中间：同一次读到的这一页里，前后两条直接相邻
     const here = await page(s.slot.pn);
-    [pred, succ] = [here.ids[s.slot.i - 1], here.ids[s.slot.i]];
+    if (whole(s.slot.pn, here)) [pred, succ] = [here.ids[s.slot.i - 1], here.ids[s.slot.i]];
+    else [pred, succ] = [null, null];
   } else {
     // 跨页：不用定位时的缓存，先重读后一页、再重读前一页
     const fresh = threadReader(api, oid, t.rootId);
@@ -232,6 +237,7 @@ async function readBackComment(api, p, oid, check) {
     if (back.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${back.code}）` };
     if (!back.ids) return { gone: false, detail: back.error };
     if (back.ids.includes(check.rpid)) return { gone: false, detail: '回读时这条还在' };
+    if (back.ids.length && !whole(pn, back)) return { gone: false, detail: `回读时第 ${pn} 页只有 ${back.ids.length} 条，和 page.count=${back.count} 对不上，确认不了` };
     if (pn === 1) {
       pred = START;
       succ = back.ids.length ? back.ids[0] : back.count === 0 ? END : null;
@@ -353,10 +359,13 @@ async function findInGroup(api, talker, type, budget) {
     // 会话条目缺 session_type：证明不了是用户会话（2 是粉丝团），不猜
     if (hits.some((s) => s.session_type == null || s.session_type === '')) return { error: `get_sessions 里 ${talker} 的会话缺 session_type，判断不了是不是用户会话` };
     if (hits.some((s) => Number(s.session_type) === 1)) present = true;
+    // sort_rule=2 是按会话时间从新到旧：session_ts 要都是数字、页内不升、不比上一页的游标新，否则翻页不可信
+    const ts = l.map((x) => bigOf(x.session_ts));
+    if (ts.some((x) => x == null) || ts.some((x, i) => i > 0 && x > ts[i - 1]) || (endTs != null && ts.length && ts[0] > endTs)) return { present, complete: false };
     if (!j.data?.has_more) return { present, complete: true };
-    // 还有下一页却给了空页、或者翻页游标没往前走：翻不完
-    const next = l.at(-1)?.session_ts;
-    if (!l.length || next == null || String(next) === String(endTs)) return { present, complete: false };
+    // 还有下一页却给了空页、或者翻页游标没往更早的方向走：翻不完
+    const next = ts.at(-1);
+    if (!l.length || (endTs != null && next >= endTs)) return { present, complete: false };
     endTs = next;
   }
 }

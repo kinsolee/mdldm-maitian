@@ -358,6 +358,24 @@ describe('B站 delete（假接口）', () => {
     }
   });
 
+  test('R2 Codex-1：回读时这一页少给了目标（隐藏 / 折叠），页不满、条数对不上 page.count → 不算删掉；目标在页中间、在第一条都一样', async () => {
+    for (const [n, target] of [[3, 102], [3, 101], [3, 103], [25, 121]]) {
+      const f = fakeBili({ threads: seqThread(n), delEffective: false });
+      afterPost(f, (pn, j) => { j.data.replies = j.data.replies.filter((x) => x.rpid !== target); });
+      const r = await deleteComment(f.api, P('delete', subOf(target)));
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], `${n} 条删 ${target}：${r.readBack.detail}`);
+    }
+  });
+
+  test('R2 Codex-1：发前目标所在的页就不满、条数对不上 page.count → thread-incomplete，不调接口', async () => {
+    const f = fakeBili({ threads: seqThread(3) });
+    const get = f.api.get;
+    f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = 5; return j; };
+    const r = await deleteComment(f.api, P('delete', subOf(102)));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
+    assert.equal(f.posts.length, 0);
+  });
+
   test('删唯一一条楼中楼（前后都没有）→ 回读第 1 页空、count=0 → found', async () => {
     const f = fakeBili({ threads: seqThread(1) });
     const r = await deleteComment(f.api, P('delete', subOf(101)));
@@ -572,6 +590,29 @@ describe('B站 deleteConversation（假接口）', () => {
     assert.ok(f.sessionTypes.length <= 50, `读了 ${f.sessionTypes.length} 页`);
     assert.deepEqual([...new Set(f.sessionTypes)], ['1']);
     assert.equal(f.posts.length, 0);
+  });
+
+  test('R2 Codex-2：翻页游标往新的方向走、不是数字、页内不是从新到旧 → list-incomplete（不当成翻完了），不调接口', async () => {
+    const bad = [
+      (end) => (end == null ? [[{ talker_id: 888, session_type: 1, session_ts: 100 }], 1] : [[{ talker_id: 999, session_type: 1, session_ts: 200 }], 0]),
+      (end) => (end == null ? [[{ talker_id: 888, session_type: 1, session_ts: 'abc' }], 1] : [[], 0]),
+      (end) => (end == null ? [[{ talker_id: 888, session_type: 1, session_ts: 1 }, { talker_id: 889, session_type: 1, session_ts: 5 }], 1] : [[], 0]),
+    ];
+    for (const [k, gen] of bad.entries()) {
+      const f = fakeBili();
+      const get = f.api.get;
+      f.api.get = async (url) => {
+        const u = new URL(url);
+        if (u.pathname !== '/session_svr/v1/session_svr/get_sessions') return get(url);
+        f.sessionTypes.push(u.searchParams.get('session_type'));
+        if (u.searchParams.get('session_type') !== '1') return { code: 0, data: { session_list: [], has_more: 0 } };
+        const [list, more] = gen(u.searchParams.get('end_ts'));
+        return { code: 0, data: { session_list: list, has_more: more } };
+      };
+      const r = await deleteConversation(f.api, C('777'));
+      assert.deepEqual([r.blocked, r.sendAttempted], ['list-incomplete', false], `第 ${k + 1} 种`);
+      assert.equal(f.posts.length, 0);
+    }
   });
 
   test('R1 Codex-2：会话条目缺 session_type → precheck-error，不当成用户会话、不调接口', async () => {
