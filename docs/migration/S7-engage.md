@@ -216,9 +216,9 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 | `delete_conversation` | `conversationId`、`idempotencyKey`、`eventId?` | 从私信会话列表里删掉一个会话 | `session_svr/v1/session_svr/remove_session`（`talker_id`、`session_type=1`） |
 
 - 三个接口都在 `member.bilibili.com` 页面里调，csrf（cookie `bili_jct`）只在页面里读、只在页面里填，不回到 Node。写入脚本是 `src/ops/engage/writers/bili-moderate.mjs`。
-- `block_user` 的 `target` 有三种写法：`Bili:<mid>`、这个人的评论 id、和这个人的私信会话 id（B站会话 id 就是对方 mid）。框架从库里推出 mid，`actions.targetId` 按 `Bili:<mid>` 记，所以同一个人换一种写法也认得出。只认库里见过的人（评论作者或私信对方），没见过的返回 `rejected` / `unknown-target`。同一个 id 既是评论 id、又是另一个人的 mid 时返回 `rejected` / `ambiguous-target`。
-- `eventId`：`delete_comment` 填这条评论的 `comment.created`，`delete_conversation` 填这个会话的 `dm.received`，`block_user` 填这个人的任一条 `comment.created` 或 `dm.received`。对不上时返回 `rejected` / `event-mismatch`。
-- `delete_conversation` 只把会话从列表里移除，聊天记录还在。对方再发消息，会话会回到列表里。所以广告私信要先 `block_user`，再 `delete_conversation`。
+- `block_user` 的 `target` 有三种写法：`Bili:<mid>`、这个人的评论 id、和这个人的私信会话 id（B站会话 id 就是对方 mid）。框架从库里推出 mid，`actions.targetId` 按 `Bili:<mid>` 记，所以同一个人换一种写法也认得出。只认库里见过的人（评论作者或私信对方），没见过的返回 `rejected` / `unknown-target`。群聊、官方号会话的 id 不是用户 mid，返回 `rejected` / `not-a-user`，绝不拿来拉黑。同一个 id 既是评论 id、又是另一个人的 mid 时返回 `rejected` / `ambiguous-target`。
+- `eventId`：`delete_comment` 填这条评论的 `comment.created`，`delete_conversation` 填这个会话的 `dm.received`，`block_user` 填这个人的任一条 `comment.created` 或 `dm.received`。事件必须是 B站同一个账号下的，别的平台 uid 碰巧一样也不算。对不上时返回 `rejected` / `event-mismatch`。
+- `delete_conversation` 只删用户会话，群聊、官方号会话返回 `failed` / `not-a-user`。它只把会话从列表里移除，聊天记录还在。对方再发消息，会话会回到列表里。所以广告私信要先 `block_user`，再 `delete_conversation`。
 
 ### 返回字段
 
@@ -234,9 +234,9 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 | 工具 | 发前重读（命中就不调接口） | 发后回读（满足才算 `sent`） |
 |---|---|---|
-| `delete_comment` | 核对登录账号；作品的作者是我（`view` 的 `owner.mid`）；拉整楼（`x/v2/reply/reply`，最多 10 页）。楼已删或楼里没有这条 → `already-gone`；作者是我 → `self-target`；楼没读全 → `thread-incomplete` | 等 2 秒再拉整楼：楼不在了（`12022` / `-404`），或者楼读全了、里面没有这条 |
+| `delete_comment` | 核对登录账号；作品的作者是我（`view` 的 `owner.mid`）；拉整楼（`x/v2/reply/reply`，最多 10 页）。楼已删或楼里没有这条 → `already-gone`；作者是我 → `self-target`；删楼中楼时整楼没读全（即使这条在第一页）→ `thread-incomplete`，因为删了也确认不了 | 等 2 秒再拉整楼：楼不在了（`12022` / `-404`），或者楼读全了、里面没有这条 |
 | `block_user` | 核对登录账号；mid 是我 → `self-target`；`x/relation?fid=` 的 `attribute` 是 `128` → `already-blocked` | 等 1.5 秒再读 `x/relation?fid=`，`attribute` 是 `128` |
-| `delete_conversation` | 核对登录账号；对方是我 → `self-target`；翻 `get_sessions` 会话列表（最多 30 页）。翻完了没有这个会话 → `already-gone`；翻不完 → `list-incomplete` | 等 1.5 秒再翻一遍列表：翻完了，并且没有这个会话 |
+| `delete_conversation` | 核对登录账号；对方是我 → `self-target`；翻完整个 `get_sessions` 会话列表（最多 50 页，找到了也要翻完）。翻不完 → `list-incomplete`（删了也确认不了）；翻完了没有这个会话 → `already-gone` | 等 1.5 秒再翻一遍列表：翻完了，并且没有这个会话 |
 
 - 接口只调一次。调过之后出任何错都只回读，不重调。
 - 回读不满足时记 `needs_readback`，**绝不重试**。同一个目标换 key 也会被拦（`target-needs-readback`），人工处理方法同第 4 节。
@@ -247,15 +247,15 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 账号自身的 mid（例如 `Bili:478358005`），以及库里登记的所有 B站账号，一律拒绝，有两层：
 
-1. 框架在库里判断：评论是我的（`authorIsMe = 1`，或作者 uid 是本平台账号）、拉黑对象是本平台账号、会话对方是本平台账号，都返回 `rejected` / `self-target`。能力位开没开都一样，不起 runner。
+1. 框架在库里判断：评论是我的（`authorIsMe = 1`，或作者 uid 是本平台账号）、拉黑对象是本平台账号（库里没见过这个 mid 也一样，先于 `unknown-target` 判）、会话对方是本平台账号，都返回 `rejected` / `self-target`。能力位开没开都一样，不起 runner。
 2. 写入脚本在页面上再核一次：评论作者、拉黑 mid、会话 talker 是登录账号或本平台账号时，返回 `failed` / `self-target`，不调接口。
 
 ### reason 列表
 
 | `status` | `reason` |
 |---|---|
-| `rejected` | `self-target`、`unknown-target`、`ambiguous-target`、`capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
-| `failed`（没调接口） | `already-gone`（评论已不在，或会话已不在列表里；库里已标 `goneAt`、之前已删过的同一目标也是这个）、`already-blocked`（已在黑名单里，或之前已拉黑过这个 mid）、`not-my-work`、`thread-incomplete`、`list-incomplete`、`target-not-found`、`self-target`、`uid-mismatch`、`no-uid`、`login-lost`、`precheck-error`、`send-error`（页面里没有 `bili_jct`）；space：`space-busy`、`space-user-controlled` |
+| `rejected` | `self-target`、`not-a-user`、`unknown-target`、`ambiguous-target`、`capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
+| `failed`（没调接口） | `already-gone`（评论已不在，或会话已不在列表里；库里已标 `goneAt`、之前已删过的同一目标也是这个）、`already-blocked`（已在黑名单里，或之前已拉黑过这个 mid）、`not-a-user`、`not-my-work`、`thread-incomplete`、`list-incomplete`、`target-not-found`、`self-target`、`uid-mismatch`、`no-uid`、`login-lost`、`precheck-error`、`send-error`（页面里没有 `bili_jct`）；space：`space-busy`、`space-user-controlled` |
 | `needs_readback` | `send-error-unconfirmed`、`readback-missing`、`target-needs-readback`、`previous-needs-readback`、`runner-timeout`、`runner-exit-code`、`interrupted` |
 
 `already-gone`、`already-blocked` 时事件不自动回执，需要时调用方自己 `ack_event`。

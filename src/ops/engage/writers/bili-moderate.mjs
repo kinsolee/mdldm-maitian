@@ -16,7 +16,7 @@ const VC = 'https://api.vc.bilibili.com';
 const GONE_CODES = new Set([12022, -404]);   // 12022：评论已经被删除了
 const BLOCKED_ATTR = 128;                    // x/relation 的 attribute：128 = 已拉黑
 const MAX_THREAD_PAGES = 10;
-const MAX_SESSION_PAGES = 30;
+const MAX_SESSION_PAGES = 50;
 
 export async function runInSpace(task, params) {
   let page;
@@ -116,7 +116,10 @@ export async function deleteComment(api, p) {
     if (!oid) return { uidSeen: me, blocked: 'target-not-found', detail: `作品 ${t.workId} 读不到（view code=${view.code}）`, sendAttempted: false };
     const owner = view.data?.owner?.mid == null ? null : String(view.data.owner.mid);
     if (owner !== me) return { uidSeen: me, blocked: 'not-my-work', detail: `作品 ${t.workId} 的作者是 ${owner ?? '（读不到）'}，不是我，只删自己作品下的评论`, sendAttempted: false };
-    const at = locate(await thread(api, oid, t.rootId), t.rootId, t.commentId);
+    const th = await thread(api, oid, t.rootId);
+    // 删楼中楼：发后要靠整楼读全才能确认删掉，发前整楼就读不全的先不删（不然删了也只能 needs_readback）
+    if (String(t.commentId) !== String(t.rootId) && th.ok && !th.complete) return { uidSeen: me, blocked: 'thread-incomplete', detail: `楼 ${t.rootId} 超过 ${MAX_THREAD_PAGES} 页或条数对不上，读不全，删了也确认不了，没删`, sendAttempted: false };
+    const at = locate(th, t.rootId, t.commentId);
     if (at.state === 'gone') return { uidSeen: me, blocked: 'already-gone', detail: at.detail, sendAttempted: false };
     if (at.state === 'unknown') return { uidSeen: me, blocked: at.detail.includes('没读全') ? 'thread-incomplete' : 'target-not-found', detail: at.detail, sendAttempted: false };
     const author = midOf(at.node);
@@ -147,7 +150,9 @@ export async function deleteComment(api, p) {
 
 async function relationAttr(api, mid) {
   const j = await api.get(`${API}/x/relation?fid=${encodeURIComponent(mid)}`);
-  if (j.code !== 0 || j.data == null || !Number.isFinite(Number(j.data.attribute))) return { error: `x/relation code=${j.code} ${j.message ?? ''}`.trim() };
+  const a = j.data?.attribute;
+  const ok = (typeof a === 'number' && Number.isFinite(a)) || (typeof a === 'string' && /^\d+$/.test(a));
+  if (j.code !== 0 || !ok) return { error: `x/relation code=${j.code} ${j.message ?? ''}`.trim() };
   return { attribute: Number(j.data.attribute) };
 }
 
@@ -186,21 +191,22 @@ export async function block(api, p) {
 
 /** 翻完整个会话列表找 talker：{ present } 或 { error }；没翻完 complete:false。 */
 async function findSession(api, talker) {
-  let endTs = null;
+  let endTs = null, present = false;
+  // 命中了也要翻完：发前和发后用同一个「翻完」标准，翻不完的在调接口前就拦下
   for (let i = 0; i < MAX_SESSION_PAGES; i++) {
     const j = await api.get(`${VC}/session_svr/v1/session_svr/get_sessions?session_type=1&group_fold=1&unfollow_fold=0&sort_rule=2${endTs ? `&end_ts=${endTs}` : ''}&build=0&mobi_app=web`);
     if (j.code !== 0) return { error: `get_sessions code=${j.code} ${j.message ?? ''}`.trim() };
     if (!Array.isArray(j.data?.session_list)) return { error: 'get_sessions code=0 但缺 data.session_list' };
     const l = j.data.session_list;
-    if (l.some((s) => String(s.talker_id) === talker && Number(s.session_type ?? 1) === 1)) return { present: true, complete: true };
-    if (!j.data?.has_more) return { present: false, complete: true };
+    if (l.some((s) => String(s.talker_id) === talker && Number(s.session_type ?? 1) === 1)) present = true;
+    if (!j.data?.has_more) return { present, complete: true };
     // 还有下一页却给了空页、或者翻页游标没往前走：翻不完
     const next = l.at(-1)?.session_ts;
-    if (!l.length || next == null || String(next) === String(endTs)) return { present: false, complete: false };
+    if (!l.length || next == null || String(next) === String(endTs)) return { present, complete: false };
     endTs = next;
     await api.sleep(300);
   }
-  return { present: false, complete: false };
+  return { present, complete: false };
 }
 
 export async function deleteConversation(api, p) {
@@ -214,10 +220,8 @@ export async function deleteConversation(api, p) {
     if (talker === me || talker === String(p.uid) || (p.selfUids ?? []).includes(talker)) return { uidSeen: me, blocked: 'self-target', detail: '会话对象是我自己，不删', sendAttempted: false };
     const s = await findSession(api, talker);
     if (s.error) return { uidSeen: me, blocked: 'precheck-error', detail: s.error, sendAttempted: false };
-    if (!s.present) {
-      return s.complete ? { uidSeen: me, blocked: 'already-gone', detail: `会话列表里已没有 ${talker}`, sendAttempted: false }
-        : { uidSeen: me, blocked: 'list-incomplete', detail: `会话列表超过 ${MAX_SESSION_PAGES} 页没翻完，没找到 ${talker}`, sendAttempted: false };
-    }
+    if (!s.complete) return { uidSeen: me, blocked: 'list-incomplete', detail: `会话列表超过 ${MAX_SESSION_PAGES} 页翻不完，删了也确认不了，没删`, sendAttempted: false };
+    if (!s.present) return { uidSeen: me, blocked: 'already-gone', detail: `会话列表里已没有 ${talker}`, sendAttempted: false };
   } catch (e) {
     return { uidSeen: me ?? null, blocked: 'precheck-error', detail: errText(e), sendAttempted: false };
   }

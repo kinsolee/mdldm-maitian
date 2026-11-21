@@ -23,17 +23,23 @@ export const selfUids = (db, platformCode) => listAccounts(db, { platform: platf
  * 只认库里见过的人：评论作者或会话对方。同一个 id 既是评论又是别人的 mid（指向两个人）时拒绝，免得拉错人。
  */
 export function resolveBlockTarget(db, req) {
-  const c = db.prepare('SELECT id, accountId, authorUid, authorIsMe FROM comments WHERE id = ?').get(req.inputId);
-  const k = db.prepare('SELECT id, accountId, peerUid FROM conversations WHERE id = ?').get(req.inputId);
   const n = nativeOf(req.inputId);
+  const mine = new Set(selfUids(db, req.platformCode));
+  const c = db.prepare('SELECT id, accountId, authorUid, authorIsMe FROM comments WHERE id = ?').get(req.inputId);
+  const k = db.prepare('SELECT id, accountId, peerUid, peerKind FROM conversations WHERE id = ?').get(req.inputId);
+  // 群聊、官方号的会话 id 不是用户 mid（群 id 和用户 mid 是两套号），绝不拿来拉黑
+  if (k && k.peerKind !== 'user' && !c) return { reject: ['not-a-user', `${req.inputId} 是${k.peerKind === 'group' ? '群聊' : '官方号'}会话，不是普通用户，不拉黑`] };
   const asMid = db.prepare(`SELECT accountId FROM comments WHERE platformCode = ? AND authorUid = ?
-    UNION SELECT accountId FROM conversations WHERE platformCode = ? AND peerUid = ?`).all(req.platformCode, n, req.platformCode, n);
+    UNION SELECT accountId FROM conversations WHERE platformCode = ? AND peerUid = ? AND peerKind = 'user'`).all(req.platformCode, n, req.platformCode, n);
   const cands = [];
+  // 对象是我自己（入参本身是本平台账号 mid，或评论作者是我）：先于「库里没见过」「指向两个人」判，一律 self-target
+  if (mine.has(n) || (c && (c.authorIsMe === 1 || mine.has(String(c.authorUid))))) return { reject: ['self-target', `拉黑对象是我自己（${req.inputId}），不拉黑`] };
   if (c) cands.push({ mid: c.authorUid == null ? null : String(c.authorUid), accountId: c.accountId, via: 'comment', ackType: 'comment.created', isMe: c.authorIsMe === 1 });
-  if (k) cands.push({ mid: String(k.peerUid ?? nativeOf(k.id)), accountId: k.accountId, via: 'conversation', ackType: 'dm.received' });
+  if (k && k.peerKind === 'user') cands.push({ mid: String(k.peerUid ?? nativeOf(k.id)), accountId: k.accountId, via: 'conversation', ackType: 'dm.received' });
   if (asMid.length) cands.push({ mid: n, accountId: asMid.length === 1 ? asMid[0].accountId : null, via: 'mid', ackType: null, accounts: asMid.length });
   if (!cands.length) return { reject: ['unknown-target', `库里没有 ${req.inputId}：不是见过的评论、会话，也不是见过的评论作者或私信对方。先 refresh_now 再试`] };
   const mids = new Set(cands.map((x) => x.mid));
+  if ([...mids].some((x) => mine.has(String(x)))) return { reject: ['self-target', `拉黑对象是我自己（${req.inputId}），不拉黑`] };
   if (mids.size > 1) return { reject: ['ambiguous-target', `${req.inputId} 同时对上了不同的人（${[...mids].join('、')}），请换成评论 id 或会话 id`] };
   const pick = cands[0];
   if (!pick.mid) return { reject: ['unknown-target', `库里 ${req.inputId} 没有作者 mid`] };
@@ -76,11 +82,16 @@ export function selfTarget(db, req, t) {
 /** eventId 核对：delete 是这条评论的 comment.created，deleteConversation 是这个会话的 dm.received；block 是这个人的评论或私信事件。 */
 export function modEventMatches(db, req) {
   if (req.eventId == null) return true;
-  const e = db.prepare('SELECT type, subjectId FROM events WHERE id = ?').get(req.eventId);
-  if (!e) return false;
+  const e = db.prepare('SELECT type, subjectId, platformCode FROM events WHERE id = ?').get(req.eventId);
+  if (!e || e.platformCode !== req.platformCode) return false;
   if (req.op !== 'block') return e.type === req.spec.eventType && e.subjectId === req.targetId;
-  if (e.type === 'comment.created') return db.prepare('SELECT authorUid FROM comments WHERE id = ?').get(e.subjectId)?.authorUid === req.block.mid;
-  if (e.type === 'dm.received') return String(db.prepare('SELECT peerUid FROM conversations WHERE id = ?').get(e.subjectId)?.peerUid ?? '') === req.block.mid;
+  // 同平台、同账号下这个人的评论或私信事件（不同平台的 uid 是不同的号，不能混）
+  if (e.type === 'comment.created') {
+    return String(db.prepare('SELECT authorUid FROM comments WHERE id = ? AND platformCode = ? AND accountId = ?').get(e.subjectId, req.platformCode, req.block.accountId)?.authorUid ?? '') === req.block.mid;
+  }
+  if (e.type === 'dm.received') {
+    return String(db.prepare("SELECT peerUid FROM conversations WHERE id = ? AND platformCode = ? AND accountId = ? AND peerKind = 'user'").get(e.subjectId, req.platformCode, req.block.accountId)?.peerUid ?? '') === req.block.mid;
+  }
   return false;
 }
 
@@ -89,8 +100,9 @@ export const modAckSubject = (req) => (req.op === 'block'
   ? { type: req.block.ackType, subjectId: req.block.subjectId }
   : { type: req.spec.eventType, subjectId: req.targetId });
 
-/** 库里就看得出不用动手的：评论已标 goneAt。 */
+/** 库里就看得出不用动手的：评论已标 goneAt。群聊、官方号会话不删（remove_session 这里只按用户会话 session_type=1 调）。 */
 export function modPrecheck(req, row) {
   if (req.op === 'delete' && row.goneAt) return ['already-gone', `库里这条评论 ${row.goneAt} 起已不在平台上`];
+  if (req.op === 'deleteConversation' && row.peerKind !== 'user') return ['not-a-user', `这是${row.peerKind === 'group' ? '群聊' : '官方号'}会话，不删`];
   return null;
 }

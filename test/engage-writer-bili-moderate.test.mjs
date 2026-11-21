@@ -186,6 +186,14 @@ describe('B站 delete（假接口）', () => {
     assert.equal(f.posts.length, 0);
   });
 
+  test('G-B4：楼中楼在第 1 页、但整楼超过 10 页读不全 → thread-incomplete，不调接口（删了也确认不了）', async () => {
+    const many = Array.from({ length: 205 }, (_, i) => rp(200 + i, { root: 100, parent: 100, mid: '9100' }));
+    const f = fakeBili({ threads: { 100: { root: rp(100), replies: [rp(101, { root: 100, parent: 100, mid: '9002' }), ...many] } } });
+    const r = await deleteComment(f.api, P('delete', sub));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
+    assert.equal(f.posts.length, 0);
+  });
+
   test('页面里没有 bili_jct：没调接口，sendAttempted:false', async () => {
     const f = fakeBili();
     f.api.post = async () => ({ code: -111, message: '页面里没有 bili_jct，没调接口', noCsrf: true });
@@ -230,6 +238,16 @@ describe('B站 block（假接口）', () => {
     assert.equal(f.posts.length, 1);
   });
 
+  test('G-7：x/relation 的 attribute 是 null / 空串 → precheck-error，不当成「没拉黑」', async () => {
+    for (const bad of [null, '', false]) {
+      const f = fakeBili();
+      const get = f.api.get;
+      f.api.get = async (url) => (url.includes('/x/relation') ? { code: 0, data: { mid: 9001, attribute: bad } } : get(url));
+      assert.equal((await block(f.api, P('block', { mid: '9001' }))).blocked, 'precheck-error', String(bad));
+      assert.equal(f.posts.length, 0);
+    }
+  });
+
   test('mid 不是数字 → target-not-found，不调接口', async () => {
     const f = fakeBili();
     assert.equal((await block(f.api, P('block', { mid: 'abc' }))).blocked, 'target-not-found');
@@ -262,8 +280,15 @@ describe('B站 deleteConversation（假接口）', () => {
     assert.equal(f.posts.length, 0);
   });
 
-  test('列表超过 30 页翻不完、没找到 → list-incomplete，不调接口', async () => {
-    const sessions = Array.from({ length: 40 }, (_, i) => ({ talker_id: 1000 + i, session_type: 1, session_ts: 100 - i }));
+  test('G-B3：目标在第 1 页、但列表超过 50 页翻不完 → list-incomplete，不调接口（删了也确认不了）', async () => {
+    const sessions = [{ talker_id: 777, session_type: 1, session_ts: 1000 }, ...Array.from({ length: 60 }, (_, i) => ({ talker_id: 2000 + i, session_type: 1, session_ts: 900 - i }))];
+    const f = fakeBili({ sessions, pageSize: 1 });
+    assert.equal((await deleteConversation(f.api, C('777'))).blocked, 'list-incomplete');
+    assert.equal(f.posts.length, 0);
+  });
+
+  test('列表超过 50 页翻不完、没找到 → list-incomplete，不调接口', async () => {
+    const sessions = Array.from({ length: 60 }, (_, i) => ({ talker_id: 1000 + i, session_type: 1, session_ts: 100 - i }));
     const f = fakeBili({ sessions, pageSize: 1 });
     assert.equal((await deleteConversation(f.api, C('777'))).blocked, 'list-incomplete');
     assert.equal(f.posts.length, 0);
