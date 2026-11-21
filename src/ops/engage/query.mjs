@@ -24,9 +24,9 @@ function checkTime(v, name) {
   return iso(Date.parse(v));
 }
 
-function checkLimit(limit, max = MAX_LIMIT) {
+function checkLimit(limit, max = MAX_LIMIT, name = 'limit') {
   if (limit == null) return Math.min(DEFAULT_LIMIT, max);
-  if (!Number.isInteger(limit) || limit < 1) throw new Error(`limit 要是正整数：${limit}`);
+  if (!Number.isInteger(limit) || limit < 1) throw new Error(`${name} 要是正整数：${limit}`);
   return Math.min(limit, max);
 }
 
@@ -132,6 +132,7 @@ const workBrief = (db, workId) => {
 export function getCommentThread(db, commentId, { compact = false, around, n } = {}) {
   splitId(commentId, 'commentId');
   if (around != null && !compact) throw new Error('around 只能和 compact: true 一起用');
+  if (n != null && around == null) throw new Error('n 只能和 around 一起用');
   const hit = db.prepare('SELECT rootId, workId FROM comments WHERE id = ?').get(commentId);
   if (!hit) throw new Error(`没有这条评论：${commentId}`);
   const rows = db.prepare(`${REPLIED_CTE} SELECT ${COMMENT_COLS} FROM comments c WHERE c.rootId = ? OR c.id = ? ORDER BY coalesce(c.createdAt, ''), c.id`).all(hit.rootId, hit.rootId);
@@ -139,11 +140,11 @@ export function getCommentThread(db, commentId, { compact = false, around, n } =
   let root = nodes.get(hit.rootId);
   if (!root) root = { id: hit.rootId, missing: true, children: [] };
   let orphan = false;
-  for (const n of nodes.values()) {
-    if (n === root) continue;
-    const parent = nodes.get(n.parentId);
+  for (const node of nodes.values()) {
+    if (node === root) continue;
+    const parent = nodes.get(node.parentId);
     if (!parent) orphan = true;
-    (parent ?? root).children.push(n);
+    (parent ?? root).children.push(node);
   }
   const flag = db.prepare('SELECT partial FROM thread_partial WHERE workId = ?').get(hit.workId);
   const partial = flag?.partial === 1 || orphan || !!root.missing;
@@ -156,7 +157,7 @@ export function getCommentThread(db, commentId, { compact = false, around, n } =
   splitId(around, 'around');
   const at = flat.findIndex((c) => c.id === around);
   if (at < 0) throw new Error(`around 不在这栋楼里：${around}`);
-  const k = n == null ? 5 : checkLimit(n, 50);
+  const k = n == null ? 5 : checkLimit(n, 50, 'n');
   const from = Math.max(1, at - k), to = Math.min(flat.length, at + k + 1);
   const items = at === 0 ? flat.slice(0, to) : [flat[0], ...flat.slice(from, to)];
   return { ...out, items, omitted: flat.length - items.length };

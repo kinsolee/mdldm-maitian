@@ -64,6 +64,14 @@ describe('MCP read 组', () => {
     assert.equal(c.omitted, 0);
     assert.deepEqual(Object.keys((await call(conn.client, 'list_comments', { compact: true })).value.items[0]), ['id', 'author', 'isMe', 'replyTo', 'text', 'at', 'depth']);
     assert.equal((await call(conn.client, 'list_events', { unhandled: true, compact: true })).value.items[0].subjectId, 'Douyin:a');
+    // 原始文本：完整版仍是 JSON.stringify(v, null, 1)，compact 不缩进
+    const raw = async (args) => (await conn.client.callTool({ name: 'get_comment_thread', arguments: args })).content[0].text;
+    const fullText = await raw({ commentId: 'Douyin:me' });
+    assert.equal(fullText, JSON.stringify(JSON.parse(fullText), null, 1));
+    assert.equal(await raw({ commentId: 'Douyin:me', compact: false }), fullText);
+    const compactText = await raw({ commentId: 'Douyin:me', compact: true });
+    assert.equal(compactText, JSON.stringify(JSON.parse(compactText)));
+    assert.equal(compactText.includes('\n'), false);
     const ack = (await call(conn.client, 'ack_event', { eventId: 'comment.created:Douyin:a', outcome: 'replied' })).value;
     assert.equal(ack.handled.outcome, 'replied');
     const sub = (await call(conn.client, 'subscribe_events', { subscriberId: 'b1', url: 'https://bot.example/h', types: ['comment.created'] })).value;

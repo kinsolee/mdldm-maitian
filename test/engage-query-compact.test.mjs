@@ -56,7 +56,12 @@ describe('compact', () => {
     assert.equal(d.omitted, 2);
     assert.throws(() => q.getCommentThread(db, 'Douyin:b', { compact: true, around: 'Douyin:r2' }), /不在这栋楼里/);
     assert.throws(() => q.getCommentThread(db, 'Douyin:b', { around: 'Douyin:e' }), /compact/);
-    assert.throws(() => q.getCommentThread(db, 'Douyin:b', { compact: true, around: 'Douyin:e', n: 0 }), /limit/);
+    assert.throws(() => q.getCommentThread(db, 'Douyin:b', { compact: true, around: 'Douyin:e', n: 0 }), /n 要是正整数/);
+    assert.throws(() => q.getCommentThread(db, 'Douyin:b', { compact: true, n: 3 }), /n 只能和 around 一起用/);
+    // n 比楼长大：全给，omitted 0；n 超过 50 按 50 算
+    const big = q.getCommentThread(db, 'Douyin:b', { compact: true, around: 'Douyin:e', n: 999 });
+    assert.equal(big.items.length, 9);
+    assert.equal(big.omitted, 0);
   });
 
   test('不传 compact 时形状不变', () => {
@@ -91,5 +96,55 @@ describe('compact', () => {
     assert.equal(dm.author, '对方k1');
     assert.equal(dm.text, '私信内容');
     assert.equal(dm.depth, null);
+  });
+
+  test('一楼缺失、孤儿评论、已删评论', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    ingestSnapshot(db, acc, commentsSnap([comment('z0', { createdAt: ts(0) })]), { now: at(T0) });
+    // x1 的一楼 rx 不在库里；o1 的 parent px 不在库里（挂到一楼 r1）；g1 下一轮被删
+    ingestSnapshot(db, acc, commentsSnap([
+      comment('z0', { createdAt: ts(0) }),
+      comment('x1', { parent: 'rx', root: 'rx', createdAt: ts(1) }),
+      comment('r1', { createdAt: ts(2) }),
+      comment('o1', { parent: 'px', root: 'r1', createdAt: ts(3) }),
+      comment('g1', { parent: 'r1', root: 'r1', createdAt: ts(4) }),
+    ]), { now: at(T0 + MIN) });
+    const missing = q.getCommentThread(db, 'Douyin:x1', { compact: true, around: 'Douyin:x1', n: 1 });
+    assert.equal(missing.partial, true);
+    assert.deepEqual(missing.items, [{ id: 'Douyin:rx', missing: true }, { id: 'Douyin:x1', author: '昵称x1', isMe: false, replyTo: null, text: '评论x1', at: ts(1), depth: 1 }]);
+    assert.equal(missing.total, 2);
+    assert.equal(missing.omitted, 0);
+    const orphan = q.getCommentThread(db, 'Douyin:o1', { compact: true });
+    assert.equal(orphan.partial, true);
+    assert.deepEqual(orphan.items.map((c) => c.id), ['Douyin:r1', 'Douyin:o1', 'Douyin:g1']);
+    ingestSnapshot(db, acc, commentsSnap(['z0', 'x1', 'r1', 'o1'].map((x) => comment(x, {
+      parent: { x1: 'rx', o1: 'px' }[x], root: { x1: 'rx', o1: 'r1' }[x], createdAt: ts({ z0: 0, x1: 1, r1: 2, o1: 3 }[x]),
+    }))), { now: at(T0 + 2 * MIN) });
+    assert.equal(q.getCommentThread(db, 'Douyin:r1', { compact: true }).items.find((c) => c.id === 'Douyin:g1').gone, true);
+    const listed = q.listComments(db, { compact: true, includeGone: true }).items.find((c) => c.id === 'Douyin:g1');
+    assert.deepEqual(Object.keys(listed), [...KEYS, 'gone']);
+    assert.equal(q.listComments(db, { compact: true }).items.some((c) => c.id === 'Douyin:g1'), false);
+  });
+
+  test('list_events compact：replyTo、一楼 depth 0、分页游标和完整版一致', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    ingestSnapshot(db, acc, commentsSnap([comment('z0', { createdAt: ts(0) })]), { now: at(T0) });
+    ingestSnapshot(db, acc, commentsSnap([
+      comment('z0', { createdAt: ts(0) }),
+      comment('r1', { createdAt: ts(1) }),
+      comment('a', { parent: 'r1', root: 'r1', createdAt: ts(2) }),
+      comment('b', { parent: 'a', root: 'r1', replyTo: { uid: 'u-a', nickname: '昵称a' }, createdAt: ts(3) }),
+    ]), { now: at(T0 + MIN) });
+    const all = q.listEvents(db, { compact: true }).items;
+    const byId = Object.fromEntries(all.map((e) => [e.id, e]));
+    assert.equal(byId['comment.created:Douyin:r1'].depth, 0);
+    assert.equal(byId['comment.created:Douyin:b'].replyTo, '昵称a');
+    assert.equal(byId['comment.created:Douyin:b'].depth, 2);
+    const p1 = q.listEvents(db, { compact: true, limit: 2 });
+    assert.equal(p1.nextCursor, q.listEvents(db, { limit: 2 }).nextCursor);
+    const p2 = q.listEvents(db, { compact: true, limit: 2, cursor: p1.nextCursor });
+    assert.deepEqual([...p1.items, ...p2.items].map((e) => e.id), all.map((e) => e.id));
   });
 });

@@ -23,15 +23,16 @@ const platforms = z.array(z.string()).optional().describe('平台代码，例如
 const cursor = z.string().optional().describe('上一页返回的 nextCursor');
 const limit = z.number().int().positive().optional().describe('每页条数，默认 50，最多 200');
 const since = z.string().optional().describe('ISO 时间');
-const compact = z.boolean().optional().describe('true 时返回扁平精简列表，每条只有 id、author、isMe、replyTo、text、at、depth，省 token；不传返回完整版');
+const compact = z.boolean().optional().describe('true 时返回扁平精简列表（JSON 不缩进），每条只有 id、author、isMe、replyTo、text、at、depth，省 token；不传返回完整版');
+const compactEvents = z.boolean().optional().describe('true 时返回扁平精简列表（JSON 不缩进），每条只有 id、type、subjectId、author、isMe、replyTo、text、at、depth；回复用 subjectId。不传返回完整版');
 const id = (what) => z.string().describe(`${what}，写成 <platformCode>:<原生 id>`);
 
 // [工具名, 说明, 入参, (db, args) => 结果]
 const READ_TOOLS = [
   ['list_accounts', '列出账号：登录状态、能力位、各类数据上次抓取成功的时间（lastSync）', {}, (db) => q.listAccounts(db)],
   ['inbox', '每个平台的未处理事件数、未读会话数、未回复评论数', { platforms }, (db, a) => q.inbox(db, a)],
-  ['list_events', '列事件（旧到新）。unhandled: true 取还没回执的，用来补漏推', {
-    types: z.array(z.enum(EVENT_TYPES)).optional(), platforms, unhandled: z.boolean().optional(), since, cursor, limit, compact,
+  ['list_events', '列事件（旧到新）。unhandled: true 取还没回执的，用来补漏推。compact: true 返回精简条目', {
+    types: z.array(z.enum(EVENT_TYPES)).optional(), platforms, unhandled: z.boolean().optional(), since, cursor, limit, compact: compactEvents,
   }, (db, a) => q.listEvents(db, a)],
   ['ack_event', '回执一个事件：处理完一条就调，outcome 是 replied / skipped / pending_human / ignored', {
     eventId: z.string(), outcome: z.enum(q.OUTCOMES), note: z.string().optional(),
@@ -43,12 +44,12 @@ const READ_TOOLS = [
   ['list_works', '列作品（新的在前）', { platforms, since, until: z.string().optional(), cursor, limit }, (db, a) => q.listWorks(db, a)],
   ['get_work', '作品详情 + 指标采样（S3 前为空）+ 最新 20 条一楼评论', { workId: id('作品 id') }, (db, a) => q.getWork(db, a.workId)],
   ['get_work_flow', '作品按小时的流速（S5 前没有数据）', { workId: id('作品 id'), hours: z.number().int().positive().optional() }, (db, a) => q.getWorkFlow(db, a.workId)],
-  ['list_comments', '扁平评论列表（新的在前），带 parentId/rootId/depth 和 replied。replied: false 只返回别人写的、还没回的', {
+  ['list_comments', '扁平评论列表（新的在前），带 parentId/rootId/depth 和 replied。replied: false 只返回别人写的、还没回的。compact: true 返回精简条目', {
     workId: id('作品 id').optional(), platforms, since, replied: z.boolean().optional(), includeGone: z.boolean().optional(), cursor, limit, compact,
   }, (db, a) => q.listComments(db, a)],
   ['get_comment_thread', '评论所在的整楼：嵌套树 + 作品标题和链接 + partial（楼中楼拿不全时 true）。compact: true 返回扁平列表和 total；再加 around、n 只取目标前后 n 条（一楼总在第一条），omitted 是省掉的条数', {
     commentId: id('评论 id'), compact,
-    around: id('只看这条评论前后，需要 compact: true').optional(), n: z.number().int().positive().optional().describe('around 前后各取几条，默认 5，最多 50'),
+    around: id('只看这条评论前后，需要 compact: true').optional(), n: z.number().int().positive().optional().describe('around 前后各取几条，默认 5，最多 50；要和 around 一起用'),
   }, (db, a) => q.getCommentThread(db, a.commentId, { compact: a.compact, around: a.around, n: a.n })],
   ['list_conversations', '私信会话列表（最近的在前）', {
     platforms, unread: z.boolean().optional(), lastBy: z.enum(['me', 'peer']).optional(), since, cursor, limit,

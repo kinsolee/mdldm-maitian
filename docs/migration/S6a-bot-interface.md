@@ -35,14 +35,14 @@ MCP 客户端配置示例（JSON 形式，各平台字段名可能不同）：
 |---|---|---|
 | `list_accounts` | — | Account[]：`loginState`、`capabilities`、`lastSync`（各 kind 最近一次抓取成功的时间） |
 | `inbox` | `platforms?` | 每个平台的 `unhandledEvents`、`unreadConversations`、`unrepliedComments` |
-| `list_events` | `types?`、`platforms?`、`unhandled?`、`since?`、`cursor?`、`limit?`、`compact?` | Event[]，旧的在前 |
+| `list_events` | `types?`、`platforms?`、`unhandled?`、`since?`、`cursor?`、`limit?`、`compact?` | Event[]，旧的在前。`compact` 的返回见下 |
 | `ack_event` | `eventId`、`outcome`、`note?` | `{ eventId, handled }` |
 | `subscribe_events` | `subscriberId`、`url`、`types[]`、`platforms?` | 见第 2 节 |
 | `unsubscribe_events` | `subscriberId` | `{ subscriberId, active: false }` |
 | `list_works` | `platforms?`、`since?`、`until?`、`cursor?`、`limit?` | Work[]，新的在前（按 `postTime`） |
 | `get_work` | `workId` | `{ work, samples: [], topComments }`。`topComments` 是最新的 20 条一楼评论。`samples` 等 S3 上线后才有数据 |
 | `get_work_flow` | `workId`、`hours?` | `{ workId, hours: [], note }`。流速数据等 S5 上线后才有 |
-| `list_comments` | `workId?`、`platforms?`、`since?`、`replied?`、`includeGone?`、`cursor?`、`limit?`、`compact?` | 扁平的 Comment[]，新的在前 |
+| `list_comments` | `workId?`、`platforms?`、`since?`、`replied?`、`includeGone?`、`cursor?`、`limit?`、`compact?` | 扁平的 Comment[]，新的在前。`compact` 的返回见下 |
 | `get_comment_thread` | `commentId`、`compact?`、`around?`、`n?` | `{ work: { id, title, url }, partial, root }`。`root` 是整楼的嵌套树，每个节点有 `children`。`compact` 的返回见下 |
 | `list_conversations` | `platforms?`、`unread?`、`lastBy?`（`me` 或 `peer`）、`since?`、`cursor?`、`limit?` | Conversation[]，最近的在前 |
 | `get_conversation` | `conversationId`、`limit?` | `{ conversation, messages }`。`messages` 是最近 `limit` 条，旧的在前 |
@@ -54,7 +54,7 @@ MCP 客户端配置示例（JSON 形式，各平台字段名可能不同）：
 
 - 每条评论只有 `id`、`author`（昵称）、`isMe`、`replyTo`（被回复的人的昵称，没有为 `null`）、`text`、`at`（评论时间）、`depth`。已被删的评论多一个 `gone: true`。
 - `get_comment_thread` 返回 `{ work, partial, total, items }`。`items` 按先序排：一楼在前，然后逐条回复和它下面的回复，同级按时间。`total` 是整栋楼的条数，含一楼。一楼不在库里时，第一条是 `{ id, missing: true }`。
-- `get_comment_thread` 再加 `around: <评论 id>` 时，只返回这条评论前后各 `n` 条（`n` 默认 5，最多 50）。一楼总是第一条。返回里多一个 `omitted`，是没返回的条数。`around` 必须在这栋楼里，并且要和 `compact: true` 一起用。`partial` 的含义不变，只表示麦田的数据是否完整，和 `around` 截掉多少无关。
+- `get_comment_thread` 再加 `around: <评论 id>` 时，只返回这条评论前后各 `n` 条（`n` 默认 5，最多 50）。一楼总是第一条。返回里多一个 `omitted`，是没返回的条数。`around` 必须在这栋楼里，并且要和 `compact: true` 一起用；`n` 要和 `around` 一起用。`partial` 的含义不变，只表示麦田的数据是否完整，和 `around` 截掉多少无关。
 - `list_events` 的每条是 `id`、`type`、`subjectId`、`author`、`isMe`、`replyTo`、`text`、`at`（事件时间）、`depth`。`subjectId` 是回复时要用的评论或会话 id。评论事件的 `isMe`、`replyTo`、`depth` 取自库里的评论；私信和其他事件的 `depth` 为 `null`。
 - 分页（`cursor`、`nextCursor`）和过滤条件都和完整版一样。
 
