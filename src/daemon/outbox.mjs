@@ -81,7 +81,9 @@ function safeUrl(url) {
 // 两种提醒都按库里的状态算：没真发出（notify 不是 true）就不记，下一轮还会再发
 async function alerts(db, s, { now, notify }) {
   let sent = 0;
-  const failed = db.prepare('SELECT eventId, lastError FROM event_deliveries WHERE subscriberId = ? AND deliveredAt IS NULL AND gaveUpAt IS NOT NULL AND alertedAt IS NULL ORDER BY gaveUpAt DESC').all(s.id);
+  // 已回执的（例如后来被推送前过滤自动回执 skipped）不再算推送失败
+  const failed = db.prepare(`SELECT d.eventId, d.lastError FROM event_deliveries d JOIN events e ON e.id = d.eventId
+    WHERE d.subscriberId = ? AND d.deliveredAt IS NULL AND d.gaveUpAt IS NOT NULL AND d.alertedAt IS NULL AND e.handledAt IS NULL ORDER BY d.gaveUpAt DESC`).all(s.id);
   if (failed.length) {
     const text = `⚠️ 事件推送失败 | ${s.id}\n${failed.length} 条事件重试 ${RETRY_DELAYS_MS.length} 次仍没送达，最后的错误：${failed[0].lastError}\n接收地址：${safeUrl(s.url)}\n已停止自动重试。bot 可调 list_events({ unhandled: true }) 补；bot 重新登记或下一次推送成功后自动恢复。`;
     if ((await notify(text)) === true) {

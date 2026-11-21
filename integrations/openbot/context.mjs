@@ -14,9 +14,7 @@ const json = (s) => { try { return JSON.parse(s); } catch { return {}; } };
 /** 只读打开 ops.db；文件不在返回 null。 */
 export function openOpsDbReadOnly(file) {
   if (!file || !fs.existsSync(file)) return null;
-  const db = new DatabaseSync(file, { readOnly: true });
-  db.exec('PRAGMA busy_timeout=5000;');
-  return db;
+  return new DatabaseSync(file, { readOnly: true, timeout: 5000 });
 }
 
 function commentContext(db, e, p) {
@@ -28,7 +26,7 @@ function commentContext(db, e, p) {
   };
   if (!c) return out;
   const t = getCommentThread(db, e.subjectId, { compact: true, around: e.subjectId, n: THREAD_AROUND });
-  out.thread = { partial: t.partial, total: t.total, omitted: t.omitted, items: t.items.map((x) => ({ ...x, author: clip(x.author), replyTo: clip(x.replyTo), text: clip(x.text) })) };
+  out.thread = { partial: t.partial, total: t.total, omitted: t.omitted, items: t.items.map((x) => (x.missing ? x : { ...x, author: clip(x.author), replyTo: clip(x.replyTo), text: clip(x.text) })) };
   return out;
 }
 

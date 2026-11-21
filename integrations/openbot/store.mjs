@@ -6,7 +6,6 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
-export const BATCH_SIZE = 100;   // 一批最多这么多条（窗口里攒的超过了，剩下的紧接着再切一批）
 export const DEFAULT_BATCH_WINDOW_MS = 30 * 60_000;
 export const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000];
 export const MAX_ATTEMPTS = RETRY_DELAYS_MS.length + 1;
@@ -57,13 +56,15 @@ export function openStore(file, { batchWindowMs = DEFAULT_BATCH_WINDOW_MS } = {}
       }
       const oldest = unbatchedSince();
       if (oldest == null || oldest + batchWindowMs > now) return null;
+      // 窗口一到，队里没分批的全部切成一批，不设条数上限：设上限的话剩下的会按自己的进队时间再等一个窗口
       const rows = db.prepare(`SELECT id FROM events WHERE batchKey IS NULL AND forwardedAt IS NULL AND gaveUpAt IS NULL
-        ORDER BY receivedAt, id LIMIT ?`).all(BATCH_SIZE);
+        ORDER BY receivedAt, id`).all();
       if (!rows.length) return null;
       const ids = rows.map((r) => r.id).sort();
       const key = batchKey(ids);
       const stamp = db.prepare('UPDATE events SET batchKey = ? WHERE id = ?');
-      for (const id of ids) stamp.run(key, id);
+      db.exec('BEGIN IMMEDIATE');
+      try { for (const id of ids) stamp.run(key, id); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
       return { key, ids, attempts: 0 };
     },
 

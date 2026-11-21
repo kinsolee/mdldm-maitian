@@ -99,6 +99,23 @@ describe('攒批', () => {
     store.close();
   });
 
+  test('窗口里攒了超过 100 条、分几次进队：窗口一到全部一次交出，不拖到下一个窗口', async () => {
+    const store = openStore(':memory:');
+    const clock = { t: T0 };
+    const { r, calls } = receiverWith(store, clock);
+    const batch = (from, n) => Array.from({ length: n }, (_, i) => ev(C(`b${from + i}`)));
+    store.receive(batch(0, 10), T0);
+    store.receive(batch(10, 50), T0 + 10 * MIN);
+    store.receive(batch(60, 60), T0 + 20 * MIN);
+    clock.t = T0 + 30 * MIN;
+    await r.drain();
+    assert.deepEqual(calls.map((c) => c.ids.length), [120]);
+    assert.equal(store.stats().pending, 0);
+    assert.equal(store.nextDueAt(), null);
+    r.stop();
+    store.close();
+  });
+
   test('窗口可配：0 是来了就投', async () => {
     const store = openStore(':memory:', { batchWindowMs: 0 });
     const clock = { t: T0 };
@@ -120,6 +137,9 @@ describe('攒批', () => {
     const d = readConfig({ OPENBOT_CLI: cli, RECEIVER_BATCH_WINDOW_MINUTES: '5', RECEIVER_MESSAGE_MAX_CHARS: '8000', MAITIAN_OPS_DB: '/x/ops.db' });
     assert.deepEqual([d.batchWindowMs, d.maxChars, d.contextDb], [5 * MIN, 8000, '/x/ops.db']);
     assert.throws(() => readConfig({ OPENBOT_CLI: cli, RECEIVER_BATCH_WINDOW_MINUTES: '-1' }), /RECEIVER_BATCH_WINDOW_MINUTES/);
+    const empty = readConfig({ OPENBOT_CLI: cli, RECEIVER_BATCH_WINDOW_MINUTES: '', RECEIVER_MESSAGE_MAX_CHARS: ' ' });
+    assert.deepEqual([empty.batchWindowMs, empty.maxChars], [30 * MIN, 12_000], '空值走缺省，不会悄悄关掉攒批');
+    assert.equal(readConfig({ OPENBOT_CLI: cli, RECEIVER_BATCH_WINDOW_MINUTES: '0' }).batchWindowMs, 0);
     assert.throws(() => readConfig({ OPENBOT_CLI: cli, RECEIVER_MESSAGE_MAX_CHARS: 'abc' }), /RECEIVER_MESSAGE_MAX_CHARS/);
   });
 });
@@ -271,6 +291,40 @@ describe('截断', () => {
     assert.deepEqual(block.map((e) => e.id), ids.slice(0, block.length));
     assert.match(outside, new RegExp(`30 条事件去掉了楼片段或私信记录，${30 - block.length} 条事件没放进数据块`));
     for (const id of ids) assert.ok(outside.includes(`- ${id}\n`));
+  });
+});
+
+describe('截断的边界情况', () => {
+  test('事件多到光 id 列表就超上限：数据块清空，id 一个不少，写明截断', () => {
+    const many = Array.from({ length: 100 }, (_, i) => C(`m${String(i).padStart(3, '0')}`));
+    const ctx = new Map(many.map((id) => [id, { id, type: 'comment.created', text: '问' }]));
+    const text = taskText(many, { contexts: ctx, maxChars: 2000, boundary: 'B6' });
+    const { outside, block } = split(text, 'B6');
+    assert.equal(block.length, 0);
+    for (const id of many) assert.ok(outside.includes(`- ${id}\n`));
+    assert.match(outside, /100 条事件没放进数据块或只留了 id/);
+  });
+
+  test('id 含特殊字符的事件超长：精简成只有 id，重新算长度，不误删前面的', () => {
+    const bad = 'comment.created:Douyin:bad id';
+    const one = taskText([bad], { contexts: new Map([[bad, { type: 'comment.created', text: '长'.repeat(2500) }]]), maxChars: 2000, boundary: 'B7' });
+    assert.ok(one.length <= 2000, `长度 ${one.length}`);
+    assert.deepEqual(split(one, 'B7').block, [{ id: bad, truncated: true }]);
+    assert.match(one, /1 条事件没放进数据块或只留了 id/);
+
+    const two = taskText([C(1), bad], { contexts: new Map([[C(1), { text: '短' }], [bad, { text: '长'.repeat(1600) }]]), maxChars: 2000, boundary: 'B8' });
+    const { block } = split(two, 'B8');
+    assert.deepEqual(block.map((e) => e.id), [C(1), bad]);
+    assert.equal(block[0].text, '短');
+  });
+
+  test('私信的 messages 也会被截', () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `dm.received:Douyin:c${i}:2026-11-19T01:00:00.000Z`);
+    const ctx = new Map(ids.map((id) => [id, { type: 'dm.received', messages: [{ by: 'peer', text: '信'.repeat(400) }] }]));
+    const text = taskText(ids, { contexts: ctx, maxChars: 6000, boundary: 'B9' });
+    const { block } = split(text, 'B9');
+    assert.ok(text.length <= 6000);
+    assert.ok(block.some((e) => e.truncated && !e.messages));
   });
 });
 

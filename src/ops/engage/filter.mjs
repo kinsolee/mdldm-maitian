@@ -1,6 +1,6 @@
 // 推送前的确定过滤：命中的事件只记库、不推，自动回执成 skipped（note 写规则名），events.filteredReason 记规则名。
 // 两条规则只看 comments 表里入库时就定下的字段（authorIsMe、depth、parentId、replyToUid），不看任何文本。
-// 拿不准的（评论行不在库里、父评论不在库里、replyTo 只有昵称没有 uid）一律不过滤，照常推。
+// 拿不准的（评论行不在库里、父评论不在库里、replyTo 只有昵称没有 uid、作品的楼中楼拿不全）一律不过滤，照常推。
 import { ackEvent } from './query.mjs';
 
 export const FILTER_RULES = ['self-author', 'peer-reply'];
@@ -13,10 +13,12 @@ export const FILTER_RULES = ['self-author', 'peer-reply'];
  */
 export function filterRuleFor(db, event) {
   if (event.type !== 'comment.created' || !event.subjectId) return null;
-  const c = db.prepare('SELECT accountId, depth, parentId, authorIsMe, replyToUid, replyToNickname FROM comments WHERE id = ?').get(event.subjectId);
+  const c = db.prepare('SELECT accountId, workId, depth, parentId, authorIsMe, replyToUid, replyToNickname FROM comments WHERE id = ?').get(event.subjectId);
   if (!c) return null;
   if (c.authorIsMe === 1) return 'self-author';
   if (c.depth < 1 || c.parentId == null) return null;
+  // 楼中楼拿不全时，有的适配器（小红书、视频号）把找不到的父评论改挂到一楼、清掉 replyTo：这时「父评论是网友的」不可信
+  if (db.prepare('SELECT partial FROM thread_partial WHERE workId = ?').get(c.workId)?.partial === 1) return null;
   const parent = db.prepare('SELECT authorIsMe FROM comments WHERE id = ?').get(c.parentId);
   if (!parent || parent.authorIsMe === 1) return null;
   if (c.replyToUid == null) return c.replyToNickname == null ? 'peer-reply' : null;
@@ -36,15 +38,15 @@ function myUids(db, accountId) {
  * 已经送达过的不动：bot 手里可能正在处理。返回 [{ eventId, rule }]。
  */
 export function applyEventFilters(db, { now = Date.now } = {}) {
-  const rows = db.prepare(`SELECT id, type, subjectId FROM events e WHERE e.type = 'comment.created' AND e.handledAt IS NULL AND e.filteredReason IS NULL
-    AND NOT EXISTS (SELECT 1 FROM event_deliveries d WHERE d.eventId = e.id AND d.deliveredAt IS NOT NULL) ORDER BY e.createdAt, e.id`).all();
   const mark = db.prepare('UPDATE events SET filteredReason = ? WHERE id = ?');
-  const hits = rows.map((r) => ({ eventId: r.id, rule: filterRuleFor(db, r) })).filter((h) => h.rule);
-  if (!hits.length) return hits;
-  db.exec('BEGIN IMMEDIATE');   // 标记和回执一起落库：不会出现标了原因却没回执、下一轮又被推出去的半截状态
+  // 查和写在同一个写事务里：别的进程（MCP 的 ack_event）不会在中间回执同一条、再被这里盖成 skipped
+  db.exec('BEGIN IMMEDIATE');
   try {
+    const rows = db.prepare(`SELECT id, type, subjectId FROM events e WHERE e.type = 'comment.created' AND e.handledAt IS NULL AND e.filteredReason IS NULL
+      AND NOT EXISTS (SELECT 1 FROM event_deliveries d WHERE d.eventId = e.id AND d.deliveredAt IS NOT NULL) ORDER BY e.createdAt, e.id`).all();
+    const hits = rows.map((r) => ({ eventId: r.id, rule: filterRuleFor(db, r) })).filter((h) => h.rule);
     for (const h of hits) { mark.run(h.rule, h.eventId); ackEvent(db, h.eventId, 'skipped', h.rule, { now }); }
     db.exec('COMMIT');
+    return hits;
   } catch (e) { db.exec('ROLLBACK'); throw e; }
-  return hits;
 }

@@ -82,6 +82,16 @@ describe('规则', () => {
     assert.equal(ruleOf(db, 'nope'), null);
   });
 
+  test('作品的楼中楼拿不全（thread_partial）：不判 peer-reply，照常推', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    const base = [comment('r1', { uid: 'u-r1' })];
+    ingestSnapshot(db, acc, commentsSnap(base), { now: at(T0) });
+    // 小红书、视频号在被回复的那条拿不到时会改挂到一楼、清掉 replyTo，库里看起来像网友回网友
+    ingestSnapshot(db, acc, commentsSnap([...base, comment('b1', { parent: 'r1', uid: 'u-x' })], { scanned: [{ workNativeId: 'w1', complete: false, threadsPartial: true }] }), { now: at(T0 + MIN) });
+    assert.equal(ruleOf(db, 'b1'), null);
+  });
+
   test('self-author：评论作者是本账号', () => {
     const db = freshDb();
     seed(db, () => []);
@@ -132,6 +142,18 @@ describe('过滤后的事件', () => {
     db.prepare("INSERT INTO event_deliveries (eventId, subscriberId, attempts, deliveredAt) VALUES ('comment.created:Douyin:peer', 'bot-a', 1, ?)").run(new Date(T0).toISOString());
     ackEvent(db, 'comment.created:Douyin:peer2', 'pending_human', '人看', { now: at(T0 + MIN) });
     assert.deepEqual(applyEventFilters(db, { now: at(T0 + 2 * MIN) }), []);
+  });
+
+  test('推送失败停了自动重试、之后被过滤自动回执的：不再发「推送失败」提醒', async () => {
+    const db = freshDb();
+    subscribe(db, { subscriberId: 'bot-a', url: 'http://127.0.0.1:9/maitian/hook', types: ['comment.created'] }, { now: at(T0 - MIN) });
+    seed(db, () => [comment('peer', { parent: 'r1', uid: 'u-x' })]);
+    // 模拟：过滤上线前这条已经推送失败、停了自动重试，提醒还没发出去
+    db.prepare("INSERT INTO event_deliveries (eventId, subscriberId, attempts, gaveUpAt, lastError) VALUES ('comment.created:Douyin:peer', 'bot-a', 4, ?, 'HTTP 500')").run(new Date(T0).toISOString());
+    const sent = [];
+    const r = await deliverPending(db, { now: at(T0 + 2 * MIN), notify: async (t) => { sent.push(t); return true; }, fetchImpl: async () => new Response('{}') });
+    assert.deepEqual(r.filtered.map((f) => f.rule), ['peer-reply']);
+    assert.ok(!sent.some((t) => t.includes('推送失败')), sent.join('\n'));
   });
 
   test('deliverPending：被过滤的不推，没命中的照常推、形状不变', async () => {

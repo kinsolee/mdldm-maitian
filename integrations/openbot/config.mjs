@@ -24,9 +24,10 @@ export function readConfig(env = process.env) {
   const port = Number(env.RECEIVER_PORT || 8790);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error(`RECEIVER_PORT 不是有效端口：${env.RECEIVER_PORT}`);
   const subscriberId = env.MAITIAN_SUBSCRIBER_ID || 'openbot-engage';
-  const windowMin = Number(env.RECEIVER_BATCH_WINDOW_MINUTES ?? 30);
+  const set = (k) => (env[k] == null || String(env[k]).trim() === '' ? null : String(env[k]).trim());   // 空值当没配，走缺省
+  const windowMin = Number(set('RECEIVER_BATCH_WINDOW_MINUTES') ?? 30);
   if (!Number.isFinite(windowMin) || windowMin < 0) throw new Error(`RECEIVER_BATCH_WINDOW_MINUTES 要是不小于 0 的分钟数：${env.RECEIVER_BATCH_WINDOW_MINUTES}`);
-  const maxChars = Number(env.RECEIVER_MESSAGE_MAX_CHARS ?? 12_000);
+  const maxChars = Number(set('RECEIVER_MESSAGE_MAX_CHARS') ?? 12_000);
   if (!Number.isInteger(maxChars) || maxChars < 2000) throw new Error(`RECEIVER_MESSAGE_MAX_CHARS 要是不小于 2000 的整数：${env.RECEIVER_MESSAGE_MAX_CHARS}`);
   const types = (env.MAITIAN_EVENT_TYPES || DEFAULT_TYPES.join(',')).split(',').map((s) => s.trim()).filter(Boolean);
   return {

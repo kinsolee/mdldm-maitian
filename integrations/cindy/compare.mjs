@@ -140,8 +140,10 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   const db = new DatabaseSync(opsDb, { readOnly: true, timeout: BUSY_TIMEOUT_MS });
   let events;
   try {
+    // 麦田推送前过滤掉的（filteredReason）两边都没收到，不算进对照；没升级过的库没有这一列
+    const filtered = db.prepare('PRAGMA table_info(events)').all().some((c) => c.name === 'filteredReason') ? 'AND filteredReason IS NULL' : '';
     events = db.prepare(`SELECT id, type, platformCode, createdAt, handledAt, handledOutcome FROM events
-      WHERE type IN (SELECT value FROM json_each(?)) AND createdAt >= ? AND createdAt < ? ORDER BY createdAt, id`)
+      WHERE type IN (SELECT value FROM json_each(?)) AND createdAt >= ? AND createdAt < ? ${filtered} ORDER BY createdAt, id`)
       .all(JSON.stringify(DEFAULT_TYPES), since, until).map((r) => ({ ...r }));
   } finally { db.close(); }
 

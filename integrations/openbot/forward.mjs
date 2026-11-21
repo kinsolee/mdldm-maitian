@@ -34,14 +34,15 @@ function render(ids, entries, { boundary, cut }) {
     end(boundary),
   ];
   if (cut.fragments || cut.entries) {
-    lines.push(`上下文截断了：${cut.fragments} 条事件去掉了楼片段或私信记录，${cut.entries} 条事件没放进数据块（只有上面的 id）。这些事件仍在这一批里，照样要处理和 ack_event，完整内容用 get_comment_thread / get_conversation / list_events 查。`);
+    lines.push(`上下文截断了：${cut.fragments} 条事件去掉了楼片段或私信记录，${cut.entries} 条事件没放进数据块或只留了 id。这些事件仍在这一批里，照样要处理和 ack_event，完整内容用 get_comment_thread / get_conversation / list_events 查。`);
   }
   return lines.join('\n');
 }
 
 /**
  * 拼任务文字。contexts：Map<事件 id, 上下文对象>（见 context.mjs），没有的只给 id。
- * 超过 maxChars 时：从后往前逐个事件去掉 thread / messages；还超就从后往前把事件移出数据块。事件 id 列表一个不少。
+ * 超过 maxChars 时：从后往前逐个事件去掉 thread / messages；还超就从后往前把事件移出数据块。事件 id 列表一个不少，
+ * 所以上限管的是上下文：一批事件多到光 id 列表就超上限时，消息会超长（只剩 id，不再带上下文）。
  */
 export function taskText(ids, { contexts = new Map(), maxChars = DEFAULT_MAX_CHARS, boundary = randomBytes(16).toString('hex') } = {}) {
   const entries = ids.map((id) => ({ id, ...(contexts.get(id) ?? { context: 'missing' }), id }));
@@ -56,8 +57,12 @@ export function taskText(ids, { contexts = new Map(), maxChars = DEFAULT_MAX_CHA
     text = render(ids, entries, { boundary, cut });
   }
   for (let i = entries.length - 1; i >= 0 && text.length > maxChars; i--) {
-    if (!SAFE_ID.test(entries[i].id)) { entries[i] = { id: entries[i].id, truncated: true }; continue; }   // 块外没列出的 id 不能移走
-    entries.splice(i, 1);
+    if (!SAFE_ID.test(entries[i].id)) {   // 块外没列出的 id 不能移走，只留 id
+      if (Object.keys(entries[i]).length <= 2 && entries[i].truncated) continue;
+      entries[i] = { id: entries[i].id, truncated: true };
+    } else {
+      entries.splice(i, 1);
+    }
     cut.entries++;
     text = render(ids, entries, { boundary, cut });
   }
