@@ -115,6 +115,43 @@ describe('一轮抓取', () => {
     assert.equal(logs.filter((l) => /过滤 1 条（peer-reply 1）/.test(l)).length, 1);
   });
 
+  test('已有事件的评论在后来的快照里才补上 replyToUid、命中 peer-reply：这次没有新事件也马上过滤，任务完成时已落库', async () => {
+    const { db, c, base } = setup({ caps: [[DOUYIN, 'readComments'], [DOUYIN, 'readDM']] });
+    let seen = null;
+    const nickOnly = comment('c4', { parent: 'c1', replyTo: { uid: null, nickname: '昵称c1' } });
+    const withUid = comment('c4', { parent: 'c1', replyTo: { uid: 'u-c1', nickname: '昵称c1' } });
+    const { collect } = fakeCollect({
+      'Douyin/comments': [commentsSnap([comment('c1')]), commentsSnap([comment('c1'), nickOnly]), commentsSnap([comment('c1'), withUid])],
+      'Douyin/dms': [dmsSnap([]), dmsSnap([]), () => {
+        seen = db.prepare("SELECT e.handledOutcome, e.filteredReason, j.status FROM events e, sync_jobs j WHERE e.id = 'comment.created:Douyin:c4' AND j.kind = 'comments' ORDER BY j.requestedAt DESC LIMIT 1").get();
+        return dmsSnap([]);
+      }],
+    });
+    const fetchImpl = async () => { throw new Error('不该发网络请求'); };
+    await runRound(db, { ...base, collect, fetchImpl });
+    c.advance(15 * MIN);
+    const r2 = await runRound(db, { ...base, collect, fetchImpl });
+    assert.equal(r2.delivery.filtered, 0, 'replyTo 只有昵称：拿不准，不过滤');
+    assert.equal(db.prepare("SELECT handledAt FROM events WHERE id = 'comment.created:Douyin:c4'").get().handledAt, null);
+    c.advance(15 * MIN);
+    const r3 = await runRound(db, { ...base, collect, fetchImpl });
+    assert.equal(r3.jobs.find((j) => j.kind === 'comments').stats.events, 0);
+    assert.deepEqual({ ...seen }, { handledOutcome: 'skipped', filteredReason: 'peer-reply', status: 'ok' });
+    assert.equal(r3.delivery.filtered, 1);
+  });
+
+  test('推送出错时，入库后已过滤的条数照样进汇总和日志', async () => {
+    const { db, c, base, logs } = setup();
+    db.prepare("INSERT INTO subscribers (id, url, types, platforms, secret, createdAt, updatedAt) VALUES ('bot-a', 'http://127.0.0.1:9/h', 'not json', NULL, 's', ?, ?)").run(new Date(T0).toISOString(), new Date(T0).toISOString());
+    const { collect } = fakeCollect({ 'Douyin/comments': [commentsSnap([comment('c1')]), commentsSnap([comment('c1'), comment('c4', { parent: 'c1' })])] });
+    await runRound(db, { ...base, collect });
+    c.advance(15 * MIN);
+    const r = await runRound(db, { ...base, collect });
+    assert.ok(r.delivery.error, '订阅方的 types 坏了，推送出错');
+    assert.equal(r.delivery.filtered, 1);
+    assert.ok(logs.some((l) => /过滤 1 条（peer-reply 1）/.test(l)));
+  });
+
   test('busy / user-controlled 记 skipped，不出事件、不算失败', async () => {
     const { db, c, base, n } = setup();
     const { collect } = fakeCollect({ 'Douyin/comments': [
