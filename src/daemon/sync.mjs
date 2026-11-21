@@ -169,7 +169,8 @@ export async function runRound(db, {
     let delivery;
     try {
       const d = await deliverPending(db, { now, fetchImpl, notify });
-      delivery = { batches: d.batches.length, failedBatches: d.batches.filter((b) => !b.ok).length, alerts: d.alerts };
+      delivery = { batches: d.batches.length, failedBatches: d.batches.filter((b) => !b.ok).length, alerts: d.alerts, filtered: d.filtered.length };
+      if (d.filtered.length) log(`${localTime(now())} [engage] 过滤 ${d.filtered.length} 条（${Object.entries(Object.groupBy(d.filtered, (f) => f.rule)).map(([k, v]) => `${k} ${v.length}`).join('，')}），已回执 skipped`);
       if (d.batches.length) log(`${localTime(now())} [engage] 推送 ${d.batches.length} 批，失败 ${delivery.failedBatches} 批`);
     } catch (e) { delivery = { error: redact(e.message) }; log(`${localTime(now())} [engage] 推送出错：${delivery.error}`); }
     return { ran: true, jobs, delivery };

@@ -83,8 +83,11 @@ describe('一轮抓取', () => {
     assert.deepEqual(r2.jobs.map((j) => j.status), ['ok']);
     assert.deepEqual(r2.jobs[0].stats, { inserted: 2, updated: 3, gone: 0, events: 2 }, '作品行算在 updated 里');
     assert.deepEqual(events(db, 'comment.created').map((e) => e.subjectId).sort(), ['Douyin:c3', 'Douyin:c4']);
-    assert.equal(bot.received.length, 1, '两条事件合成一批');
-    assert.equal(bot.received[0].body.events.length, 2);
+    // c4 是网友回网友的楼中楼：推送前被 peer-reply 过滤、自动回执，只推 c3
+    assert.equal(bot.received.length, 1);
+    assert.deepEqual(bot.received[0].body.events.map((e) => e.subjectId), ['Douyin:c3']);
+    assert.equal(r2.delivery.filtered, 1);
+    assert.ok(logs.some((l) => /过滤 1 条（peer-reply 1），已回执 skipped/.test(l)));
     assert.ok(verify(secret, bot.received[0].raw, bot.received[0].headers['x-maitian-signature']));
     assert.equal(r2.delivery.batches, 1);
     const jobLog = logs.filter((l) => l.includes('Douyin comments'));

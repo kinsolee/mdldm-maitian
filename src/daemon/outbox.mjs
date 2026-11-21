@@ -4,6 +4,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { defaultNotify } from '../ops/login.mjs';
 import { toEvent } from '../ops/engage/query.mjs';
+import { applyEventFilters } from '../ops/engage/filter.mjs';
 
 export const BATCH_SIZE = 20;
 export const RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000];
@@ -106,9 +107,11 @@ async function alerts(db, s, { now, notify }) {
 /**
  * 推一轮。opts：now（毫秒时间函数）、fetchImpl、notify（返回 true 才算发出，默认飞书）、timeoutMs（默认 30 秒）。
  * 同一订阅方一批失败就不再推它后面的批次（地址多半整个不通），留到下一轮。
- * 返回 { batches: [{ subscriberId, batchId, size, ok, error? }], alerts }。
+ * 推之前先跑确定过滤（filter.mjs）：命中的自动回执 skipped，不进任何订阅方的队列。
+ * 返回 { batches: [{ subscriberId, batchId, size, ok, error? }], alerts, filtered: [{ eventId, rule }] }。
  */
 export async function deliverPending(db, { now = Date.now, fetchImpl = fetch, notify = defaultNotify, timeoutMs = POST_TIMEOUT_MS } = {}) {
+  const filtered = applyEventFilters(db, { now });
   const subs = db.prepare('SELECT * FROM subscribers WHERE active = 1 ORDER BY createdAt, id').all();
   const batches = [];
   let alertCount = 0;
@@ -122,5 +125,5 @@ export async function deliverPending(db, { now = Date.now, fetchImpl = fetch, no
     }
     alertCount += await alerts(db, s, { now, notify });
   }
-  return { batches, alerts: alertCount };
+  return { batches, alerts: alertCount, filtered };
 }

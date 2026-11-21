@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // 麦田事件接收端（OpenBot 侧）。只监听 127.0.0.1。
-// 收到推送：验 X-Maitian-Signature → 按事件 id 去重入队 → 马上回 200 → 后台逐批交给 OpenBot（openbot-cli run --id）。
+// 收到推送：验 X-Maitian-Signature → 按事件 id 去重入队 → 马上回 200 → 攒批：队里最早一条进队满 30 分钟（可配）
+// 后一次交给 OpenBot（openbot-cli run --id），消息里带从 ops.db 只读取的精简上下文。
 // 同一时间只投一批；失败按 30 秒、2 分钟、10 分钟重试，用尽后不再投，留给 agent 每轮开头的 list_events 补漏。
 // 日志只写条数、批次键、deliveryId、错误摘要，不写评论私信正文，不写密钥。
 import fs from 'node:fs';
@@ -9,6 +10,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { ENV_FILE, enforceEnvPerms, loadEnvFile, readConfig } from './config.mjs';
 import { openStore } from './store.mjs';
 import { cliForwarder } from './forward.mjs';
+import { opsContextSource } from './context.mjs';
 import { ensureSubscribed } from './subscribe.mjs';
 
 export const HOOK_PATH = '/maitian/hook';
@@ -103,12 +105,13 @@ export async function main() {
   const cfg = readConfig();
   const { secret, created } = await ensureSubscribed(cfg, { envFile: ENV_FILE });
   defaultLog(`订阅 ${cfg.subscriberId}：${created ? '首次登记，密钥已写进 .env' : '已更新'}（${cfg.types.join(', ')}）`);
-  const store = openStore(cfg.stateDb);
-  const receiver = createReceiver({ secret, subscriberId: cfg.subscriberId, store, forward: cliForwarder({ cli: cfg.cli, agent: cfg.agent }) });
+  const store = openStore(cfg.stateDb, { batchWindowMs: cfg.batchWindowMs });
+  const contexts = opsContextSource(cfg.contextDb, { log: defaultLog });
+  const receiver = createReceiver({ secret, subscriberId: cfg.subscriberId, store, forward: cliForwarder({ cli: cfg.cli, agent: cfg.agent, contexts, maxChars: cfg.maxChars }) });
   const server = http.createServer(receiver.handler);
   server.requestTimeout = 20_000;   // 拖着不发完请求体的连接 20 秒断开，保证 30 秒内有回应
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(cfg.port, '127.0.0.1', resolve); });
-  defaultLog(`接收端已启动：127.0.0.1:${cfg.port}${HOOK_PATH}，投给 OpenBot「${cfg.agent}」`);
+  defaultLog(`接收端已启动：127.0.0.1:${cfg.port}${HOOK_PATH}，投给 OpenBot「${cfg.agent}」，攒批 ${cfg.batchWindowMs / 60_000} 分钟，消息上限 ${cfg.maxChars} 字`);
   receiver.drain();
   const stop = () => { receiver.stop(); server.close(() => { store.close(); process.exit(0); }); };
   process.on('SIGTERM', stop);

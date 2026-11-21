@@ -24,6 +24,10 @@ export function readConfig(env = process.env) {
   const port = Number(env.RECEIVER_PORT || 8790);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error(`RECEIVER_PORT 不是有效端口：${env.RECEIVER_PORT}`);
   const subscriberId = env.MAITIAN_SUBSCRIBER_ID || 'openbot-engage';
+  const windowMin = Number(env.RECEIVER_BATCH_WINDOW_MINUTES ?? 30);
+  if (!Number.isFinite(windowMin) || windowMin < 0) throw new Error(`RECEIVER_BATCH_WINDOW_MINUTES 要是不小于 0 的分钟数：${env.RECEIVER_BATCH_WINDOW_MINUTES}`);
+  const maxChars = Number(env.RECEIVER_MESSAGE_MAX_CHARS ?? 12_000);
+  if (!Number.isInteger(maxChars) || maxChars < 2000) throw new Error(`RECEIVER_MESSAGE_MAX_CHARS 要是不小于 2000 的整数：${env.RECEIVER_MESSAGE_MAX_CHARS}`);
   const types = (env.MAITIAN_EVENT_TYPES || DEFAULT_TYPES.join(',')).split(',').map((s) => s.trim()).filter(Boolean);
   return {
     cli,
@@ -34,6 +38,9 @@ export function readConfig(env = process.env) {
     secret: env.MAITIAN_SECRET || null,
     mcpServer: env.MAITIAN_MCP_SERVER || path.resolve(HERE, '../../src/mcp/server.mjs'),
     opsDb: env.MAITIAN_OPS_DB || null,
+    contextDb: env.MAITIAN_OPS_DB || path.resolve(HERE, '../../data/ops.db'),   // 推送消息的上下文从这里只读取
+    batchWindowMs: Math.round(windowMin * 60_000),
+    maxChars,
     stateDb: env.RECEIVER_STATE_DB || path.join(HERE, 'data', 'receiver.db'),
     url: `http://127.0.0.1:${port}/maitian/hook`,
   };
