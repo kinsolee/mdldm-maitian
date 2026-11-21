@@ -126,7 +126,7 @@ describe('抖音：接口读评论', () => {
     assert.equal(w2[0].selectErrors.length, 1);
     // 一楼一页都没读到：作品记 opened:false，全部都这样时 parse 报 no-data（同步失败会告警）
     assert.equal(w2[0].opened, false);
-    assert.throws(() => parse(w2), /no-data|一个都没能/);
+    assert.throws(() => parse(w2), /一楼评论接口都没读到：请求网络失败/);
     // 「url doesn't match」：status_code=0 但没有 comments，按出错算
     const w3 = await dy.worksViaApi(async () => ({ ok: true, data: { status_code: 0, status_msg: "url doesn't match" } }), [{ item_id_plain: 'w1' }], o);
     assert.equal(w3[0].selectErrors[0].comments, 'missing');
@@ -456,5 +456,10 @@ describe('runApiReply 和开关', () => {
     // 能力位关着时调用方传 readVia: 'api' 也不生效
     await collect({ account: acc({}), kind: 'comments', runner, options: { readVia: 'api' } });
     assert.equal(seen.at(-1), 'dom');
+    // 退回 DOM 时写日志
+    const logs = [];
+    await collect({ account: acc({ readViaApi: true }), kind: 'comments', log: (m) => logs.push(m),
+      runner: async () => ({ ok: true, result: { kind: 'comments', via: 'dom', apiFallback: '页面评论服务没找到，退回 DOM 路径', uidSeen: ME, itemListCodes: [] } }) });
+    assert.match(logs[0] ?? '', /页面内接口没用上：页面评论服务没找到/);
   });
 });

@@ -273,7 +273,13 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
   if (!codes.length) adapterFail('no-data', '没抓到 /aweme/v1/creator/item/list');
   if (!codes.includes(0)) adapterFail('api-error', `/aweme/v1/creator/item/list status_code=${codes.join(',')}`);
   // G-B5a：有近期作品要扫，却一个都没切过去（「选择作品」改版之类），不能报成功
-  if (raw.works.length && !raw.works.some((w) => w.opened)) adapterFail('no-data', `${raw.works.length} 个近期作品一个都没能切过去（「选择作品」或作品列表没找到）`);
+  if (raw.works.length && !raw.works.some((w) => w.opened)) {
+    if (raw.via === 'api') {
+      const errs = [...new Set(raw.works.flatMap((w) => w.selectErrors ?? []).map((e) => e.error ?? `status_code=${e.status_code}，comments ${e.comments}`))];
+      adapterFail('no-data', `${raw.works.length} 个近期作品的一楼评论接口都没读到：${errs.slice(0, 3).join('；') || '原因不明'}`);
+    }
+    adapterFail('no-data', `${raw.works.length} 个近期作品一个都没能切过去（「选择作品」或作品列表没找到）`);
+  }
   const items = new Map(raw.items.map((x) => [x.item_id_plain, x]));
   const works = [], comments = [], scannedWorks = [];
   const author = (u) => ({ uid: str(u?.uid), nickname: u?.nickname ?? '', isMe: str(u?.uid) === me });

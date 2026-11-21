@@ -26,7 +26,7 @@
 
 ```sh
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 readViaApi true
-node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi true   # 只有负责人同意首次真发时才开，见第 6 节
+node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi true   # 只有负责人同意首次真发时才开，见第 7 节
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi false  # 关回页面写法
 ```
 
@@ -125,7 +125,7 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi false  # �
 
 和 S7 第 7 节一样，下面只写接口写法要多做的。以抖音为例，视频号把账号 id 换成 `Channels:<uid>`：
 
-1. 先只开读：`set-cap Douyin:106707338905 readViaApi true`。跑一周，对比以前 DOM 采集的评论条数和 `threadsPartial`，看日志里有没有 `apiFallback`、接口出错或验证码。
+1. 先只开读：`set-cap Douyin:106707338905 readViaApi true`。跑一周，对比以前 DOM 采集的评论条数和 `threadsPartial`，看守护进程 stderr 里有没有「页面内接口没用上」、接口出错或验证码。
 2. 负责人同意本次真发，并指定目标，最好是负责人自己用小号留的评论。
 3. 打开 `reply` 和 `writeViaApi`。负责人在 Ego 里看着那个 space 的页面。
 4. 回评官调一次 `reply_comment`。应该返回 `status: "sent"`、`readBack.found: true`、`readBack.count: 1`、`readBack.nativeId` 不为空。
