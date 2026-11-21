@@ -79,6 +79,8 @@ const MAX_LOCATE_PAGES = 30;               // 一次定位最多读这么多页�
 const START = 'start', END = 'end';        // 邻居：目标前面没有了 / 后面没有了
 const bigOf = (x) => (/^\d+$/.test(String(x ?? '')) ? BigInt(String(x)) : null);
 const numOf = (x) => (x == null || x === '' ? NaN : Number(x));
+// 条数只认非负整数：负数、小数都不能当「下面没有回复」的证据
+const countOf = (x) => { const n = numOf(x); return Number.isInteger(n) && n >= 0 ? n : NaN; };
 const showId = (x) => (x === START ? '楼的开头' : x === END ? '楼的末尾' : x == null ? '（读不到）' : String(x));
 
 /** 按页读楼，带缓存和页数上限。page(pn) → { replies, ids, count, root } / { gone, code } / { error, unsure? }。 */
@@ -98,7 +100,7 @@ function threadReader(api, oid, root) {
       const ids = replies.map((x) => bigOf(rpidOf(x)));
       if (ids.some((x) => x == null)) r = { error: `reply/reply 第 ${pn} 页有条目缺 rpid`, unsure: true };
       else if (ids.some((x, i) => i > 0 && x <= ids[i - 1])) r = { error: `reply/reply 第 ${pn} 页不是按 rpid 递增，定位不了`, unsure: true };
-      else r = { replies, ids, count: numOf(j.data?.page?.count), root: j.data?.root ?? null };
+      else r = { replies, ids, count: countOf(j.data?.page?.count), root: j.data?.root ?? null };
     }
     cache.set(pn, r);
     return r;
@@ -127,10 +129,11 @@ async function idAt(page, pn, i) {
 async function seek(page, rpid) {
   const first = await page(1);
   if (!first.ids) return first;
-  if (!Number.isFinite(first.count)) return { error: 'reply/reply 没给 page.count', unsure: true };
+  if (!Number.isFinite(first.count)) return { error: `reply/reply 的 page.count 不是非负整数（${first.count}）`, unsure: true };
   // X3-B1：第 1 页是空的、count 却说有回复，不能当空楼
   if (!first.ids.length && first.count > 0) return { error: `reply/reply 第 1 页是空的，但 page.count=${first.count}`, unsure: true };
-  let lo = 1, hi = Math.max(1, Math.ceil(first.count / PS));
+  const last = Math.max(1, Math.ceil(first.count / PS));
+  let lo = 1, hi = last;
   while (lo <= hi) {
     const pn = (lo + hi) >> 1;
     const p = await page(pn);
@@ -139,6 +142,16 @@ async function seek(page, rpid) {
     if (rpid > p.ids.at(-1)) { lo = pn + 1; continue; }
     const i = p.ids.indexOf(rpid);
     return i >= 0 ? { at: { pn, i, node: p.replies[i] } } : { slot: { pn, i: p.ids.findIndex((x) => x > rpid) } };
+  }
+  // 目标比 count 算出的最后一页还靠后：最后一页是满的、后面还有一页非空，说明 count 偏小，定位不了
+  if (lo > last) {
+    const tail = await page(last);
+    if (!tail.ids) return tail;
+    if (tail.ids.length === PS) {
+      const more = await page(last + 1);
+      if (!more.ids) return more;
+      if (more.ids.length) return { error: `reply/reply 的 page.count=${first.count} 偏小，第 ${last + 1} 页还有回复，定位不了`, unsure: true };
+    }
   }
   return { slot: { pn: Math.max(lo, 1), i: 0 } };
 }
@@ -159,8 +172,9 @@ async function precheckComment(api, p, me, oid) {
     if (first.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${first.code}）`);
     if (!first.ids) return stop(first.unsure ? 'thread-incomplete' : 'target-not-found', first.error);
     if (!first.root || rpidOf(first.root) !== String(t.commentId)) return stop('target-not-found', `reply/reply 给的一楼是 ${first.root ? rpidOf(first.root) : '（没给）'}，不是 ${t.commentId}`);
-    if (!Number.isFinite(first.count)) return stop('thread-incomplete', 'reply/reply 没给 page.count，判断不了一楼下面有没有回复');
+    if (!Number.isFinite(first.count)) return stop('thread-incomplete', 'reply/reply 的 page.count 读不到或不是非负整数，判断不了一楼下面有没有回复');
     const n = Math.max(first.count, first.ids.length, ...[first.root.rcount, first.root.count].map(numOf).filter(Number.isFinite));
+    if ([first.root.rcount, first.root.count].some((x) => x != null && x !== '' && !Number.isFinite(countOf(x)))) return stop('thread-incomplete', `一楼的 rcount / count 不是非负整数，判断不了下面有没有回复`);
     if (n > 0) return { done: { ...stop('deletes-thread', `${t.commentId} 是一楼，下面有 ${n} 条回复；B站删一楼会把整楼回复一起删掉，不删`).done, rejected: true } };
     const author = midOf(first.root);
     if (!author) return stop('precheck-error', '读不到这条评论的作者');
@@ -303,7 +317,10 @@ async function findInGroup(api, talker, type) {
     if (j.data?.session_list === null && !j.data?.has_more) return { present, complete: true };
     if (!Array.isArray(j.data?.session_list)) return { error: 'get_sessions code=0 但缺 data.session_list' };
     const l = j.data.session_list;
-    if (l.some((s) => String(s.talker_id) === talker && Number(s.session_type ?? 1) === 1)) present = true;
+    const hits = l.filter((s) => String(s.talker_id) === talker);
+    // 会话条目缺 session_type：证明不了是用户会话（2 是粉丝团），不猜
+    if (hits.some((s) => s.session_type == null || s.session_type === '')) return { error: `get_sessions 里 ${talker} 的会话缺 session_type，判断不了是不是用户会话` };
+    if (hits.some((s) => Number(s.session_type) === 1)) present = true;
     if (!j.data?.has_more) return { present, complete: true };
     // 还有下一页却给了空页、或者翻页游标没往前走：翻不完
     const next = l.at(-1)?.session_ts;

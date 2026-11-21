@@ -290,6 +290,28 @@ describe('B站 delete（假接口）', () => {
     const r2 = await deleteComment(g.api, P('delete', sub));
     assert.deepEqual([r2.sendAttempted, r2.readBack.found], [true, false]);
     assert.equal(f.posts.length, 0);
+    assert.equal(g.posts.length, 1);
+  });
+
+  test('R1 Codex-1：删一楼时 page.count 是负数 / 小数，或一楼 rcount 是负数 → thread-incomplete，不调接口', async () => {
+    for (const [cnt, rc] of [[-1, undefined], [0.5, undefined], [0, -2]]) {
+      const f = fakeBili({ threads: { 100: { root: { ...rp(100, { mid: '9001' }), ...(rc === undefined ? {} : { rcount: rc }) }, replies: [] } } });
+      const get = f.api.get;
+      f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = cnt; return j; };
+      const r = await deleteComment(f.api, P('delete', root));
+      assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false], `count=${cnt} rcount=${rc}`);
+      assert.equal(f.posts.length, 0);
+    }
+  });
+
+  test('R1 Codex-3：page.count 偏小（说 20 条、实际 45 条），目标在第 3 页 → thread-incomplete（不是 target-not-found），不调接口', async () => {
+    const f = fakeBili({ threads: bigThread(45) });
+    const get = f.api.get;
+    f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = 20; return j; };
+    const r = await deleteComment(f.api, P('delete', { ...sub, commentId: String(1000 + 42 * 3), authorUid: '9100' }));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
+    assert.match(r.detail, /偏小/);
+    assert.equal(f.posts.length, 0);
   });
 
   test('KIN-326 真实现象：楼中楼在第 1 页、整楼超过 10 页 → 以前 thread-incomplete 永远删不掉，现在删掉并回读确认', async () => {
@@ -463,6 +485,22 @@ describe('B站 deleteConversation（假接口）', () => {
     const r = await deleteConversation(f.api, C('777'));
     assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false]);
     assert.match(r.readBack.detail, /session_type=5/);
+  });
+
+  test('R1 Codex-2：会话条目缺 session_type → precheck-error，不当成用户会话、不调接口', async () => {
+    for (const g of ['1', '5']) {
+      const f = fakeBili({ groups: { [g]: [{ talker_id: 777, session_ts: 3 }] } });
+      const r = await deleteConversation(f.api, C('777'));
+      assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], g);
+      assert.match(r.detail, /缺 session_type/);
+      assert.equal(f.posts.length, 0);
+    }
+  });
+
+  test('同一个 talker_id 只作为粉丝团（session_type=2）出现 → 不算这个用户会话 → already-gone', async () => {
+    const f = fakeBili({ groups: { 1: [{ talker_id: 777, session_type: 2, session_ts: 3 }] } });
+    assert.equal((await deleteConversation(f.api, C('777'))).blocked, 'already-gone');
+    assert.equal(f.posts.length, 0);
   });
 
   test('接口说成功但会话还在 → found:false；接口报错 → sendError', async () => {
