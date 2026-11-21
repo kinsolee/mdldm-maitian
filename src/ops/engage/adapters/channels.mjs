@@ -147,9 +147,13 @@ export async function worksViaApi(call, feeds, o) {
     if (error) { works.push({ objectNonce: f.objectNonce, opened: false, via: 'api', error }); continue; }
     let calls = 0, left = 0;
     for (const root of roots) {
-      root.levelTwoComment = Array.isArray(root.levelTwoComment) ? [...root.levelTwoComment] : [];
+      // 一楼没带 levelTwoComment 字段：不知道有没有楼中楼，按没读全（不当成空楼）
+      const hasL2 = Array.isArray(root.levelTwoComment);
+      root.levelTwoComment = hasL2 ? [...root.levelTwoComment] : [];
+      if (!hasL2) { left++; continue; }
       while (!pageEnd(root.downContinueFlag)) {
         if (!pageMore(root.downContinueFlag)) { left++; break; }   // 标志缺失或不认识：按没读全
+        if (!root.lastBuff) { left++; break; }                       // 说还有下一页却没给游标：不拿空游标去请求
         if (calls >= o.maxExpand) { left++; break; }
         calls++;
         const d = listData(await call('getCommentList', listArgs(f.objectId, root.lastBuff, root.commentId)));

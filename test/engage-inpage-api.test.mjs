@@ -257,6 +257,41 @@ describe('评审第 1 轮回归（astra）：回读时楼没读全', () => {
   });
 });
 
+describe('评审第 2 轮回归（astra）：游标缺失、levelTwoComment 缺失、重复一楼的总数', () => {
+  const cc = (id, x = {}) => ({ commentId: id, commentNickname: `昵称${id}`, commentContent: '', ...x });
+  const feeds = [{ objectId: 'obj1', objectNonce: 'n1', createTime: T - 3600, commentCount: 1, desc: { description: 'x', shortTitle: [] } }];
+  const chParse = (works) => ch.parseComments({ kind: 'comments', via: 'api', windowStartSec: T - 30 * 86400, feeds, emptyState: false, works, me: { nickname: '我' } }, { accountUid: 'sph', fetchedAt: new Date(T * 1000).toISOString() });
+  const page = { evaluate: async () => [{ objectId: 'obj1', objectNonce: 'n1' }] };
+  const pre = (call) => channelsApi.precheck({ call, page, params: { op: 'reply', text: '收到', target: { commentId: 'r1', rootId: 'r1', workId: 'n1' } }, me: { nickname: '我' } });
+
+  test('视频号：楼中楼说还有下一页但 lastBuff 空，不发空游标请求，读、写都按没读全', async () => {
+    const calls = [];
+    const call = async (m, a) => { calls.push(a); return a.rootCommentId ? { ok: true, data: { errCode: 0, data: { comment: [], lastBuff: '', downContinueFlag: 0 } } }
+      : { ok: true, data: { errCode: 0, data: { comment: [cc('r1', { levelTwoComment: [], downContinueFlag: 1, lastBuff: '' })], lastBuff: '', downContinueFlag: 0 } } }; };
+    const w = await ch.worksViaApi(call, feeds, { ...ch.LIMITS, now: T * 1000 });
+    assert.equal(w[0].expandLeft, 1);
+    assert.equal(chParse(w).scannedWorks[0].complete, false);
+    assert.equal((await pre(call)).blocked, 'thread-incomplete');
+    assert.equal(calls.some((a) => a.rootCommentId), false);
+  });
+
+  test('视频号：一楼缺 levelTwoComment 字段，读、写都按没读全', async () => {
+    const call = async () => ({ ok: true, data: { errCode: 0, data: { comment: [cc('r1', { downContinueFlag: 0 })], lastBuff: '', downContinueFlag: 0 } } });
+    const w = await ch.worksViaApi(call, feeds, { ...ch.LIMITS, now: T * 1000 });
+    assert.equal(chParse(w).scannedWorks[0].complete, false);
+    assert.equal((await pre(call)).blocked, 'thread-incomplete');
+  });
+
+  test('抖音 parse：同一条一楼两页里一份总数为 null、一份为 0，按读不到算没拿全；has_more "0" 算到底', () => {
+    const r1null = dyC('r1'); r1null.reply_comment_total = null;
+    const parse = (select) => dy.parseComments({ kind: 'comments', itemListCodes: [0], windowStartMs: T * 1000 - 30 * 86400_000,
+      items: [{ item_id_plain: 'w1', title: 't', create_time: T - 3600, comment_count: 1 }],
+      works: [{ item_id_plain: 'w1', opened: true, clicks: 0, expandLeft: 0, select, replies: [], selectErrors: [] }] }, { accountUid: ME, fetchedAt: new Date(T * 1000).toISOString() });
+    assert.equal(parse([{ status_code: 0, has_more: 1, comments: [r1null] }, { status_code: 0, has_more: 0, comments: [dyC('r1', { total: 0 })] }]).scannedWorks[0].complete, false);
+    assert.equal(parse([{ status_code: 0, has_more: '0', comments: [dyC('r1', { total: 0 })] }]).scannedWorks[0].complete, true);
+  });
+});
+
 describe('视频号：接口读评论', () => {
   const o = { ...ch.LIMITS, now: T * 1000 };
   const cc = (id, x = {}) => ({ commentId: id, commentNickname: x.nick ?? `昵称${id}`, commentContent: x.text ?? `评论${id}`, commentCreatetime: T - 60, commentLikeCount: 0,

@@ -113,9 +113,12 @@ export async function channelsThread(call, { exportId, rootId }, lim = API_LIMIT
     buf = d.lastBuff;
   }
   if (!root) return { root: null, end };
-  const byId = new Map((root.levelTwoComment ?? []).map((c) => [String(c.commentId), c]));
+  // 一楼没带 levelTwoComment 字段：不知道楼里有什么，按没读全
+  if (!Array.isArray(root.levelTwoComment)) return { root, l2: [], complete: false, end: false };
+  const byId = new Map(root.levelTwoComment.map((c) => [String(c.commentId), c]));
   let flag = root.downContinueFlag, lb = root.lastBuff;
-  for (let calls = 0; pageMore(flag) && calls < lim.maxExpand; calls++) {
+  // 说还有下一页却没给游标（lastBuff 空）：不拿空游标去请求，flag 留着 1，按没读全
+  for (let calls = 0; pageMore(flag) && lb && calls < lim.maxExpand; calls++) {
     const d = listData(await call('getCommentList', listArgs(exportId, lb, rootId)));
     if (!d) return { error: '楼中楼读失败（errCode 不是 0 或没有列表）' };
     for (const c of d.comment) byId.set(String(c.commentId), c);

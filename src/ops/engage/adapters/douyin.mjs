@@ -288,7 +288,12 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     if (!w.opened || !w.select.length) { scannedWorks.push({ workNativeId: wid, complete: false, threadsPartial: true }); continue; }
     const seen = new Map();
     const bad = (j) => j.status_code !== 0 || !Array.isArray(j.comments);
-    for (const j of w.select.filter((x) => !bad(x))) for (const c of j.comments) seen.set(String(c.cid), { ...base(c, wid), parentNativeId: null, rootNativeId: String(c.cid), replyTo: null, replyCount: numOrNull(c.reply_comment_total) });
+    // 同一条一楼跨页重复时回复总数取保守值：任一份读不到就当读不到，都读到取大的（不让后一份把「不知道」盖成 0）
+    for (const j of w.select.filter((x) => !bad(x))) for (const c of j.comments) {
+      const id = String(c.cid), n = numOrNull(c.reply_comment_total), prev = seen.get(id);
+      const replyCount = !prev ? n : prev.replyCount == null || n == null ? null : Math.max(prev.replyCount, n);
+      seen.set(id, { ...base(c, wid), parentNativeId: null, rootNativeId: id, replyTo: null, replyCount });
+    }
     const roots = new Map([...seen.values()].map((c) => [c.nativeId, 0]));
     // X-B3：一楼或子回复有任何一条 status_code 非 0 的响应，这个作品拿不全
     const apiError = (w.selectErrors ?? []).length > 0 || w.select.some(bad) || w.replies.some(bad);
@@ -310,7 +315,7 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
     comments.push(...seen.values());
     const lastSelect = w.select.at(-1);
     // has_more 必须明确是 0/false 才算翻到底
-    const lastPage = lastSelect.has_more === 0 || lastSelect.has_more === false;
+    const lastPage = pageEnd(lastSelect.has_more);
     scannedWorks.push({ workNativeId: wid, complete: lastPage && !partial, threadsPartial: partial });
   }
   // G-B11a：窗口内评论数为 0 的作品（作品列表接口成功）也算扫过、拿全，库里这个作品已删的评论才能标 goneAt
