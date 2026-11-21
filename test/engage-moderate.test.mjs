@@ -1,0 +1,326 @@
+// S7 处置组（delete_comment / block_user / delete_conversation）的框架：临时 ops.db + 假 writer（不起 runner、不碰任何平台）、假通知。
+import { test, describe, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { getAccount, setCapability } from '../src/ops/accounts.mjs';
+import { ingestSnapshot } from '../src/ops/engage/store.mjs';
+import { engageWrite } from '../src/ops/engage/write.mjs';
+import { MOD_ROUND_LIMIT } from '../src/ops/engage/moderate.mjs';
+import { writerModuleUrl } from '../src/ops/engage/writers/index.mjs';
+import { freshDb, tmpDbFile, comment, conv, T0, MIN } from './helpers/engage-fixtures.mjs';
+
+const BILI = 'Bili:478358005';
+const ME = '478358005';
+const HOUR = 60 * MIN;
+
+const snap = (kind, rows) => ({ ok: true, platformCode: 'Bili', accountUid: ME, kind, fetchedAt: '2026-11-19T02:00:00.000Z',
+  works: kind === 'comments' ? [{ nativeId: 'BV1xx', title: '作品一', url: 'https://www.bilibili.com/video/BV1xx', postTime: '2026-11-18T00:00:00.000Z' }] : [],
+  comments: kind === 'comments' ? rows.map((c) => ({ ...c, workNativeId: 'BV1xx' })) : [],
+  scannedWorks: kind === 'comments' ? [{ workNativeId: 'BV1xx', complete: true, threadsPartial: false }] : [],
+  conversations: kind === 'dms' ? rows : [], messages: [] });
+const peerConv = (id, o = {}) => ({ ...conv(id, o), peer: { uid: id, nickname: `对方${id}`, kind: 'user' } });
+
+/** 库里：一楼 r1（9001）、楼中楼 a（9002 回 r1）、我的楼中楼 m；会话 777（对方 777）、888。第二轮才出事件。 */
+function seed(db) {
+  const acct = getAccount(db, BILI);
+  ingestSnapshot(db, acct, snap('comments', []), { now: () => T0 });
+  ingestSnapshot(db, acct, snap('comments', [comment('r1', { uid: '9001' }), comment('a', { parent: 'r1', root: 'r1', uid: '9002' }),
+    comment('m', { parent: 'r1', root: 'r1', uid: ME, isMe: true })]), { now: () => T0 + MIN });
+  ingestSnapshot(db, acct, snap('dms', []), { now: () => T0 });
+  ingestSnapshot(db, acct, snap('dms', [peerConv('777'), peerConv('888')]), { now: () => T0 + MIN });
+}
+
+const DONE = { uidSeen: ME, sendAttempted: true, readBack: { found: true, count: 1, nativeId: 'x' } };
+const LOST = { uidSeen: ME, sendAttempted: true, readBack: { found: false, count: 0, detail: '回读时这条还在' } };
+
+function fakeWriter(results) {
+  const calls = [];
+  const queue = Array.isArray(results) ? [...results] : null;
+  const fn = async (args) => { calls.push(args); const r = queue ? queue.shift() : results; return { ok: true, result: r }; };
+  fn.calls = calls;
+  return fn;
+}
+
+function setup({ caps = ['deleteComment', 'block', 'deleteConversation'] } = {}) {
+  const db = freshDb(tmpDbFile());
+  seed(db);
+  for (const c of caps) setCapability(db, BILI, c, true);
+  const notes = [];
+  let clock = T0 + 2 * MIN;
+  const deps = (writer) => ({ now: () => clock, runWriter: writer, notify: async (t) => { notes.push(t); return true; }, log: () => {} });
+  return { db, notes, deps, tick: (ms) => { clock += ms; } };
+}
+
+const del = (extra = {}) => ({ op: 'delete', targetId: 'Bili:a', idempotencyKey: 'del-a', caller: 'test-bot', ...extra });
+const blk = (extra = {}) => ({ op: 'block', targetId: 'Bili:a', idempotencyKey: 'blk-a', caller: 'test-bot', ...extra });
+const dconv = (extra = {}) => ({ op: 'deleteConversation', targetId: 'Bili:777', idempotencyKey: 'dc-777', caller: 'test-bot', ...extra });
+const actions = (db) => db.prepare('SELECT * FROM actions ORDER BY createdAt, rowid').all();
+const caps = (db) => getAccount(db, BILI).capabilities;
+
+describe('delete_comment', () => {
+  let s;
+  beforeEach(() => { s = setup(); });
+
+  test('回读确认删掉 → sent；actions op=delete、不存正文；事件自动回执 ignored；writer 拿到楼信息和本平台账号 uid、不拿 text', async () => {
+    const w = fakeWriter(DONE);
+    const r = await engageWrite(s.db, del(), s.deps(w));
+    assert.equal(r.status, 'sent');
+    assert.deepEqual(r.ackedEvents, ['comment.created:Bili:a']);
+    const [row] = actions(s.db);
+    assert.deepEqual([row.op, row.status, row.targetId, row.sendAttempted], ['delete', 'sent', 'Bili:a', 1]);
+    assert.equal(row.textHash, createHash('sha256').update('').digest('hex'));
+    const ev = s.db.prepare('SELECT handledOutcome, actionId FROM events WHERE id = ?').get('comment.created:Bili:a');
+    assert.deepEqual({ ...ev }, { handledOutcome: 'ignored', actionId: r.actionId });
+    const p = w.calls[0].params;
+    assert.equal(p.op, 'delete');
+    assert.equal('text' in p, false);
+    assert.deepEqual(p.target, { commentId: 'a', workId: 'BV1xx', parentId: 'r1', rootId: 'r1', authorUid: '9002' });
+    assert.deepEqual(p.selfUids, [ME]);
+  });
+
+  test('绝不删我自己的评论：authorIsMe 的、作者 mid 是账号自身 Bili:478358005 的 → rejected self-target，不起 writer', async () => {
+    const w = fakeWriter(DONE);
+    const r = await engageWrite(s.db, del({ targetId: 'Bili:m', idempotencyKey: 'k-m' }), s.deps(w));
+    assert.deepEqual([r.status, r.reason, r.sendAttempted], ['rejected', 'self-target', false]);
+    // 库里没标 isMe、但作者 uid 就是账号 mid 的，也拒
+    s.db.prepare("UPDATE comments SET authorIsMe = 0 WHERE id = 'Bili:m'").run();
+    const r2 = await engageWrite(s.db, del({ targetId: 'Bili:m', idempotencyKey: 'k-m2' }), s.deps(w));
+    assert.equal(r2.reason, 'self-target');
+    assert.equal(w.calls.length, 0);
+  });
+
+  test('能力位 deleteComment 关着 → capability-off；只开 block 也删不了', async () => {
+    const t = setup({ caps: ['block'] });
+    const r = await engageWrite(t.db, del(), t.deps(fakeWriter(DONE)));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'capability-off']);
+    assert.match(r.detail, /set-cap Bili:478358005 deleteComment true/);
+  });
+
+  test('库里已标 goneAt → failed already-gone，不起 writer；writer 说已不在 → failed already-gone，不算写入失败', async () => {
+    s.db.prepare("UPDATE comments SET goneAt = '2026-11-19T03:00:00Z' WHERE id = 'Bili:a'").run();
+    const w = fakeWriter(DONE);
+    const r = await engageWrite(s.db, del(), s.deps(w));
+    assert.deepEqual([r.status, r.reason], ['failed', 'already-gone']);
+    assert.equal(w.calls.length, 0);
+    s.db.prepare("UPDATE comments SET goneAt = NULL WHERE id = 'Bili:a'").run();
+    const r2 = await engageWrite(s.db, del({ idempotencyKey: 'k2' }), s.deps(fakeWriter({ uidSeen: ME, sendAttempted: false, blocked: 'already-gone', detail: '楼里已没有' })));
+    assert.deepEqual([r2.status, r2.reason, r2.sendAttempted], ['failed', 'already-gone', false]);
+  });
+
+  test('读不回 → needs_readback，同一个 key、换个 key 都不再调 writer', async () => {
+    const w = fakeWriter(LOST);
+    const r = await engageWrite(s.db, del(), s.deps(w));
+    assert.deepEqual([r.status, r.reason], ['needs_readback', 'readback-missing']);
+    const again = await engageWrite(s.db, del(), s.deps(w));
+    assert.deepEqual([again.status, again.previousActionId], ['needs_readback', r.actionId]);
+    const otherKey = await engageWrite(s.db, del({ idempotencyKey: 'k-other' }), s.deps(w));
+    assert.deepEqual([otherKey.status, otherKey.reason], ['needs_readback', 'target-needs-readback']);
+    assert.equal(w.calls.length, 1, '接口只调一次');
+    assert.equal(s.db.prepare("SELECT handledAt FROM events WHERE id = 'comment.created:Bili:a'").get().handledAt, null, '没读回不回执');
+  });
+
+  test('同一个 key 成功过 → duplicate；换 key 再删同一条 → failed already-gone', async () => {
+    const w = fakeWriter(DONE);
+    const first = await engageWrite(s.db, del(), s.deps(w));
+    const dup = await engageWrite(s.db, del(), s.deps(w));
+    assert.deepEqual([dup.status, dup.previousActionId], ['duplicate', first.actionId]);
+    const other = await engageWrite(s.db, del({ idempotencyKey: 'k-x' }), s.deps(w));
+    assert.deepEqual([other.status, other.reason], ['failed', 'already-gone']);
+    assert.equal(w.calls.length, 1);
+  });
+
+  test('eventId 不是这条评论的 comment.created → rejected event-mismatch', async () => {
+    const r = await engageWrite(s.db, del({ eventId: 'comment.created:Bili:r1' }), s.deps(fakeWriter(DONE)));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'event-mismatch']);
+  });
+
+  test('非 B站 → rejected unsupported-platform', async () => {
+    const r = await engageWrite(s.db, del({ targetId: 'Douyin:a' }), s.deps(fakeWriter(DONE)));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'unsupported-platform']);
+  });
+
+  test('writer 路由：处置组走 bili-moderate.mjs，回复照旧走 bili.mjs', () => {
+    assert.match(writerModuleUrl('Bili', 'delete'), /bili-moderate\.mjs$/);
+    assert.match(writerModuleUrl('Bili', 'block'), /bili-moderate\.mjs$/);
+    assert.match(writerModuleUrl('Bili', 'reply'), /\/bili\.mjs$/);
+    assert.throws(() => writerModuleUrl('Douyin', 'delete'), /没有 delete/);
+  });
+});
+
+describe('block_user', () => {
+  let s;
+  beforeEach(() => { s = setup(); });
+
+  test('target 是评论 id：推出作者 mid，actions 按 Bili:<mid> 记，返回 inputTarget；回执这条评论的事件', async () => {
+    const w = fakeWriter(DONE);
+    const r = await engageWrite(s.db, blk(), s.deps(w));
+    assert.deepEqual([r.status, r.targetId, r.inputTarget], ['sent', 'Bili:9002', 'Bili:a']);
+    assert.deepEqual(w.calls[0].params.target, { mid: '9002', via: 'comment' });
+    assert.equal(actions(s.db)[0].targetId, 'Bili:9002');
+    assert.deepEqual(r.ackedEvents, ['comment.created:Bili:a']);
+  });
+
+  test('target 是会话 id（B站会话 id 就是对方 mid）或直接给 mid：都认', async () => {
+    const w = fakeWriter([DONE, DONE]);
+    const a = await engageWrite(s.db, blk({ targetId: 'Bili:777', idempotencyKey: 'k1' }), s.deps(w));
+    assert.deepEqual([a.status, a.targetId], ['sent', 'Bili:777']);
+    const dmEvents = s.db.prepare("SELECT id FROM events WHERE type = 'dm.received' AND subjectId = 'Bili:777'").all().map((e) => e.id);
+    assert.ok(dmEvents.length > 0, '种子里应有这个会话的 dm.received');
+    assert.deepEqual(a.ackedEvents, dmEvents);
+    const b = await engageWrite(s.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k2' }), s.deps(w));
+    assert.deepEqual([b.status, b.targetId, b.inputTarget], ['sent', 'Bili:9001', undefined]);
+    assert.deepEqual(w.calls[1].params.target, { mid: '9001', via: 'mid' });
+  });
+
+  test('绝不拉黑我自己：Bili:478358005、我自己的评论 id → rejected self-target，能力位开着也不起 writer', async () => {
+    const w = fakeWriter(DONE);
+    for (const [targetId, key] of [['Bili:478358005', 'k-me'], ['Bili:m', 'k-my-comment']]) {
+      const r = await engageWrite(s.db, blk({ targetId, idempotencyKey: key }), s.deps(w));
+      assert.deepEqual([r.status, r.reason, r.sendAttempted], ['rejected', 'self-target', false], targetId);
+    }
+    assert.equal(w.calls.length, 0);
+  });
+
+  test('库里没见过的 mid → rejected unknown-target，不起 writer', async () => {
+    const w = fakeWriter(DONE);
+    const r = await engageWrite(s.db, blk({ targetId: 'Bili:123456' }), s.deps(w));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'unknown-target']);
+    assert.equal(w.calls.length, 0);
+  });
+
+  test('同一个 id 既是评论 id、又是别人的 mid（指向两个人）→ rejected ambiguous-target', async () => {
+    const acct = getAccount(s.db, BILI);
+    // 评论 9001 的作者是 5000，而 9001 本身又是 r1 的作者 mid
+    ingestSnapshot(s.db, acct, snap('comments', [comment('r1', { uid: '9001' }), comment('a', { parent: 'r1', root: 'r1', uid: '9002' }),
+      comment('m', { parent: 'r1', root: 'r1', uid: ME, isMe: true }), comment('9001', { uid: '5000' })]), { now: () => T0 + 2 * MIN });
+    const r = await engageWrite(s.db, blk({ targetId: 'Bili:9001' }), s.deps(fakeWriter(DONE)));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'ambiguous-target']);
+  });
+
+  test('同一个人换个入口（评论 id → mid）、换个 key：之前已拉黑 → failed already-blocked，不起 writer', async () => {
+    const w = fakeWriter(DONE);
+    await engageWrite(s.db, blk(), s.deps(w));
+    const r = await engageWrite(s.db, blk({ targetId: 'Bili:9002', idempotencyKey: 'k-again' }), s.deps(w));
+    assert.deepEqual([r.status, r.reason], ['failed', 'already-blocked']);
+    assert.equal(w.calls.length, 1);
+  });
+
+  test('eventId 是这个人的评论事件 → 可以；是别人的 → event-mismatch', async () => {
+    const ok = await engageWrite(s.db, blk({ targetId: 'Bili:9002', eventId: 'comment.created:Bili:a' }), s.deps(fakeWriter(DONE)));
+    assert.equal(ok.status, 'sent');
+    assert.deepEqual(ok.ackedEvents, ['comment.created:Bili:a']);
+    const bad = await engageWrite(s.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k2', eventId: 'comment.created:Bili:a' }), s.deps(fakeWriter(DONE)));
+    assert.deepEqual([bad.status, bad.reason], ['rejected', 'event-mismatch']);
+  });
+
+  test('能力位 block 关着 → capability-off', async () => {
+    const t = setup({ caps: ['deleteComment'] });
+    const r = await engageWrite(t.db, blk(), t.deps(fakeWriter(DONE)));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'capability-off']);
+  });
+});
+
+describe('delete_conversation', () => {
+  let s;
+  beforeEach(() => { s = setup(); });
+
+  test('回读确认删掉 → sent；回执这个会话的 dm.received（ignored）', async () => {
+    const w = fakeWriter(DONE);
+    const r = await engageWrite(s.db, dconv(), s.deps(w));
+    assert.equal(r.status, 'sent');
+    assert.deepEqual(w.calls[0].params.target, { conversationId: '777', peerUid: '777' });
+    for (const id of r.ackedEvents) assert.equal(s.db.prepare('SELECT handledOutcome FROM events WHERE id = ?').get(id).handledOutcome, 'ignored');
+  });
+
+  test('删过之后：会话没新消息，换 key 再删 → failed already-gone；对方又发了消息（lastAt 变了）→ 可以再删', async () => {
+    const w = fakeWriter([DONE, DONE]);
+    await engageWrite(s.db, dconv(), s.deps(w));
+    const again = await engageWrite(s.db, dconv({ idempotencyKey: 'k2' }), s.deps(w));
+    assert.deepEqual([again.status, again.reason], ['failed', 'already-gone']);
+    s.db.prepare("UPDATE conversations SET lastAt = '2026-11-19T05:00:00.000Z' WHERE id = 'Bili:777'").run();
+    const back = await engageWrite(s.db, dconv({ idempotencyKey: 'k3' }), s.deps(w));
+    assert.equal(back.status, 'sent');
+    assert.equal(w.calls.length, 2);
+  });
+
+  test('会话对方是我自己 → rejected self-target', async () => {
+    s.db.prepare("UPDATE conversations SET peerUid = ? WHERE id = 'Bili:888'").run(ME);
+    const r = await engageWrite(s.db, dconv({ targetId: 'Bili:888' }), s.deps(fakeWriter(DONE)));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'self-target']);
+  });
+
+  test('能力位 deleteConversation 关着 → capability-off', async () => {
+    const t = setup({ caps: ['block', 'deleteComment'] });
+    const r = await engageWrite(t.db, dconv(), t.deps(fakeWriter(DONE)));
+    assert.deepEqual([r.status, r.reason], ['rejected', 'capability-off']);
+  });
+});
+
+describe('每轮上限、连续失败自动关（处置组和回复组分开）', () => {
+  /** n 条不同评论，作者各不相同 */
+  function many(s, n) {
+    const acct = getAccount(s.db, BILI);
+    const rows = Array.from({ length: n }, (_, i) => comment(`z${i}`, { uid: `70${i}` }));
+    ingestSnapshot(s.db, acct, snap('comments', [comment('r1', { uid: '9001' }), comment('a', { parent: 'r1', root: 'r1', uid: '9002' }),
+      comment('m', { parent: 'r1', root: 'r1', uid: ME, isMe: true }), ...rows]), { now: () => T0 + MIN });
+  }
+
+  test(`每小时 delete 最多 ${MOD_ROUND_LIMIT} 条，block 另算；处置不占回复的 15 条`, async () => {
+    const s = setup();
+    setCapability(s.db, BILI, 'reply', true);
+    many(s, MOD_ROUND_LIMIT + 1);
+    const w = fakeWriter(DONE);
+    for (let i = 0; i < MOD_ROUND_LIMIT; i++) assert.equal((await engageWrite(s.db, del({ targetId: `Bili:z${i}`, idempotencyKey: `d${i}` }), s.deps(w))).status, 'sent');
+    const over = await engageWrite(s.db, del({ targetId: `Bili:z${MOD_ROUND_LIMIT}`, idempotencyKey: 'd-over' }), s.deps(w));
+    assert.deepEqual([over.status, over.reason, over.retryable], ['rejected', 'round-limit', true]);
+    assert.equal((await engageWrite(s.db, blk({ targetId: 'Bili:z0', idempotencyKey: 'b0' }), s.deps(w))).status, 'sent', 'block 另算');
+    const rep = await engageWrite(s.db, { op: 'reply', targetId: 'Bili:z1', text: '谢谢', idempotencyKey: 'r-1', caller: 't' }, s.deps(fakeWriter({ ...DONE })));
+    assert.equal(rep.status, 'sent', '回复不受处置条数影响');
+    s.tick(HOUR);
+    assert.equal((await engageWrite(s.db, del({ targetId: `Bili:z${MOD_ROUND_LIMIT}`, idempotencyKey: 'd-next' }), s.deps(w))).status, 'sent', '下一轮恢复');
+  });
+
+  test('连续 2 轮处置读不回 → 关掉 deleteComment、block、deleteConversation（回复的能力位不动），发一条提醒（假通知）', async () => {
+    const s = setup();
+    setCapability(s.db, BILI, 'reply', true);
+    const w = fakeWriter([LOST, LOST]);
+    const r1 = await engageWrite(s.db, del(), s.deps(w));
+    assert.equal(r1.writeDisabled, false);
+    s.tick(HOUR);
+    const r2 = await engageWrite(s.db, blk({ targetId: 'Bili:r1', idempotencyKey: 'b-r1' }), s.deps(w));
+    assert.equal(r2.status, 'needs_readback');
+    assert.equal(r2.writeDisabled, true);
+    const c = caps(s.db);
+    assert.deepEqual([c.deleteComment, c.block, c.deleteConversation, c.reply], [false, false, false, true]);
+    assert.equal(s.notes.length, 1);
+    assert.match(s.notes[0], /处置.*连续 2 轮失败/);
+    assert.match(s.notes[0], /set-cap Bili:478358005 deleteComment true/);
+    const trip = s.db.prepare('SELECT family, alertedAt FROM engage_write_trips').get();
+    assert.equal(trip.family, 'moderate');
+    assert.ok(trip.alertedAt);
+  });
+
+  test('回复组连续失败不关处置能力位；处置的失败也不算进回复组', async () => {
+    const s = setup();
+    setCapability(s.db, BILI, 'reply', true);
+    const rw = fakeWriter([LOST, LOST]);
+    // 一轮处置失败 + 一轮回复失败：两组各只有 1 轮，都不关
+    await engageWrite(s.db, del(), s.deps(rw));
+    s.tick(HOUR);
+    const r = await engageWrite(s.db, { op: 'reply', targetId: 'Bili:a', text: '谢谢', idempotencyKey: 'r-1', caller: 't' }, s.deps(rw));
+    assert.equal(r.writeDisabled, false);
+    assert.equal(caps(s.db).reply, true);
+    assert.equal(caps(s.db).deleteComment, true);
+    assert.equal(s.notes.length, 0);
+  });
+
+  test('发前重读拦下的（already-gone、already-blocked）不算写入失败，不触发自动关', async () => {
+    const s = setup();
+    const w = fakeWriter([{ uidSeen: ME, sendAttempted: false, blocked: 'already-gone' }, { uidSeen: ME, sendAttempted: false, blocked: 'already-blocked' }]);
+    await engageWrite(s.db, del(), s.deps(w));
+    s.tick(HOUR);
+    const r = await engageWrite(s.db, blk(), s.deps(w));
+    assert.equal(r.writeDisabled, false);
+    assert.equal(caps(s.db).deleteComment, true);
+  });
+});
