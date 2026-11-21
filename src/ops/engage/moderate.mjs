@@ -80,10 +80,20 @@ export function selfTarget(db, req, t) {
 }
 
 /** eventId 核对：delete 是这条评论的 comment.created，deleteConversation 是这个会话的 dm.received；block 是这个人的评论或私信事件。 */
+/** 目标属于哪个账号：评论、会话按库里的行，拉黑按推出 mid 时用的那一行。库里没有返回 null。 */
+export function modTargetAccount(db, req) {
+  if (req.op === 'block') return req.block?.accountId ?? null;
+  const table = req.op === 'delete' ? 'comments' : 'conversations';
+  return db.prepare(`SELECT accountId FROM ${table} WHERE id = ?`).get(req.targetId)?.accountId ?? null;
+}
+
 export function modEventMatches(db, req) {
   if (req.eventId == null) return true;
-  const e = db.prepare('SELECT type, subjectId, platformCode FROM events WHERE id = ?').get(req.eventId);
+  const e = db.prepare('SELECT type, subjectId, platformCode, accountId FROM events WHERE id = ?').get(req.eventId);
   if (!e || e.platformCode !== req.platformCode) return false;
+  // 事件必须是目标所属账号的（同平台登记了多个账号时，不能拿别的账号的事件来回执）
+  const acct = modTargetAccount(db, req);
+  if (!acct || (e.accountId != null && e.accountId !== acct)) return false;
   if (req.op !== 'block') return e.type === req.spec.eventType && e.subjectId === req.targetId;
   // 同平台、同账号下这个人的评论或私信事件（不同平台的 uid 是不同的号，不能混）
   if (e.type === 'comment.created') {

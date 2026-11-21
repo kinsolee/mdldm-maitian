@@ -11,7 +11,7 @@ import { splitId } from './ids.mjs';
 import { ackEvent } from './query.mjs';
 import { redact } from './redact.mjs';
 import { runWriterInSpace, WRITE_TIMEOUT_MS } from './writers/index.mjs';
-import { MOD_OPS, MOD_CAPS, MOD_ROUND_LIMIT, MOD_PLATFORMS, resolveBlockTarget, loadModTarget, selfTarget, modEventMatches, modAckSubject, modPrecheck, selfUids } from './moderate.mjs';
+import { MOD_OPS, MOD_CAPS, MOD_ROUND_LIMIT, MOD_PLATFORMS, resolveBlockTarget, loadModTarget, selfTarget, modEventMatches, modAckSubject, modPrecheck, modTargetAccount, selfUids } from './moderate.mjs';
 
 export const STATUSES = ['sent', 'needs_readback', 'failed', 'duplicate', 'rejected'];
 export const ROUND_LIMIT = 15;
@@ -206,7 +206,14 @@ function ackFor(db, req, actionId, now) {
   const { type, subjectId } = mod ? modAckSubject(req) : { type: req.spec.eventType, subjectId: req.targetId };
   const outcome = req.spec.ackOutcome;
   const ids = new Set(req.eventId ? [req.eventId] : []);
-  if (type && subjectId) for (const { id } of db.prepare('SELECT id FROM events WHERE subjectId = ? AND type = ? AND handledAt IS NULL ORDER BY createdAt').all(subjectId, type)) ids.add(id);
+  if (mod) {
+    // 处置组：只回执同平台、目标所属账号的事件
+    const acct = modTargetAccount(db, req);
+    if (type && subjectId && acct) {
+      for (const { id } of db.prepare('SELECT id FROM events WHERE subjectId = ? AND type = ? AND platformCode = ? AND (accountId = ? OR accountId IS NULL) AND handledAt IS NULL ORDER BY createdAt')
+        .all(subjectId, type, req.platformCode, acct)) ids.add(id);
+    }
+  } else if (type && subjectId) for (const { id } of db.prepare('SELECT id FROM events WHERE subjectId = ? AND type = ? AND handledAt IS NULL ORDER BY createdAt').all(subjectId, type)) ids.add(id);
   const acked = [];
   for (const id of ids) {
     const e = db.prepare('SELECT handledOutcome, type, subjectId FROM events WHERE id = ?').get(id);

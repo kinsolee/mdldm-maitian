@@ -234,6 +234,20 @@ describe('block_user', () => {
     assert.equal(s.db.prepare("SELECT handledAt FROM events WHERE id = 'comment.created:Douyin:c99'").get().handledAt, null);
   });
 
+  test('R2-B1：同平台另一个账号的事件（subjectId 一样）→ event-mismatch；自动回执也不碰别的账号的事件', async () => {
+    s.db.prepare('INSERT INTO accounts (platformCode, platformName, uid, nickname, profileId, spaceName, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('Bili', 'B站', '5550001', '小号', 'Profile 5', 'kinso/Bili/5550001', '{}');
+    s.db.prepare(`INSERT INTO events (id, type, platformCode, accountId, subjectId, createdAt, payload) VALUES ('dm.received:alt', 'dm.received', 'Bili', 'Bili:5550001', 'Bili:777', '2026-11-19T02:00:00.000Z', '{}')`).run();
+    const bad = await engageWrite(s.db, dconv({ eventId: 'dm.received:alt' }), s.deps(fakeWriter(DONE)));
+    assert.deepEqual([bad.status, bad.reason], ['rejected', 'event-mismatch']);
+    const blkBad = await engageWrite(s.db, blk({ targetId: 'Bili:777', idempotencyKey: 'b-alt', eventId: 'dm.received:alt' }), s.deps(fakeWriter(DONE)));
+    assert.deepEqual([blkBad.status, blkBad.reason], ['rejected', 'event-mismatch']);
+    const ok = await engageWrite(s.db, dconv({ idempotencyKey: 'dc-ok' }), s.deps(fakeWriter(DONE)));
+    assert.equal(ok.status, 'sent');
+    assert.ok(!ok.ackedEvents.includes('dm.received:alt'));
+    assert.equal(s.db.prepare("SELECT handledAt FROM events WHERE id = 'dm.received:alt'").get().handledAt, null);
+  });
+
   test('拉黑读不回之后，换个入口（评论 id → mid）、换 key 也被拦 target-needs-readback', async () => {
     const w = fakeWriter(LOST);
     await engageWrite(s.db, blk(), s.deps(w));

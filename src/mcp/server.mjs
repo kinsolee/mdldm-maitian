@@ -62,7 +62,7 @@ const WRITE_NOTE = '发前在平台上重读、发后回读；返回 status：se
 
 // B站处置（广告评论、私信）。生效并回读确认才返回 sent；对象是我自己一律 rejected self-target
 const modEventId = z.string().optional().describe('对应的事件 id（可选）；生效后自动回执 ignored。不填时回执这个目标所有没回执的同类事件');
-const MOD_NOTE = '只做 B站。发前重读、接口只调一次、发后回读；返回 status：sent（回读确认已生效）、needs_readback（调了接口没读回，绝不重试，请人工看）、failed（没动手或平台报错，reason 如 already-gone、already-blocked、not-my-work）、duplicate、rejected（self-target、capability-off、round-limit 每小时每种 10 条等）';
+const MOD_NOTE = '只做 B站。发前重读、接口只调一次、发后回读；返回 status：sent（回读确认已生效）、needs_readback（调了接口没读回，绝不重试，请人工看）、failed（没调接口，reason 如 already-gone、already-blocked、not-my-work、not-a-user）；调过接口但平台报错、回读也没确认的记 needs_readback / send-error-unconfirmed，不要重试、duplicate、rejected（self-target、capability-off、round-limit 每小时每种 10 条等）';
 const mod = (op, targetKey) => (db, a, deps) => engageWrite(db, { op, targetId: a[targetKey], idempotencyKey: a.idempotencyKey, eventId: a.eventId, caller: deps.caller() }, deps);
 const MODERATE_TOOLS = [
   ['delete_comment', `删除自己作品下别人的一条评论（一楼、楼中楼都行）。${MOD_NOTE}`, { commentId: id('评论 id'), idempotencyKey, eventId: modEventId }, mod('delete', 'commentId')],
