@@ -1,10 +1,12 @@
 // B站处置：删评论、拉黑、删私信会话。和 bili.mjs 一样在 member.bilibili.com 页面里调接口，接口约定见 writers/index.mjs。
-//   删评论 delete：nav 核对账号 → x/web-interface/view 取 aid、确认作品是我的 → x/v2/reply/reply 拉整楼重读
-//        （楼或这条已不在 → already-gone；作者是我 → self-target；楼没读全 → thread-incomplete）
-//        → x/v2/reply/del 只调一次 → 等 2 秒再拉整楼，确认这条不在了才算 found。
+//   删评论 delete：nav 核对账号 → x/web-interface/view 取 aid、确认作品是我的 → x/v2/reply/reply 按 rpid 二分页码，只定位目标这一条
+//        （楼已不在 → already-gone；定位不到 → target-not-found；定位不了 → thread-incomplete；作者是我 → self-target；
+//        一楼下面有回复 → deletes-thread，rejected，因为 B站删一楼会连整楼回复一起删）
+//        → x/v2/reply/del 只调一次 → 等 2 秒再定位这一条：楼没了，或这条不在、它原来前后的两条现在挨着，才算 found。
 //   拉黑 block：x/relation?fid= 重读（attribute 128 已拉黑 → already-blocked）→ x/relation/modify act=5 只调一次 → 再读 x/relation，attribute 128 才算 found。
-//   删会话 deleteConversation：session_svr/get_sessions 翻完整个会话列表重读（不在 → already-gone；翻不完 → list-incomplete）
-//        → session_svr/remove_session 只调一次 → 再翻一遍，翻完且不在才算 found。只是从会话列表里移除，聊天记录还在；对方再发消息会话会回来。
+//   删会话 deleteConversation：session_svr/get_sessions 把用户与系统、未关注人、被拦截、陌生人四组都翻完重读
+//        （都不在 → already-gone；哪组翻不完 → list-incomplete）→ session_svr/remove_session 只调一次 → 四组再翻一遍，都翻完且都不在才算 found。
+//        只是从会话列表里移除，聊天记录还在；对方再发消息会话会回来。
 // 目标是登录账号自己（mid 相同）一律不动手（self-target）。csrf（cookie bili_jct）只在页面里读、只在页面里填，不回到 Node。
 // 返回同 writers/index.mjs：found 的含义是「回读确认生效了」（评论没了、已拉黑、会话不在列表里）。
 import { bigJson, mainPage, open, sleep } from '../adapters/page-lib.mjs';
@@ -15,7 +17,6 @@ const API = 'https://api.bilibili.com';
 const VC = 'https://api.vc.bilibili.com';
 const GONE_CODES = new Set([12022, -404]);   // 12022：评论已经被删除了
 const BLOCKED_ATTR = 128;                    // x/relation 的 attribute：128 = 已拉黑
-const MAX_THREAD_PAGES = 10;
 const MAX_SESSION_PAGES = 50;
 
 export async function runInSpace(task, params) {
@@ -69,44 +70,147 @@ async function whoAmI(api, uid) {
   return { me };
 }
 
-/** 整楼：{ ok, root, replies, complete } / { gone, code } / { error }。replies 缺失只有 page.count 明确为 0 才是空楼。 */
-async function thread(api, oid, root) {
-  const replies = [];
-  let rootNode = null;
-  for (let pn = 1; pn <= MAX_THREAD_PAGES; pn++) {
-    const j = await api.get(`${API}/x/v2/reply/reply?oid=${oid}&type=1&root=${root}&ps=20&pn=${pn}`);
-    if (GONE_CODES.has(j.code)) return { gone: true, code: j.code };
-    if (j.code !== 0) return { error: `reply/reply code=${j.code} ${j.message ?? ''}`.trim() };
-    rootNode = j.data?.root ?? rootNode;
-    const raw = j.data?.page?.count;
-    const count = raw == null || raw === '' ? NaN : Number(raw);
-    if (!Array.isArray(j.data?.replies) && !(j.data?.replies === null && count === 0)) return { ok: true, root: rootNode, replies, complete: false };
-    const rs = j.data.replies ?? [];
-    replies.push(...rs);
-    // 读到最后一页：累计条数要够声明的 count 才算读全（count 读不到的按「没读全」）
-    if (rs.length < 20 || (Number.isFinite(count) && pn * 20 >= count)) return { ok: true, root: rootNode, replies, complete: Number.isFinite(count) && replies.length >= count };
-  }
-  return { ok: true, root: rootNode, replies, complete: false };
+// —— 删评论：只定位目标这一条，不读整楼 ——
+// x/v2/reply/reply 按回复顺序（时间正序）给楼中楼，rpid 跟着时间递增。按 rpid 二分页码，十来页就能落到目标那一页，
+// 再按 rpid 精确对上。页内 rpid 不是递增的就不猜（thread-incomplete）。
+// 回读不靠「整楼读全」：发前记下目标前后的两条（邻居），发后这条不见了、并且这两条现在挨着，才算删掉。
+const PS = 20;
+const MAX_LOCATE_PAGES = 30;               // 一次定位最多读这么多页（二分 2^25 页的楼也够）
+const START = 'start', END = 'end';        // 邻居：目标前面没有了 / 后面没有了
+const bigOf = (x) => (/^\d+$/.test(String(x ?? '')) ? BigInt(String(x)) : null);
+const numOf = (x) => (x == null || x === '' ? NaN : Number(x));
+const showId = (x) => (x === START ? '楼的开头' : x === END ? '楼的末尾' : x == null ? '（读不到）' : String(x));
+
+/** 按页读楼，带缓存和页数上限。page(pn) → { replies, ids, count, root } / { gone, code } / { error, unsure? }。 */
+function threadReader(api, oid, root) {
+  const cache = new Map();
+  return async function page(pn) {
+    if (cache.has(pn)) return cache.get(pn);
+    if (cache.size >= MAX_LOCATE_PAGES) return { error: `reply/reply 读了 ${MAX_LOCATE_PAGES} 页还没定位到`, unsure: true };
+    if (cache.size) await api.sleep(200);
+    const j = await api.get(`${API}/x/v2/reply/reply?oid=${oid}&type=1&root=${root}&ps=${PS}&pn=${pn}`);
+    let r;
+    if (GONE_CODES.has(j.code)) r = { gone: true, code: j.code };
+    else if (j.code !== 0) r = { error: `reply/reply 第 ${pn} 页 code=${j.code} ${j.message ?? ''}`.trim() };
+    else if (!Array.isArray(j.data?.replies) && j.data?.replies !== null) r = { error: `reply/reply 第 ${pn} 页缺 data.replies` };
+    else {
+      const replies = j.data.replies ?? [];
+      const ids = replies.map((x) => bigOf(rpidOf(x)));
+      if (ids.some((x) => x == null)) r = { error: `reply/reply 第 ${pn} 页有条目缺 rpid`, unsure: true };
+      else if (ids.some((x, i) => i > 0 && x <= ids[i - 1])) r = { error: `reply/reply 第 ${pn} 页不是按 rpid 递增，定位不了`, unsure: true };
+      else r = { replies, ids, count: numOf(j.data?.page?.count), root: j.data?.root ?? null };
+    }
+    cache.set(pn, r);
+    return r;
+  };
 }
 
-/** 这条评论在不在：'present'（带节点）、'gone'、'unknown'（读不全或出错，带原因）。 */
-function locate(th, rootId, commentId) {
-  if (th.gone) return { state: 'gone', detail: `楼 ${rootId} 已不在（code=${th.code}）` };
-  if (th.error) return { state: 'unknown', detail: th.error };
-  const isRoot = String(commentId) === String(rootId);
-  if (isRoot) {
-    if (!th.root) return { state: 'unknown', detail: `reply/reply 没给楼 ${rootId} 的一楼` };
-    return rpidOf(th.root) === String(commentId) ? { state: 'present', node: th.root } : { state: 'unknown', detail: `reply/reply 给的一楼 ${rpidOf(th.root)} 不是 ${commentId}` };
+/** 第 pn 页第 i 个位置上的 rpid（i 可以是 -1 或越过本页，跨到前后页）：BigInt、START、END，或 null（读不到）。 */
+async function idAt(page, pn, i) {
+  if (i < 0) {
+    if (pn === 1) return START;
+    const prev = await page(pn - 1);
+    return prev.ids?.length ? prev.ids.at(-1) : null;
   }
-  const node = th.replies.find((x) => rpidOf(x) === String(commentId));
-  if (node) return { state: 'present', node };
-  if (!th.complete) return { state: 'unknown', detail: `楼 ${rootId} 超过 ${MAX_THREAD_PAGES} 页没读全` };
-  return { state: 'gone', detail: `楼 ${rootId} 里已没有 ${commentId}` };
+  const p = await page(pn);
+  if (!p.ids) return null;
+  if (i < p.ids.length) return p.ids[i];
+  // 越过本页：本页不满、并且按 count 也到底了，才是楼的末尾；否则看下一页
+  if (p.ids.length < PS && pn * PS >= p.count) return END;
+  const next = await page(pn + 1);
+  if (!next.ids) return null;
+  if (next.ids.length) return p.ids.length === PS ? next.ids[0] : null;
+  return p.ids.length || pn === 1 ? END : null;   // 下一页是空的：本页就是最后一页
+}
+
+/** 在楼里按 rpid 找：{ at: { pn, i, node } } / { slot: { pn, i } }（不在，i 是它该在的位置）/ { gone } / { error, unsure? }。 */
+async function seek(page, rpid) {
+  const first = await page(1);
+  if (!first.ids) return first;
+  if (!Number.isFinite(first.count)) return { error: 'reply/reply 没给 page.count', unsure: true };
+  // X3-B1：第 1 页是空的、count 却说有回复，不能当空楼
+  if (!first.ids.length && first.count > 0) return { error: `reply/reply 第 1 页是空的，但 page.count=${first.count}`, unsure: true };
+  let lo = 1, hi = Math.max(1, Math.ceil(first.count / PS));
+  while (lo <= hi) {
+    const pn = (lo + hi) >> 1;
+    const p = await page(pn);
+    if (!p.ids) return p;
+    if (!p.ids.length || rpid < p.ids[0]) { hi = pn - 1; continue; }   // 空页：已经过了楼的末尾
+    if (rpid > p.ids.at(-1)) { lo = pn + 1; continue; }
+    const i = p.ids.indexOf(rpid);
+    return i >= 0 ? { at: { pn, i, node: p.replies[i] } } : { slot: { pn, i: p.ids.findIndex((x) => x > rpid) } };
+  }
+  return { slot: { pn: Math.max(lo, 1), i: 0 } };
+}
+
+const isSelf = (mid, me, p) => mid === me || mid === String(p.uid) || (p.selfUids ?? []).includes(mid);
+
+/** 发前：确认目标还在、rpid 对得上、作者不是我。返回 { done }（不调接口）或 { check }（发后回读要用）。 */
+async function precheckComment(api, p, me, oid) {
+  const t = p.target;
+  const stop = (blocked, detail) => ({ done: { uidSeen: me, blocked, detail, sendAttempted: false } });
+  const rpid = bigOf(t.commentId);
+  if (rpid == null) return stop('target-not-found', `评论 id 不对：${t.commentId}`);
+  const page = threadReader(api, oid, t.rootId);
+
+  if (String(t.commentId) === String(t.rootId)) {
+    // 删一楼：B站会把它下面的整楼回复一起删掉。下面有回复（不管是谁的）就不删
+    const first = await page(1);
+    if (first.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${first.code}）`);
+    if (!first.ids) return stop(first.unsure ? 'thread-incomplete' : 'target-not-found', first.error);
+    if (!first.root || rpidOf(first.root) !== String(t.commentId)) return stop('target-not-found', `reply/reply 给的一楼是 ${first.root ? rpidOf(first.root) : '（没给）'}，不是 ${t.commentId}`);
+    if (!Number.isFinite(first.count)) return stop('thread-incomplete', 'reply/reply 没给 page.count，判断不了一楼下面有没有回复');
+    const n = Math.max(first.count, first.ids.length, ...[first.root.rcount, first.root.count].map(numOf).filter(Number.isFinite));
+    if (n > 0) return { done: { ...stop('deletes-thread', `${t.commentId} 是一楼，下面有 ${n} 条回复；B站删一楼会把整楼回复一起删掉，不删`).done, rejected: true } };
+    const author = midOf(first.root);
+    if (!author) return stop('precheck-error', '读不到这条评论的作者');
+    if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
+    return { check: { isRoot: true } };
+  }
+
+  const s = await seek(page, rpid);
+  if (s.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${s.code}）`);
+  if (s.error) return stop(s.unsure ? 'thread-incomplete' : 'target-not-found', s.error);
+  if (!s.at) return stop('target-not-found', `按 rpid 定位到楼 ${t.rootId} 第 ${s.slot.pn} 页，没有 ${t.commentId}`);
+  const node = s.at.node;
+  const nodeRoot = String(node.root_str ?? node.root ?? '');
+  if (nodeRoot !== String(t.rootId)) return stop('target-not-found', `对上 rpid 的这条属于楼 ${nodeRoot || '（没给）'}，不是楼 ${t.rootId}`);
+  if (node.oid != null && String(node.oid) !== String(oid)) return stop('target-not-found', `对上 rpid 的这条在评论区 ${node.oid}，不是 ${oid}`);
+  const author = midOf(node);
+  if (!author) return stop('precheck-error', '读不到这条评论的作者');
+  if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
+  const prev = await idAt(page, s.at.pn, s.at.i - 1);
+  const next = await idAt(page, s.at.pn, s.at.i + 1);
+  if (prev == null || next == null) return stop('thread-incomplete', `定位到了 ${t.commentId}（第 ${s.at.pn} 页），但读不到它前后的两条，删了也确认不了，没删`);
+  return { check: { isRoot: false, rpid, prev, next } };
+}
+
+/** 发后：只回读这一条在不在。{ gone, detail }，gone 只在拿到证据时为 true。 */
+async function readBackComment(api, p, oid, check) {
+  const t = p.target;
+  const page = threadReader(api, oid, t.rootId);
+  if (check.isRoot) {
+    const first = await page(1);
+    if (first.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${first.code}）` };
+    if (!first.ids) return { gone: false, detail: first.error };
+    if (first.root && rpidOf(first.root) === String(t.commentId)) return { gone: false, detail: '回读时这条还在' };
+    return { gone: false, detail: `回读时 reply/reply 给的一楼是 ${first.root ? rpidOf(first.root) : '（没给）'}，确认不了` };
+  }
+  const s = await seek(page, check.rpid);
+  if (s.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${s.code}）` };
+  if (s.error) return { gone: false, detail: s.error };
+  if (s.at) return { gone: false, detail: '回读时这条还在' };
+  // 这条不见了：它原来前后的两条现在要挨着（后面原来是楼的末尾时，允许删完又来了新回复）
+  const pred = await idAt(page, s.slot.pn, s.slot.i - 1);
+  const succ = await idAt(page, s.slot.pn, s.slot.i);
+  const after = succ === check.next || (check.next === END && typeof succ === 'bigint' && succ > check.rpid);
+  if (pred === check.prev && after) return { gone: true, detail: `楼 ${t.rootId} 里已没有 ${t.commentId}` };
+  return { gone: false, detail: `回读时定位不到 ${t.commentId}，但它前后的邻居变了（原来 ${showId(check.prev)}、${showId(check.next)}，现在 ${showId(pred)}、${showId(succ)}），确认不了` };
 }
 
 export async function deleteComment(api, p) {
   const t = p.target;
-  let me, oid;
+  let me, oid, check;
   try {
     const who = await whoAmI(api, p.uid);
     if (who.done) return who.done;
@@ -116,15 +220,9 @@ export async function deleteComment(api, p) {
     if (!oid) return { uidSeen: me, blocked: 'target-not-found', detail: `作品 ${t.workId} 读不到（view code=${view.code}）`, sendAttempted: false };
     const owner = view.data?.owner?.mid == null ? null : String(view.data.owner.mid);
     if (owner !== me) return { uidSeen: me, blocked: 'not-my-work', detail: `作品 ${t.workId} 的作者是 ${owner ?? '（读不到）'}，不是我，只删自己作品下的评论`, sendAttempted: false };
-    const th = await thread(api, oid, t.rootId);
-    // 删楼中楼：发后要靠整楼读全才能确认删掉，发前整楼就读不全的先不删（不然删了也只能 needs_readback）
-    if (String(t.commentId) !== String(t.rootId) && th.ok && !th.complete) return { uidSeen: me, blocked: 'thread-incomplete', detail: `楼 ${t.rootId} 超过 ${MAX_THREAD_PAGES} 页或条数对不上，读不全，删了也确认不了，没删`, sendAttempted: false };
-    const at = locate(th, t.rootId, t.commentId);
-    if (at.state === 'gone') return { uidSeen: me, blocked: 'already-gone', detail: at.detail, sendAttempted: false };
-    if (at.state === 'unknown') return { uidSeen: me, blocked: at.detail.includes('没读全') ? 'thread-incomplete' : 'target-not-found', detail: at.detail, sendAttempted: false };
-    const author = midOf(at.node);
-    if (!author) return { uidSeen: me, blocked: 'precheck-error', detail: '读不到这条评论的作者', sendAttempted: false };
-    if (author === me || author === String(p.uid) || (p.selfUids ?? []).includes(author)) return { uidSeen: me, blocked: 'self-target', detail: '这条是我自己的评论，不删', sendAttempted: false };
+    const pre = await precheckComment(api, p, me, oid);
+    if (pre.done) return pre.done;
+    check = pre.check;
   } catch (e) {
     return { uidSeen: me ?? null, blocked: 'precheck-error', detail: errText(e), sendAttempted: false };
   }
@@ -140,10 +238,10 @@ export async function deleteComment(api, p) {
   let readBack;
   try {
     await api.sleep(2000);
-    const at = locate(await thread(api, oid, t.rootId), t.rootId, t.commentId);
-    const gone = at.state === 'gone' && !sendError;
+    const rb = await readBackComment(api, p, oid, check);
+    const gone = rb.gone && !sendError;
     readBack = { found: gone, count: gone ? 1 : 0, nativeId: String(t.commentId),
-      detail: [at.state === 'present' ? '回读时这条还在' : at.detail, postError ? `reply/del 出错：${postError}` : null].filter(Boolean).join('；') || undefined };
+      detail: [rb.detail, postError ? `reply/del 出错：${postError}` : null].filter(Boolean).join('；') || undefined };
   } catch (e) { readBack = { found: false, count: 0, nativeId: String(t.commentId), detail: `回读出错：${errText(e)}` }; }
   return { uidSeen: me, sendAttempted: true, ...(sendError ? { sendError } : {}), readBack: clean(readBack) };
 }
@@ -189,13 +287,20 @@ export async function block(api, p) {
   return { uidSeen: me, sendAttempted: true, ...(sendError ? { sendError } : {}), readBack: clean(readBack) };
 }
 
-/** 翻完整个会话列表找 talker：{ present } 或 { error }；没翻完 complete:false。 */
-async function findSession(api, talker) {
+// get_sessions 的 session_type 是「哪一组」：1 用户与系统、2 未关注人、5 被拦截、8 陌生人（接口文档还有 3 粉丝团、7 系统消息，
+// 都不是用户会话，不读）。广告私信常落在未关注人、被拦截里，只读 1 组会把它们当成「已不在」。发前、发后都把这几组翻完。
+const SESSION_GROUPS = [[1, '用户与系统'], [2, '未关注人'], [5, '被拦截'], [8, '陌生人']];
+const groupName = ([type, name]) => `session_type=${type}（${name}）`;
+
+/** 翻完一组会话列表找 talker：{ present, complete } 或 { error }。 */
+async function findInGroup(api, talker, type) {
   let endTs = null, present = false;
   // 命中了也要翻完：发前和发后用同一个「翻完」标准，翻不完的在调接口前就拦下
   for (let i = 0; i < MAX_SESSION_PAGES; i++) {
-    const j = await api.get(`${VC}/session_svr/v1/session_svr/get_sessions?session_type=1&group_fold=1&unfollow_fold=0&sort_rule=2${endTs ? `&end_ts=${endTs}` : ''}&build=0&mobi_app=web`);
+    const j = await api.get(`${VC}/session_svr/v1/session_svr/get_sessions?session_type=${type}&group_fold=1&unfollow_fold=0&sort_rule=2${endTs ? `&end_ts=${endTs}` : ''}&build=0&mobi_app=web`);
     if (j.code !== 0) return { error: `get_sessions code=${j.code} ${j.message ?? ''}`.trim() };
+    // 文档：没有会话时 session_list 是 null
+    if (j.data?.session_list === null && !j.data?.has_more) return { present, complete: true };
     if (!Array.isArray(j.data?.session_list)) return { error: 'get_sessions code=0 但缺 data.session_list' };
     const l = j.data.session_list;
     if (l.some((s) => String(s.talker_id) === talker && Number(s.session_type ?? 1) === 1)) present = true;
@@ -209,6 +314,18 @@ async function findSession(api, talker) {
   return { present, complete: false };
 }
 
+/** 把每一组都翻完找 talker：{ present, complete, in, detail } 或 { error }。 */
+async function findSession(api, talker) {
+  const found = [], cut = [];
+  for (const g of SESSION_GROUPS) {
+    const r = await findInGroup(api, talker, g[0]);
+    if (r.error) return { error: `${groupName(g)} ${r.error}` };
+    if (r.present) found.push(groupName(g));
+    if (!r.complete) cut.push(groupName(g));
+  }
+  return { present: found.length > 0, complete: !cut.length, in: found, cut, groups: SESSION_GROUPS.map(groupName).join('、') };
+}
+
 export async function deleteConversation(api, p) {
   const talker = String(p.target.conversationId ?? '');
   let me;
@@ -220,8 +337,8 @@ export async function deleteConversation(api, p) {
     if (talker === me || talker === String(p.uid) || (p.selfUids ?? []).includes(talker)) return { uidSeen: me, blocked: 'self-target', detail: '会话对象是我自己，不删', sendAttempted: false };
     const s = await findSession(api, talker);
     if (s.error) return { uidSeen: me, blocked: 'precheck-error', detail: s.error, sendAttempted: false };
-    if (!s.complete) return { uidSeen: me, blocked: 'list-incomplete', detail: `会话列表超过 ${MAX_SESSION_PAGES} 页翻不完，删了也确认不了，没删`, sendAttempted: false };
-    if (!s.present) return { uidSeen: me, blocked: 'already-gone', detail: `会话列表里已没有 ${talker}`, sendAttempted: false };
+    if (!s.complete) return { uidSeen: me, blocked: 'list-incomplete', detail: `会话列表 ${s.cut.join('、')} 超过 ${MAX_SESSION_PAGES} 页翻不完，删了也确认不了，没删`, sendAttempted: false };
+    if (!s.present) return { uidSeen: me, blocked: 'already-gone', detail: `会话列表里已没有 ${talker}（${s.groups} 都翻完了）`, sendAttempted: false };
   } catch (e) {
     return { uidSeen: me ?? null, blocked: 'precheck-error', detail: errText(e), sendAttempted: false };
   }
@@ -238,7 +355,7 @@ export async function deleteConversation(api, p) {
     const s = await findSession(api, talker);
     const ok = !s.error && s.complete && !s.present && !sendError;
     readBack = { found: ok, count: ok ? 1 : 0, nativeId: talker,
-      detail: [s.error ?? (s.present ? '回读时会话还在列表里' : s.complete ? null : '回读时会话列表没翻完'), postError ? `remove_session 出错：${postError}` : null].filter(Boolean).join('；') || undefined };
+      detail: [s.error ?? (s.present ? `回读时会话还在列表里（${s.in.join('、')}）` : s.complete ? null : `回读时会话列表 ${s.cut.join('、')} 没翻完`), postError ? `remove_session 出错：${postError}` : null].filter(Boolean).join('；') || undefined };
   } catch (e) { readBack = { found: false, count: 0, nativeId: talker, detail: `回读出错：${errText(e)}` }; }
   return { uidSeen: me, sendAttempted: true, ...(sendError ? { sendError } : {}), readBack: clean(readBack) };
 }
