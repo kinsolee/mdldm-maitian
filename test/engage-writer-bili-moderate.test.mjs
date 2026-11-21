@@ -293,6 +293,77 @@ describe('B站 delete（假接口）', () => {
     assert.equal(g.posts.length, 1);
   });
 
+  // R1 Gemini：回读的「挨着」证据必须来自同一个时刻能成立的读取
+  const seqThread = (n) => ({ 100: { root: rp(100), replies: Array.from({ length: n }, (_, i) => rp(101 + i, { root: 100, parent: 100, mid: '9100' })) } });
+  /** 删除调用之后，reply/reply 的第 pn 页先按 fn 改写（目标一直还在：delEffective=false）。 */
+  const afterPost = (f, fn) => { const get = f.api.get; f.api.get = async (url) => { const j = await get(url); const u = new URL(url); if (f.posts.length && u.pathname === '/x/v2/reply/reply' && j.data) fn(Number(u.searchParams.get('pn')), j); return j; }; };
+  const subOf = (id) => ({ ...sub, commentId: String(id), authorUid: '9100' });
+
+  test('R1 Gemini-1：回读时读完第 1 页、读第 2 页前，前面有一条被删（整楼往前挪）→ 不能拿旧的第 1 页拼出「挨着」，目标还在 → found:false', async () => {
+    const f = fakeBili({ threads: seqThread(60), delEffective: false });
+    let shifted = false;
+    afterPost(f, (pn) => { if (pn === 1 && !shifted) { shifted = true; f.st.threads[100].replies = f.st.threads[100].replies.filter((x) => x.rpid !== 105); } });
+    const r = await deleteComment(f.api, P('delete', subOf(121)));
+    assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], r.readBack.detail);
+  });
+
+  test('R1 Gemini-2：回读时第 2 页异常给空页、末页少给、前一页少给 → 都不算到底，目标还在 → found:false', async () => {
+    const cases = [
+      [21, 121, (pn, j) => { if (pn === 2) j.data.replies = []; }],
+      [5, 105, (pn, j) => { if (pn === 1) j.data.replies = j.data.replies.slice(0, 4); }],
+      [40, 120, (pn, j) => { if (pn === 1) j.data.replies = j.data.replies.slice(0, 19); }],
+    ];
+    for (const [n, target, fn] of cases) {
+      const f = fakeBili({ threads: seqThread(n), delEffective: false });
+      afterPost(f, fn);
+      const r = await deleteComment(f.api, P('delete', subOf(target)));
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], `${n} 条删 ${target}：${r.readBack.detail}`);
+    }
+  });
+
+  test('R1 Gemini-3：删一楼时 page.count / rcount 是 false、空白串、数组 → thread-incomplete，不调接口', async () => {
+    for (const [cnt, rc] of [[false, undefined], ['   ', undefined], [[], undefined], [0, false], [0, '  ']]) {
+      const f = fakeBili({ threads: { 100: { root: { ...rp(100, { mid: '9001' }), ...(rc === undefined ? {} : { rcount: rc }) }, replies: [] } } });
+      const get = f.api.get;
+      f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = cnt; return j; };
+      const r = await deleteComment(f.api, P('delete', root));
+      assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false], `count=${JSON.stringify(cnt)} rcount=${JSON.stringify(rc)}`);
+    }
+  });
+
+  test('R1 Gemini-4：page.count 偏大（可见 900 条、count=1000），删最后一条 → 发前就 thread-incomplete，不会删了再 needs_readback', async () => {
+    const f = fakeBili({ threads: seqThread(900) });
+    const get = f.api.get;
+    f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = 1000; return j; };
+    const r = await deleteComment(f.api, P('delete', subOf(1000)));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
+    assert.equal(f.posts.length, 0);
+  });
+
+  test('R1 Gemini-8：删一楼时一楼的 oid 不是这个作品 → target-not-found；一楼是我自己的、下面有回复 → self-target', async () => {
+    const f = fakeBili({ threads: { 100: { root: { ...rp(100, { mid: '9001' }), oid: 999 }, replies: [] } } });
+    assert.equal((await deleteComment(f.api, P('delete', root))).blocked, 'target-not-found');
+    const g = fakeBili({ threads: { 100: { root: rp(100, { mid: ME }), replies: [rp(101, { root: 100, parent: 100 })] } } });
+    assert.equal((await deleteComment(g.api, P('delete', root))).blocked, 'self-target');
+    assert.equal(f.posts.length + g.posts.length, 0);
+  });
+
+  test('R1 Gemini-9：reply/reply 报 -412（限流）→ precheck-error（可重试），不报 target-not-found', async () => {
+    for (const t of [sub, root]) {
+      const f = fakeBili();
+      const get = f.api.get;
+      f.api.get = async (url) => (url.includes('reply/reply') ? { code: -412, message: '请求被拦截' } : get(url));
+      const r = await deleteComment(f.api, P('delete', t));
+      assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], t.commentId);
+    }
+  });
+
+  test('删唯一一条楼中楼（前后都没有）→ 回读第 1 页空、count=0 → found', async () => {
+    const f = fakeBili({ threads: seqThread(1) });
+    const r = await deleteComment(f.api, P('delete', subOf(101)));
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+  });
+
   test('R1 Codex-1：删一楼时 page.count 是负数 / 小数，或一楼 rcount 是负数 → thread-incomplete，不调接口', async () => {
     for (const [cnt, rc] of [[-1, undefined], [0.5, undefined], [0, -2]]) {
       const f = fakeBili({ threads: { 100: { root: { ...rp(100, { mid: '9001' }), ...(rc === undefined ? {} : { rcount: rc }) }, replies: [] } } });
@@ -304,14 +375,14 @@ describe('B站 delete（假接口）', () => {
     }
   });
 
-  test('R1 Codex-3：page.count 偏小（说 20 条、实际 45 条），目标在第 3 页 → thread-incomplete（不是 target-not-found），不调接口', async () => {
+  test('R1 Codex-3 / Gemini-6：page.count 偏小（说 20 条、实际 45 条），目标在第 3 页 → 往后找到、删掉、回读确认', async () => {
     const f = fakeBili({ threads: bigThread(45) });
     const get = f.api.get;
-    f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = 20; return j; };
+    f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = Math.min(20, j.data.page.count); return j; };
     const r = await deleteComment(f.api, P('delete', { ...sub, commentId: String(1000 + 42 * 3), authorUid: '9100' }));
-    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
-    assert.match(r.detail, /偏小/);
-    assert.equal(f.posts.length, 0);
+    assert.equal(r.sendAttempted, true);
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.equal(f.posts.length, 1);
   });
 
   test('KIN-326 真实现象：楼中楼在第 1 页、整楼超过 10 页 → 以前 thread-incomplete 永远删不掉，现在删掉并回读确认', async () => {
@@ -441,9 +512,15 @@ describe('B站 deleteConversation（假接口）', () => {
   test('分组：发前、发后都读同一套分组（1 用户与系统、2 未关注人、5 被拦截、8 陌生人）', async () => {
     const f = fakeBili();
     await deleteConversation(f.api, C('777'));
-    const before = f.sessionTypes.slice(0, f.sessionTypes.length / 2), after = f.sessionTypes.slice(f.sessionTypes.length / 2);
-    assert.deepEqual([...new Set(before)].sort(), GROUPS);
-    assert.deepEqual(before, after);
+    assert.deepEqual([...new Set(f.sessionTypes)].sort(), GROUPS);
+    assert.deepEqual(f.sessionTypes, [...GROUPS, ...GROUPS]);
+  });
+
+  test('回读在某一组里还看得到会话 → 不再读后面几组，found:false', async () => {
+    const f = fakeBili({ removeEffective: false });
+    const r = await deleteConversation(f.api, C('777'));
+    assert.equal(r.readBack.found, false);
+    assert.deepEqual(f.sessionTypes, [...GROUPS, '1']);
   });
 
   for (const [g, name] of [['2', '未关注人'], ['5', '被拦截'], ['8', '陌生人']]) {
@@ -485,6 +562,16 @@ describe('B站 deleteConversation（假接口）', () => {
     const r = await deleteConversation(f.api, C('777'));
     assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false]);
     assert.match(r.readBack.detail, /session_type=5/);
+  });
+
+  test('R1 Gemini-5：四组每组都 49 页 → 一次扫描总页数有上限，报 list-incomplete，不调接口；第一组翻不完就不再读后面几组', async () => {
+    const grp = (base) => Array.from({ length: 49 }, (_, i) => ({ talker_id: base + i, session_type: 1, session_ts: 1000 - i }));
+    const f = fakeBili({ pageSize: 1, groups: { 1: [{ talker_id: 777, session_type: 1, session_ts: 2000 }, ...grp(3000)], 2: grp(4000), 5: grp(5000), 8: grp(6000) } });
+    const r = await deleteConversation(f.api, C('777'));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['list-incomplete', false]);
+    assert.ok(f.sessionTypes.length <= 50, `读了 ${f.sessionTypes.length} 页`);
+    assert.deepEqual([...new Set(f.sessionTypes)], ['1']);
+    assert.equal(f.posts.length, 0);
   });
 
   test('R1 Codex-2：会话条目缺 session_type → precheck-error，不当成用户会话、不调接口', async () => {
