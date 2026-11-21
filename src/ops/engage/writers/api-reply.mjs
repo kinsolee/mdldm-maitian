@@ -14,44 +14,52 @@ import { randomUUID } from 'node:crypto';
 import { atLogin, installHook, mainPage, open, sleep as realSleep } from '../adapters/page-lib.mjs';
 import { selectArgs, replyArgs } from '../adapters/douyin.mjs';
 import { FEEDS_SRC, listArgs, listData } from '../adapters/channels.mjs';
-import { serviceCaller } from '../inpage-api.mjs';
+import { countOf, idOf, pageEnd, pageMore, serviceCaller } from '../inpage-api.mjs';
 import { redact } from '../redact.mjs';
 import { DEFAULT_TIMEOUTS, norm, waitFor } from './page-write-lib.mjs';
 
 export const API_LIMITS = { Douyin: { maxCommentPages: 30, maxExpand: 25 }, Channels: { maxPages: 10, maxExpand: 15 } };
-const more = (j) => j?.has_more === 1 || j?.has_more === true;
 const isRootTarget = (v) => v == null || v === '' || String(v) === '0';
 
 // —— 抖音 ——
 
-/** 一楼里找 rootId，再把这栋楼的楼中楼读全。返回 { root, replies, complete, end, error }。 */
+/**
+ * 一楼里找 rootId，再把这栋楼的楼中楼读全（按 cid 去重）。返回 { root, replies, complete, end, error }。
+ * end：一楼明确翻到底（has_more 是 0）也没找到；翻不动（游标不前进、has_more 缺失）不算到底。
+ * complete：楼中楼明确翻到底，并且去重后的条数不少于 reply_comment_total（总数读不到算没读全）。
+ */
 export async function douyinThread(call, { awemeId, rootId }, lim = API_LIMITS.Douyin) {
   let root = null, end = false, cursor = 0;
-  for (let p = 0; p < lim.maxCommentPages && !root; p++) {
+  for (let p = 0; p < lim.maxCommentPages; p++) {
     const r = await call('awemeV1CommentListSelect', selectArgs(awemeId, cursor));
     const j = r.ok ? r.data : null;
     if (!j || j.status_code !== 0 || !Array.isArray(j.comments)) return { error: `一楼列表读失败：${r.ok ? `status_code=${j?.status_code}` : r.error}` };
     root = j.comments.find((c) => String(c.cid) === rootId) ?? null;
     if (root) break;
-    if (!more(j) || j.cursor == null || j.cursor === cursor) { end = true; break; }
+    if (pageEnd(j.has_more)) { end = true; break; }
+    if (!pageMore(j.has_more) || j.cursor == null || j.cursor === cursor) break;
     cursor = j.cursor;
   }
   if (!root) return { root: null, end };
-  const replies = [];
-  let complete = Number(root.reply_comment_total) === 0;
-  for (let calls = 0, cur = 0; !complete && calls < lim.maxExpand; calls++) {
+  const total = countOf(root.reply_comment_total);
+  const byId = new Map();
+  let done = total === 0;
+  for (let calls = 0, cur = 0; !done && calls < lim.maxExpand; calls++) {
     const r = await call('awemeV1CommentListReply', replyArgs(rootId, cur));
     const j = r.ok ? r.data : null;
     if (!j || j.status_code !== 0 || !Array.isArray(j.comments)) return { error: `楼中楼读失败：${r.ok ? `status_code=${j?.status_code}` : r.error}` };
-    replies.push(...j.comments);
-    if (!more(j)) complete = true;
-    else if (j.cursor == null || j.cursor === cur) break;
-    else cur = j.cursor;
+    for (const c of j.comments) byId.set(String(c.cid), c);
+    if (pageEnd(j.has_more)) { done = true; break; }
+    if (!pageMore(j.has_more) || j.cursor == null || j.cursor === cur) break;
+    cur = j.cursor;
   }
-  const total = Number(root.reply_comment_total);
-  if (!Number.isFinite(total) || replies.length < total) complete = false;
-  return { root, replies, complete, end: false };
+  const replies = [...byId.values()];
+  return { root, replies, complete: done && total != null && replies.length >= total, end: false };
 }
+
+// 新回复是不是直接回的目标：一楼目标是挂在这栋楼、reply_to_reply_id 为 "0"；楼中楼目标是 reply_to_reply_id 等于它
+const dyRepliesTo = (c, s) => String(c.reply_id) === s.rootId && (s.target === s.rootId ? isRootTarget(c.reply_to_reply_id) : String(c.reply_to_reply_id) === s.target);
+const chRepliesTo = (c, s) => (s.target === s.rootId ? isRootTarget(c.replyCommentId) || String(c.replyCommentId) === s.rootId : String(c.replyCommentId) === s.target);
 
 export const douyinApi = {
   platform: 'Douyin',
@@ -65,7 +73,7 @@ export const douyinApi = {
     if (target !== rootId && !th.replies.some((c) => String(c.cid) === target)) return { blocked: 'comment-gone', detail: '楼读全了，里面没有这条楼中楼' };
     const uid = String(me.uid);
     const mine = th.replies.filter((c) => String(c.user?.uid) === uid);
-    const replied = target === rootId ? mine.some((c) => String(c.reply_id) === rootId && isRootTarget(c.reply_to_reply_id)) : mine.some((c) => String(c.reply_to_reply_id) === target);
+    const replied = mine.some((c) => dyRepliesTo(c, { rootId, target }));
     if (replied) return { blocked: 'already-replied', detail: '这栋楼里已经有我对这条评论的直接回复' };
     return { state: { awemeId, rootId, target, before: new Set(th.replies.map((c) => String(c.cid))) } };
   },
@@ -73,53 +81,68 @@ export const douyinApi = {
     const r = await call('awemeV1CommentMultiPublish', { aweme_id: s.awemeId, text: params.text, reply_to_comment_ids: s.target, channel_id: 618 });
     const d = r.ok ? r.data : null;
     const list = Array.isArray(d?.comments) ? d.comments : null;
-    const cid = list?.length === 1 && list[0]?.code === 0 ? list[0].comment?.cid : null;
-    if (d?.status_code === 0 && cid != null) return { ok: true, nativeId: String(cid) };
+    const cid = list?.length === 1 && list[0]?.code === 0 ? idOf(list[0].comment?.cid) : null;
+    if (d?.status_code === 0 && cid != null) return { ok: true, nativeId: cid };
     return { ok: false, detail: r.ok ? `发送接口返回不认识：status_code=${d?.status_code ?? '无'}，comments=${list ? list.map((c) => c?.code).join(',') : '无'}` : `发送接口调用出错：${r.error}` };
   },
   async fresh({ call, params, me }, s) {
     const th = await douyinThread(call, { awemeId: s.awemeId, rootId: s.rootId });
     if (th.error || !th.root) return { items: null, detail: th.error ?? '回读时没找到这栋楼' };
     const want = norm(params.text), uid = String(me.uid);
-    return { items: th.replies.filter((c) => !s.before.has(String(c.cid)) && String(c.user?.uid) === uid && norm(c.text) === want).map((c) => String(c.cid)) };
+    return { items: [...new Set(th.replies.filter((c) => !s.before.has(String(c.cid)) && String(c.user?.uid) === uid && norm(c.text) === want && dyRepliesTo(c, s)).map((c) => String(c.cid)))] };
   },
 };
 
 // —— 视频号 ——
 
-/** 一楼里找 rootId（最多 maxPages 页），再把它的楼中楼读全（最多 maxExpand 次）。返回 { root, l2, complete, end, error }。 */
+/**
+ * 一楼里找 rootId（最多 maxPages 页），再把它的楼中楼读全（最多 maxExpand 次，按 commentId 去重）。返回 { root, l2, complete, end, error }。
+ * downContinueFlag 只有明确是 0 才算翻到底；缺失、别的值、翻不动（lastBuff 没变）都按没读全。
+ */
 export async function channelsThread(call, { exportId, rootId }, lim = API_LIMITS.Channels) {
   let root = null, end = false, buf = '';
-  for (let p = 0; p < lim.maxPages && !root; p++) {
+  for (let p = 0; p < lim.maxPages; p++) {
     const d = listData(await call('getCommentList', listArgs(exportId, buf)));
     if (!d) return { error: '一楼列表读失败（errCode 不是 0 或没有列表）' };
     root = d.comment.find((c) => String(c.commentId) === rootId) ?? null;
     if (root) break;
-    if (Number(d.downContinueFlag) !== 1 || !d.lastBuff || d.lastBuff === buf) { end = true; break; }
+    if (pageEnd(d.downContinueFlag)) { end = true; break; }
+    if (!pageMore(d.downContinueFlag) || !d.lastBuff || d.lastBuff === buf) break;
     buf = d.lastBuff;
   }
   if (!root) return { root: null, end };
-  const l2 = [...(root.levelTwoComment ?? [])];
-  let flag = Number(root.downContinueFlag), lb = root.lastBuff;
-  for (let calls = 0; flag === 1 && calls < lim.maxExpand; calls++) {
+  const byId = new Map((root.levelTwoComment ?? []).map((c) => [String(c.commentId), c]));
+  let flag = root.downContinueFlag, lb = root.lastBuff;
+  for (let calls = 0; pageMore(flag) && calls < lim.maxExpand; calls++) {
     const d = listData(await call('getCommentList', listArgs(exportId, lb, rootId)));
     if (!d) return { error: '楼中楼读失败（errCode 不是 0 或没有列表）' };
-    l2.push(...d.comment);
-    if (Number(d.downContinueFlag) === 1 && (!d.lastBuff || d.lastBuff === lb)) break;
-    flag = Number(d.downContinueFlag); lb = d.lastBuff;
+    for (const c of d.comment) byId.set(String(c.commentId), c);
+    if (pageMore(d.downContinueFlag) && (!d.lastBuff || d.lastBuff === lb)) break;
+    flag = d.downContinueFlag; lb = d.lastBuff;
   }
-  return { root, l2, complete: flag !== 1, end: false };
+  return { root, l2: [...byId.values()], complete: pageEnd(flag), end: false };
 }
 
 export const channelsApi = {
   platform: 'Channels',
-  async precheck({ call, page, params, me }) {
+  async precheck({ call, page, params, me, deps }) {
     const t = params.target ?? {};
     const target = String(t.commentId), rootId = String(t.rootId ?? t.commentId), workId = String(t.workId);
     const myNick = me.nickname ?? params.nickname ?? null;
     if (!myNick) return { blocked: 'no-uid', detail: '没读到自己的视频号昵称，判断不了哪条是我发的' };
-    const feeds = await waitFor(() => page.evaluate(new Function(`const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null; ${FEEDS_SRC}`)), 20000, 1000);
-    const feed = (feeds ?? []).find((f) => String(f.objectNonce) === workId || String(f.objectId) === workId);
+    const inShadow = (src) => page.evaluate(new Function(`const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null; ${src}`));
+    // 组件刚挂载时 commentFeeds 是空数组，要等到非空；目标不在首屏就滚动懒加载（同页面写法）
+    let feeds = await waitFor(async () => { const f = await inShadow(FEEDS_SRC); return Array.isArray(f) && f.length ? f : null; }, 20000, 1000);
+    if (!feeds) return { blocked: 'target-not-found', detail: '视频号作品列表读不到' };
+    const pick = () => feeds.find((f) => String(f.objectNonce) === workId || String(f.objectId) === workId);
+    for (let i = 0; i < 6 && !pick(); i++) {
+      await inShadow(`const l = [...sr.querySelectorAll('.comment-feed-wrap')].at(-1); l?.scrollIntoView({ block: 'end' }); return true;`);
+      await (deps?.sleep ?? realSleep)(2500);
+      const next = await inShadow(FEEDS_SRC);
+      if (!Array.isArray(next) || next.length <= feeds.length) break;
+      feeds = next;
+    }
+    const feed = pick();
     if (!feed) return { blocked: 'target-not-found', detail: '作品列表里没有这个作品' };
     const exportId = feed.objectId;
     const th = await channelsThread(call, { exportId, rootId });
@@ -128,7 +151,7 @@ export const channelsApi = {
     if (!th.complete) return { blocked: 'thread-incomplete', detail: `楼中楼读到 ${th.l2.length} 条，还有没读完的` };
     const tgt = target === rootId ? th.root : th.l2.find((c) => String(c.commentId) === target);
     if (!tgt) return { blocked: 'comment-gone', detail: '楼读全了，里面没有这条楼中楼' };
-    const replied = th.l2.some((c) => c.commentNickname === myNick && (target === rootId ? isRootTarget(c.replyCommentId) || String(c.replyCommentId) === rootId : String(c.replyCommentId) === target));
+    const replied = th.l2.some((c) => c.commentNickname === myNick && chRepliesTo(c, { rootId, target }));
     if (replied) return { blocked: 'already-replied', detail: '这栋楼里已经有我对这条评论的直接回复' };
     const { levelTwoComment: _l2, ...comment } = tgt;
     return { state: { exportId, rootId, target, comment, myNick, before: new Set(th.l2.map((c) => String(c.commentId))) } };
@@ -136,15 +159,15 @@ export const channelsApi = {
   async send({ call, params, uuid }, s) {
     const r = await call('createComment', { replyCommentId: s.target, content: params.text, clientId: uuid(), rootCommentId: s.rootId, comment: s.comment, exportId: s.exportId });
     const d = r.ok ? r.data : null;
-    const id = d?.errCode === 0 && !d?.data?.baseResp?.errcode ? d?.data?.comment?.commentId : null;
-    if (id != null) return { ok: true, nativeId: String(id) };
+    const id = d?.errCode === 0 && !d?.data?.baseResp?.errcode ? idOf(d?.data?.comment?.commentId) : null;
+    if (id != null) return { ok: true, nativeId: id };
     return { ok: false, detail: r.ok ? `发送接口返回不认识：errCode=${d?.errCode ?? '无'}，baseResp.errcode=${d?.data?.baseResp?.errcode ?? '无'}` : `发送接口调用出错：${r.error}` };
   },
   async fresh({ call, params }, s) {
     const th = await channelsThread(call, { exportId: s.exportId, rootId: s.rootId });
     if (th.error || !th.root) return { items: null, detail: th.error ?? '回读时没找到这栋楼' };
     const want = norm(params.text);
-    return { items: th.l2.filter((c) => !s.before.has(String(c.commentId)) && c.commentNickname === s.myNick && norm(c.commentContent) === want).map((c) => String(c.commentId)) };
+    return { items: [...new Set(th.l2.filter((c) => !s.before.has(String(c.commentId)) && c.commentNickname === s.myNick && norm(c.commentContent) === want && chRepliesTo(c, s)).map((c) => String(c.commentId)))] };
   },
 };
 
@@ -187,7 +210,7 @@ export async function runApiReply(task, params, plat, deps = {}) {
     if (out.uidSeen !== String(params.uid).trim()) return { ...out, blocked: 'uid-mismatch', detail: `页面登录的是 ${out.uidSeen}，要用的账号是 ${params.uid}` };
     const call = await (deps.serviceCaller ?? serviceCaller)(page, plat.api.platform, { waitMs: Math.min(t.loadMs, 60000) });
     if (!call) return { ...out, blocked: 'cannot-send', detail: '页面自己的评论服务没找到（页面可能改版了），没发。可以关掉 writeViaApi 改回页面写法' };
-    const ctx = { call, page, params, me: who, uuid: deps.uuid ?? randomUUID };
+    const ctx = { call, page, params, me: who, uuid: deps.uuid ?? randomUUID, deps };
     const pre = await plat.api.precheck(ctx);
     if (pre.blocked) return { ...out, blocked: pre.blocked, ...(pre.detail ? { detail: redact(pre.detail) } : {}) };
     out.sendAttempted = true;

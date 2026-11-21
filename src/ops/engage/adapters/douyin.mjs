@@ -10,7 +10,7 @@
 //        不再点「选择作品」「查看回复」。翻页上限同 DOM 路径（一楼 maxSelectPages 页、楼中楼共 maxExpand 次请求），原始数据形状不变。
 //        找不到页面服务时退回 DOM 路径（raw.apiFallback 写明原因）。
 // 不点「回复」、不往输入框里写字、不调 Context 上的写函数。
-import { serviceCaller } from '../inpage-api.mjs';
+import { countOf, pageEnd, pageMore, serviceCaller } from '../inpage-api.mjs';
 import { open, atLogin, bigJson, capCount, captured, clickMarked, installHook, mainPage, sleep, waitCaptured } from './page-lib.mjs';
 import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
@@ -107,7 +107,6 @@ export function recentWorks(items, o) {
   return { windowStartMs, recent: items.filter((x) => x.comment_count > 0 && (publishedAt(x.create_time) ?? o.now) >= windowStartMs).slice(0, o.maxWorks) };
 }
 
-const more = (j) => j.has_more === 1 || j.has_more === true;
 // 参数同页面自己发的一楼请求（探针看到的：aweme_id、cursor、count=10、comment_select_options=0、sort_options=0、channel_id=618；app_id、aid、device_platform 由页面封装补）
 export const selectArgs = (awemeId, cursor) => ({ aweme_id: String(awemeId), cursor, count: 10, comment_select_options: 0, sort_options: 0, channel_id: 618 });
 export const replyArgs = (cid, cursor) => ({ comment_id: String(cid), cursor, count: 10, channel_id: 618 });
@@ -129,22 +128,29 @@ export async function worksViaApi(call, recent, o) {
         break;
       }
       select.push(j);
-      if (!more(j) || j.cursor == null || j.cursor === cursor) break;
+      // 没有明确翻到底（has_more 不是 0）时，最后一页的 has_more 留着，parse 判成没拿全
+      if (pageEnd(j.has_more) || !pageMore(j.has_more) || j.cursor == null || j.cursor === cursor) break;
       cursor = j.cursor;
     }
+    // 一楼跨页可能重复（新评论插进来），按 cid 去重后再拉楼中楼；总数读不到的也拉
+    const roots = new Map();
+    for (const c of select.flatMap((j) => j.comments)) { const n = countOf(c.reply_comment_total); if (n == null || n > 0) roots.set(String(c.cid), c); }
     let calls = 0, left = 0;
-    for (const c of select.flatMap((j) => j.comments).filter((c) => Number(c.reply_comment_total) > 0)) {
+    for (const cid of roots.keys()) {
       for (let cur = 0; ;) {
         if (calls >= o.maxExpand) { left++; break; }
         calls++;
-        const r = await call('awemeV1CommentListReply', replyArgs(c.cid, cur));
+        const r = await call('awemeV1CommentListReply', replyArgs(cid, cur));
         const j = r.ok ? slimList(r.data ?? {}) : { status_code: null, has_more: null, cursor: null, total: null, comments: null };
         replies.push(j);
-        if (j.status_code !== 0 || !Array.isArray(j.comments) || !more(j) || j.cursor == null || j.cursor === cur) break;
+        if (j.status_code !== 0 || !Array.isArray(j.comments) || pageEnd(j.has_more)) break;
+        // 还有下一页却翻不动、或 has_more 缺失：这栋楼没读全
+        if (!pageMore(j.has_more) || j.cursor == null || j.cursor === cur) { left++; break; }
         cur = j.cursor;
       }
     }
-    works.push({ item_id_plain: it.item_id_plain, opened: true, via: 'api', clicks: calls, expandLeft: left, expandLeftTexts: [], select, replies, selectErrors });
+    // 一楼一页都没读到的作品记 opened:false，全部作品都这样时 parse 报 no-data（同步失败会告警），不会悄悄记成功
+    works.push({ item_id_plain: it.item_id_plain, opened: select.length > 0, via: 'api', clicks: calls, expandLeft: left, expandLeftTexts: [], select, replies, selectErrors });
   }
   return works;
 }
@@ -292,9 +298,11 @@ export function parseComments(raw, { accountUid, fetchedAt }) {
       const id = String(c.cid), root = str(c.reply_id) ?? null;
       if (!root || root === '0') continue;
       const to = str(c.reply_to_reply_id);
+      const first = !seen.has(id);
       seen.set(id, { ...base(c, wid), rootNativeId: root, parentNativeId: to && to !== '0' ? to : root,
         replyTo: c.reply_to_userid ? { uid: str(c.reply_to_userid), nickname: c.reply_to_username ?? null } : null, replyCount: null });
-      if (roots.has(root)) roots.set(root, roots.get(root) + 1);
+      // 同一条楼中楼在几页响应里重复出现时只数一次，否则会把没读全的楼数成读全了
+      if (first && roots.has(root)) roots.set(root, roots.get(root) + 1);
     }
     // 子回复数对不上（没展开完、或分页没跟到）的楼算拿不全
     // 子回复总数缺失时不知道拿全没有，算拿不全（X2-S8）

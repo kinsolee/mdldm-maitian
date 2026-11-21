@@ -11,7 +11,7 @@
 //        一楼 { lastBuff, exportId: objectId }，楼中楼加 rootCommentId 和那条一楼的 lastBuff（同页面自己的 fetchReply）。
 //        不调 updateFeedCommentReadState，所以评论不会被标已读。原始数据形状同 DOM 路径；找不到页面服务时退回 DOM（raw.apiFallback）。
 // 不点 .like-action、不点回复图标、不往任何输入框里写字。
-import { serviceCaller } from '../inpage-api.mjs';
+import { pageEnd, pageMore, serviceCaller } from '../inpage-api.mjs';
 import { open, atLogin, clickMarked, mainPage, sleep } from './page-lib.mjs';
 import { adapterFail, clip, isoOf, numOrNull, okResult, str } from './shape.mjs';
 
@@ -138,15 +138,17 @@ export async function worksViaApi(call, feeds, o) {
       const d = listData(await call('getCommentList', listArgs(f.objectId, buf)));
       if (!d) { error = '一楼列表接口没返回 errCode=0 的列表'; break; }
       roots.push(...d.comment);
-      if (Number(d.downContinueFlag) !== 1) break;
-      if (p + 1 >= o.maxPages || !d.lastBuff || d.lastBuff === buf) { topLeft = 1; break; }
+      if (pageEnd(d.downContinueFlag)) break;
+      // 还有下一页但到上限、翻不动，或标志缺失：一楼没读全
+      if (!pageMore(d.downContinueFlag) || p + 1 >= o.maxPages || !d.lastBuff || d.lastBuff === buf) { topLeft = 1; break; }
       buf = d.lastBuff;
     }
     if (error) { works.push({ objectNonce: f.objectNonce, opened: false, via: 'api', error }); continue; }
     let calls = 0, left = 0;
     for (const root of roots) {
       root.levelTwoComment = Array.isArray(root.levelTwoComment) ? [...root.levelTwoComment] : [];
-      while (Number(root.downContinueFlag) === 1) {
+      while (!pageEnd(root.downContinueFlag)) {
+        if (!pageMore(root.downContinueFlag)) { left++; break; }   // 标志缺失或不认识：按没读全
         if (calls >= o.maxExpand) { left++; break; }
         calls++;
         const d = listData(await call('getCommentList', listArgs(f.objectId, root.lastBuff, root.commentId)));

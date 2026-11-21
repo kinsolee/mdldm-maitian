@@ -10,8 +10,16 @@
 
 export const SERVICES = {
   Douyin: { methods: ['awemeV1CommentListSelect', 'awemeV1CommentListReply', 'awemeV1CommentMultiPublish'], marks: ['awemeV1CommentListSelect:', 'awemeV1CommentMultiPublish:'] },
-  Channels: { methods: ['getCommentList', 'createComment'], marks: ['async getCommentList(e)', 'async createComment(e)'] },
+  Channels: { methods: ['getCommentList', 'createComment'], marks: ['async getCommentList(', 'async createComment('] },
 };
+
+// 翻页标志：只有明确是 0 / false 才算翻到底；明确是 1 / true 才算还有下一页；缺失、别的值一律当「不知道」，按没读全处理
+export const pageEnd = (v) => v === 0 || v === false || v === '0';
+export const pageMore = (v) => v === 1 || v === true || v === '1';
+/** 条数：有限数字或非空数字字符串才算，其余（null、''、布尔）返回 null。 */
+export const countOf = (v) => ((typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) ? Number(v) : null);
+/** 发送接口给的新 id：空串、"0" 不算。 */
+export const idOf = (v) => (v == null || v === '' || String(v) === '0' ? null : String(v));
 
 /** 在页面里找服务并挂到 window.__engSvc[platform]。参数 { platform, methods, marks }，返回是否找到。导出给测试在假 window 上跑。 */
 export function locateService({ platform, methods, marks }) {
@@ -28,6 +36,8 @@ export function locateService({ platform, methods, marks }) {
     }
   }
   for (const chunk of globals) {
+    // webpack runtime 还没接管时 push 是原生数组方法，往里塞空 chunk 没用，还会留在页面数组里
+    try { if (/\[native code\]/.test(Function.prototype.toString.call(chunk.push))) continue; } catch { continue; }
     let req = null;
     try { chunk.push([[`__eng_${Date.now()}_${Math.random()}`], {}, (r) => { req = r; }]); } catch { continue; }
     if (!req?.m) continue;
@@ -48,7 +58,11 @@ export async function callInPage({ platform, method, args }) {
   const s = window.__engSvc?.[platform];
   if (!s || typeof s[method] !== 'function') return { ok: false, error: `页面服务没有 ${method}` };
   try { const d = await s[method](args); return { ok: true, data: JSON.parse(JSON.stringify(d ?? null)) }; }
-  catch (e) { return { ok: false, error: String(e?.message ?? e).slice(0, 300) }; }
+  catch (e) {
+    let msg = e?.message;
+    if (msg == null && e && typeof e === 'object') { try { msg = JSON.stringify({ status_code: e.status_code, status_msg: e.status_msg, errCode: e.errCode, errMsg: e.errMsg }); } catch { msg = null; } }
+    return { ok: false, error: String(msg ?? e).slice(0, 300) };
+  }
 }
 
 /**
@@ -56,6 +70,7 @@ export async function callInPage({ platform, method, args }) {
  * gapMs：两次调用之间至少隔这么久，节奏不快于人工翻页。
  */
 export async function serviceCaller(page, platform, { waitMs = 60000, stepMs = 1500, gapMs = 800, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  if (!SERVICES[platform]) return null;
   const spec = { platform, ...SERVICES[platform] };
   let found = false;
   for (const end = Date.now() + waitMs; !found; await sleep(stepMs)) {

@@ -109,7 +109,9 @@ describe('抖音：接口读评论', () => {
     const bad = async (m) => (m === 'awemeV1CommentListSelect' ? { ok: false, error: '请求网络失败' } : { ok: true, data: {} });
     const w2 = await dy.worksViaApi(bad, [{ item_id_plain: 'w1' }], o);
     assert.equal(w2[0].selectErrors.length, 1);
-    assert.deepEqual(parse(w2).scannedWorks[0], { workNativeId: 'w1', complete: false, threadsPartial: true });
+    // 一楼一页都没读到：作品记 opened:false，全部都这样时 parse 报 no-data（同步失败会告警）
+    assert.equal(w2[0].opened, false);
+    assert.throws(() => parse(w2), /no-data|一个都没能/);
     // 「url doesn't match」：status_code=0 但没有 comments，按出错算
     const w3 = await dy.worksViaApi(async () => ({ ok: true, data: { status_code: 0, status_msg: "url doesn't match" } }), [{ item_id_plain: 'w1' }], o);
     assert.equal(w3[0].selectErrors[0].comments, 'missing');
@@ -118,6 +120,105 @@ describe('抖音：接口读评论', () => {
   test('一楼翻到上限还有下一页：不算拿全', async () => {
     const works = await dy.worksViaApi(fakeDouyin(dyWorld()).call, [{ item_id_plain: 'w1' }], { ...o, maxSelectPages: 1 });
     assert.equal(parse(works).scannedWorks[0].complete, false);
+  });
+});
+
+describe('评审第 1 轮回归：翻页标志缺失、游标停滞、重复、挂错目标', () => {
+  const o = { ...dy.LIMITS, now: T * 1000 };
+  const parse = (works) => dy.parseComments({ kind: 'comments', itemListCodes: [0], windowStartMs: o.now - 30 * 86400_000,
+    items: [{ item_id_plain: 'w1', title: '作品一', create_time: T - 3600, comment_count: 3 }], works }, { accountUid: ME, fetchedAt: new Date(o.now).toISOString() });
+  const ok = (data) => ({ ok: true, data: { status_code: 0, ...data } });
+  const ctx = (call, target, rootId = 'r1') => ({ call, params: { op: 'reply', text: '谢谢', target: { commentId: target, rootId, workId: 'w1' } }, me: { uid: ME } });
+
+  test('抖音发前重读：reply_comment_total 为 null 时照样拉楼中楼，读不到总数一律 thread-incomplete，不放行', async () => {
+    const calls = [];
+    const roots = [dyC('r1')]; roots[0].reply_comment_total = null;
+    for (const list of [[dyC('mine', { uid: ME, reply_id: 'r1' })], []]) {
+      const pre = await douyinApi.precheck(ctx(async (m) => { calls.push(m); return m === 'awemeV1CommentListSelect' ? ok({ has_more: 0, comments: roots }) : ok({ has_more: 0, comments: list }); }, 'r1'));
+      assert.equal(pre.blocked, 'thread-incomplete');
+    }
+    assert.equal(calls.filter((m) => m === 'awemeV1CommentListReply').length, 2);
+  });
+
+  test('抖音发前重读：一楼游标停滞或 has_more 缺失不算翻到底（target-not-found，不是 comment-gone）；楼中楼重叠按 cid 去重', async () => {
+    assert.equal((await douyinApi.precheck(ctx(async () => ok({ has_more: 1, cursor: 0, comments: [dyC('r1')] }), 'r9', 'r9'))).blocked, 'target-not-found');
+    assert.equal((await douyinApi.precheck(ctx(async () => ok({ comments: [dyC('r1')] }), 'r9', 'r9'))).blocked, 'target-not-found');
+    // r1 有 3 条（a、b、mine），翻页重叠只读到 a、b、b：去重后 2 条 < 3，按没读全拦下
+    const root = dyC('r1', { total: 3 });
+    const pages = [ok({ has_more: 1, cursor: 2, comments: [dyC('a', { reply_id: 'r1' }), dyC('b', { reply_id: 'r1' })] }), ok({ has_more: 0, cursor: 3, comments: [dyC('b', { reply_id: 'r1' })] })];
+    let i = 0;
+    const pre = await douyinApi.precheck(ctx(async (m) => (m === 'awemeV1CommentListSelect' ? ok({ has_more: 0, comments: [root] }) : pages[i++]), 'r1'));
+    assert.equal(pre.blocked, 'thread-incomplete');
+    // 楼中楼 has_more 缺失：不算读全
+    const pre3 = await douyinApi.precheck(ctx(async (m) => (m === 'awemeV1CommentListSelect' ? ok({ has_more: 0, comments: [dyC('r1', { total: 1 })] }) : ok({ comments: [dyC('a', { reply_id: 'r1' })] })), 'r1'));
+    assert.equal(pre3.blocked, 'thread-incomplete');
+  });
+
+  test('抖音接口读：楼中楼游标停滞、一楼跨页重复，都不能判成拿全', async () => {
+    const stuck = async (m) => (m === 'awemeV1CommentListSelect' ? ok({ has_more: 0, comments: [dyC('r1', { total: 1 })] }) : ok({ has_more: 1, cursor: 0, comments: [dyC('a', { reply_id: 'r1' })] }));
+    const w = await dy.worksViaApi(stuck, [{ item_id_plain: 'w1' }], o);
+    assert.equal(w[0].expandLeft, 1);
+    assert.equal(parse(w).scannedWorks[0].complete, false);
+    // r1 在一楼两页里都出现；楼中楼只读到 a（总数 2）：只拉一次，数一次
+    const sel = [ok({ has_more: 1, cursor: 1, comments: [dyC('r1', { total: 2 })] }), ok({ has_more: 0, cursor: 2, comments: [dyC('r1', { total: 2 })] })];
+    let k = 0, replyCalls = 0;
+    const dup = async (m) => (m === 'awemeV1CommentListSelect' ? sel[k++] : (replyCalls++, ok({ has_more: 0, comments: [dyC('a', { reply_id: 'r1' })] })));
+    const w2 = await dy.worksViaApi(dup, [{ item_id_plain: 'w1' }], o);
+    assert.equal(replyCalls, 1);
+    assert.deepEqual(parse(w2).scannedWorks[0], { workNativeId: 'w1', complete: false, threadsPartial: true });
+    // parse 本身：同一条楼中楼在两页响应里各出现一次只数一次（DOM 路径抓到重复响应时也一样）
+    const w3 = [{ item_id_plain: 'w1', opened: true, clicks: 2, expandLeft: 0, select: [{ status_code: 0, has_more: 0, comments: [dyC('r1', { total: 2 })] }],
+      replies: [{ status_code: 0, has_more: 1, comments: [dyC('a', { reply_id: 'r1' })] }, { status_code: 0, has_more: 0, comments: [dyC('a', { reply_id: 'r1' })] }], selectErrors: [] }];
+    assert.equal(parse(w3).scannedWorks[0].complete, false);
+  });
+
+  test('发后回读：挂错目标的不算；同一条在两页里重复只数一次', async () => {
+    const s = { awemeId: 'w1', rootId: 'r1', target: 'a', before: new Set(['a']) };
+    const wrong = async (m) => (m === 'awemeV1CommentMultiPublish' ? ok({ comments: [{ code: 0, comment: { cid: 'new1' } }] })
+      : m === 'awemeV1CommentListSelect' ? ok({ has_more: 0, comments: [dyC('r1', { total: 2 })] })
+        : ok({ has_more: 0, comments: [dyC('a', { reply_id: 'r1' }), dyC('new1', { uid: ME, text: '谢谢', reply_id: 'r1', reply_to_reply_id: '0' })] }));
+    const rb = (await sendAndReadBack(douyinApi, ctx(wrong, 'a'), s, { sleep: noSleep, readbackMs: 0 })).readBack;
+    assert.deepEqual([rb.found, rb.count], [false, 0]);
+    const pages = [ok({ has_more: 1, cursor: 2, comments: [dyC('a', { reply_id: 'r1' }), dyC('new1', { uid: ME, text: '谢谢', reply_id: 'r1', reply_to_reply_id: 'a' })] }),
+      ok({ has_more: 0, cursor: 3, comments: [dyC('new1', { uid: ME, text: '谢谢', reply_id: 'r1', reply_to_reply_id: 'a' })] })];
+    let i = 0;
+    const dup = async (m) => (m === 'awemeV1CommentMultiPublish' ? ok({ comments: [{ code: 0, comment: { cid: 'new1' } }] })
+      : m === 'awemeV1CommentListSelect' ? ok({ has_more: 0, comments: [dyC('r1', { total: 2 })] }) : pages[i++ % 2]);
+    const rb2 = (await sendAndReadBack(douyinApi, ctx(dup, 'a'), s, { sleep: noSleep, readbackMs: 0 })).readBack;
+    assert.deepEqual(rb2, { found: true, count: 1, nativeId: 'new1' });
+    // 发送接口给的 id 是空串：不认
+    const empty = async (m) => (m === 'awemeV1CommentMultiPublish' ? ok({ comments: [{ code: 0, comment: { cid: '' } }] }) : wrong(m));
+    assert.equal((await douyinApi.send(ctx(empty, 'a'), s)).ok, false);
+  });
+
+  test('视频号：downContinueFlag 缺失按没读全（读、写都是）；作品列表先空后有要等到', async () => {
+    const cc = (id, x = {}) => ({ commentId: id, commentNickname: `昵称${id}`, commentContent: '', levelTwoComment: [], ...x });
+    const noFlag = async () => ({ ok: true, data: { errCode: 0, data: { comment: [cc('r1')], lastBuff: '' } } });
+    const feeds = [{ objectId: 'obj1', objectNonce: 'n1', createTime: T - 3600, commentCount: 1, desc: { description: 'x', shortTitle: [] } }];
+    const w = await ch.worksViaApi(noFlag, feeds, { ...ch.LIMITS, now: T * 1000 });
+    assert.ok(w[0].expandLeft > 0);
+    const out = ch.parseComments({ kind: 'comments', windowStartSec: T - 30 * 86400, feeds, emptyState: false, works: w, me: { nickname: '我' } }, { accountUid: 'sph', fetchedAt: new Date(T * 1000).toISOString() });
+    assert.equal(out.scannedWorks[0].complete, false);
+    let n = 0;
+    const page = { evaluate: async () => (n++ === 0 ? [] : [{ objectId: 'obj1', objectNonce: 'n1' }]) };
+    const pre = await channelsApi.precheck({ call: noFlag, page, params: { op: 'reply', text: '收到', target: { commentId: 'r1', rootId: 'r1', workId: 'n1' } }, me: { nickname: '我' } });
+    assert.equal(pre.blocked, 'thread-incomplete');
+    assert.ok(n >= 2);
+    // 一楼没找到、标志缺失：不算翻到底
+    const pre2 = await channelsApi.precheck({ call: noFlag, page, params: { op: 'reply', text: '收到', target: { commentId: 'r9', rootId: 'r9', workId: 'n1' } }, me: { nickname: '我' } });
+    assert.equal(pre2.blocked, 'target-not-found');
+  });
+
+  test('runApiReply：发送、回读抛错都返回 sendAttempted:true、没有 sendError；重读抛错是 precheck-error', async () => {
+    const page = { cdp: async () => ({}), goto: async () => {}, url: async () => 'https://x.test/a', evaluate: async () => true };
+    const task = { pages: async () => [page] };
+    const base = { op: 'reply', uid: ME, text: '谢谢', target: {}, timeouts: { readbackMs: 0 } };
+    const plat = (api) => ({ api, hook: false, url: () => 'https://x.test/a', login: async () => ({ uid: ME }) });
+    const deps = { serviceCaller: async () => async () => ({ ok: true, data: {} }), sleep: noSleep };
+    const r = await runApiReply(task, base, plat({ platform: 'Douyin', precheck: async () => ({ state: {} }), send: async () => { throw new Error('boom'); }, fresh: async () => ({ items: [] }) }), deps);
+    assert.deepEqual([r.sendAttempted, r.readBack.found, 'sendError' in r], [true, false, false]);
+    const r2 = await runApiReply(task, base, plat({ platform: 'Douyin', precheck: async () => { throw new Error('读坏了'); } }), deps);
+    assert.deepEqual([r2.sendAttempted, r2.blocked], [false, 'precheck-error']);
   });
 });
 
@@ -222,7 +323,7 @@ describe('视频号：接口回复评论', () => {
   const p = (commentId) => ({ op: 'reply', text: '收到', target: { commentId, rootId: 'r1', workId: 'n1' } });
   const ctx = (w, prm) => ({ call: w.call, page: w.page, params: prm, me: { nickname: '我' }, uuid: () => 'uuid-1' });
 
-  test('回楼中楼：入参同页面自己的 createComment，回读到恰好 1 条', async () => {
+  test('回一楼：入参同页面自己的 createComment，回读到恰好 1 条', async () => {
     const w = world();
     const pre = await channelsApi.precheck(ctx(w, p('r1')));
     assert.ok(pre.state);
@@ -233,8 +334,12 @@ describe('视频号：接口回复评论', () => {
     assert.deepEqual({ ...sent[0][1], comment: sent[0][1].comment.commentId }, { replyCommentId: 'r1', content: '收到', clientId: 'uuid-1', rootCommentId: 'r1', comment: 'r1', exportId: 'obj1' });
   });
 
-  test('已回过、要验证手机（-4300）', async () => {
-    assert.equal((await channelsApi.precheck(ctx(world(), p('x')))).blocked, 'already-replied');
+  test('已回过（目标是楼中楼）、评论已删、没昵称、要验证手机（-4300）', async () => {
+    const w0 = world();
+    const pre0 = await channelsApi.precheck(ctx(w0, p('x')));
+    assert.equal(pre0.blocked, 'already-replied');
+    assert.equal((await channelsApi.precheck(ctx(world(), p('gone')))).blocked, 'comment-gone');
+    assert.equal((await channelsApi.precheck({ ...ctx(world(), p('r1')), me: {}, params: { ...p('r1') } })).blocked, 'no-uid');
     const w = world({ publish: 'phone' });
     const pre = await channelsApi.precheck(ctx(w, p('r1')));
     const { readBack } = await sendAndReadBack(channelsApi, ctx(w, p('r1')), pre.state, { sleep: noSleep, readbackMs: 0 });
