@@ -96,6 +96,25 @@ describe('一轮抓取', () => {
     assert.ok(!logs.join('\n').includes('should-not-leak'), '日志不打印订阅地址的 query');
   });
 
+  test('评论一入库就过滤：同一轮后面的任务还没跑完时，网友互回的楼中楼已经回执 skipped、补漏捞不到', async () => {
+    const { db, c, base, logs } = setup({ caps: [[DOUYIN, 'readComments'], [DOUYIN, 'readDM']] });
+    let seenDuringRound = null;
+    const { collect } = fakeCollect({
+      'Douyin/comments': [commentsSnap([comment('c1')]), commentsSnap([comment('c1'), comment('c4', { parent: 'c1' })])],
+      'Douyin/dms': [dmsSnap([]), () => {
+        seenDuringRound = db.prepare("SELECT handledOutcome, filteredReason FROM events WHERE id = 'comment.created:Douyin:c4'").get();
+        return dmsSnap([]);
+      }],
+    });
+    await runRound(db, { ...base, collect });
+    c.advance(15 * MIN);
+    const r = await runRound(db, { ...base, collect });
+    assert.deepEqual({ ...seenDuringRound }, { handledOutcome: 'skipped', filteredReason: 'peer-reply' });
+    assert.deepEqual(r.jobs.find((j) => j.kind === 'comments').filtered, [{ eventId: 'comment.created:Douyin:c4', rule: 'peer-reply' }]);
+    assert.equal(r.delivery.filtered, 1, '入库后过滤的也算进本轮汇总，只算一次');
+    assert.equal(logs.filter((l) => /过滤 1 条（peer-reply 1）/.test(l)).length, 1);
+  });
+
   test('busy / user-controlled 记 skipped，不出事件、不算失败', async () => {
     const { db, c, base, n } = setup();
     const { collect } = fakeCollect({ 'Douyin/comments': [

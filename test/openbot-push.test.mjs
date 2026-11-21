@@ -318,6 +318,22 @@ describe('截断的边界情况', () => {
     assert.equal(block[0].text, '短');
   });
 
+  test('几千条事件也是线性时间，结果和逐条重拼一致', () => {
+    const big = Array.from({ length: 3000 }, (_, i) => C(`n${String(i).padStart(4, '0')}`));
+    const ctx = new Map(big.map((id) => [id, { type: 'comment.created', text: '问', thread: { items: Array.from({ length: 7 }, () => ({ text: '楼'.repeat(40) })) } }]));
+    const t0 = performance.now();
+    const text = taskText(big, { contexts: ctx, maxChars: 12_000, boundary: 'BA' });
+    assert.ok(performance.now() - t0 < 1500, `耗时 ${Math.round(performance.now() - t0)} ms`);
+    const { outside, block } = split(text, 'BA');
+    assert.equal(block.length, 0);
+    for (const id of big) assert.ok(outside.includes(`- ${id}\n`));
+    // 小批量：长度刚好卡在上限以内
+    const small = big.slice(0, 40);
+    const t = taskText(small, { contexts: ctx, maxChars: 8000, boundary: 'BB' });
+    assert.ok(t.length <= 8000, `长度 ${t.length}`);
+    assert.ok(taskText(small, { contexts: ctx, maxChars: t.length + 0, boundary: 'BB' }) === t);
+  });
+
   test('私信的 messages 也会被截', () => {
     const ids = Array.from({ length: 20 }, (_, i) => `dm.received:Douyin:c${i}:2026-11-19T01:00:00.000Z`);
     const ctx = new Map(ids.map((id) => [id, { type: 'dm.received', messages: [{ by: 'peer', text: '信'.repeat(400) }] }]));
