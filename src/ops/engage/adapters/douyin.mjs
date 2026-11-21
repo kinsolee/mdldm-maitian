@@ -65,7 +65,9 @@ async function rawComments(page, o) {
     const from = await capCount(page);
     const switched = await switchTo(page, it.item_id_plain, { maxPages: o.maxPickerPages });
     if (!switched.ok) { works.push({ item_id_plain: it.item_id_plain, opened: false }); continue; }
-    const got = await waitCaptured(page, SELECT, { from, timeoutMs: 20000 });
+    // 切到的就是默认作品时页面不重新请求，它的一楼列表开头已经抓到了，不用再等
+    const had = (await bodies(page, SELECT, 0)).some((j) => Array.isArray(j.comments) && j.comments.length && j.comments.every((c) => String(c.aweme_id) === it.item_id_plain));
+    const got = had || await waitCaptured(page, SELECT, { from, timeoutMs: 20000 });
     // 列表加载失败时页面显示「点击刷新」，点一次（只读）
     if (!got && await clickMarked(page, `() => [...document.querySelectorAll('[class*=reload-list-]')].find((e) => /点击刷新/.test(e.textContent))`, 'reload comment list')) await waitCaptured(page, SELECT, { from, timeoutMs: 30000 });
     await sleep(1500);
@@ -99,7 +101,7 @@ const WORK_CARDS = `const cards = () => [...document.querySelectorAll('*')].filt
       for (let f = e[k], j = 0; f && j < 8; f = f.return, j++) { const p = f.memoizedProps; if (p && typeof p === 'object') for (const v of Object.values(p)) if (v && typeof v === 'object' && v.item_id_plain != null) return { el, id: String(v.item_id_plain) }; }
     }
     return null; }).filter(Boolean);`;
-const cardCount = (page) => page.evaluate(new Function(`${WORK_CARDS} return cards().length;`));
+const cardIds = (page) => page.evaluate(new Function(`${WORK_CARDS} return cards().map((c) => c.id);`));
 // 抽屉的滚动容器（最后一个作品项往上第一个能纵向滚动的）滚到底；作品列表每页 20 个，滚到底才请求下一页
 const SCROLL_CARDS = `${WORK_CARDS} const last = cards().at(-1)?.el; if (!last) return false;
   for (let e = last.parentElement; e; e = e.parentElement) if (e.scrollHeight > e.clientHeight + 5 && /(auto|scroll)/.test(getComputedStyle(e).overflowY)) {
@@ -110,23 +112,41 @@ async function until(fn, ms, stepMs = 250) {
   for (const end = Date.now() + ms; ;) { const v = await fn(); if (v || Date.now() >= end) return v; await sleep(stepMs); }
 }
 
+// 关掉「选择作品」抽屉：先按 Esc；还开着就点遮罩（Semi SideSheet 点遮罩关），再不行点关闭按钮。抽屉开着时遮罩盖住「选择作品」按钮，下一次就打不开了
+async function closePicker(page) {
+  const open = async () => (await cardIds(page)).length > 0;
+  if (!(await open())) return;
+  await page.cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+  await page.cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+  if (!(await until(async () => !(await open()), 1000))) {
+    await page.evaluate(() => (document.querySelector('[class*=sidesheet-mask]') ?? document.querySelector('[class*=sidesheet-close]'))?.click());
+    await until(async () => !(await open()), 1500);
+  }
+}
+
 /**
- * 「选择作品」→ 作品列表里 item_id_plain 等于 id 的那一项。返回 { ok, detail }。
+ * 「选择作品」→ 作品列表里 item_id_plain 等于 id 的那一项。返回 { ok, detail }；没切成时关掉抽屉再返回。
  * 作品列表是打开抽屉后才请求的（实测 0 到 3.3 秒才出来），每页 20 个；目标不在已加载的里面就把抽屉滚到底翻页，
- * 最多 maxPages 页。抽屉底部「没有更多视频」还有下一页时也显示，所以按「滚了没出新作品」判到底。
+ * 最多 maxPages 页。抽屉底部「没有更多视频」还有下一页时也显示，所以按「滚了没出新作品 id」判到底（按 id 不按个数，列表复用节点时个数不涨）。
  */
 export async function switchTo(page, id, { maxPages = LIMITS.maxPickerPages, listMs = 15000, pageMs = 8000 } = {}) {
+  const want = String(id);
   if (!(await clickMarked(page, PICKER_SRC, 'open work picker'))) return { ok: false, detail: '页面上没有「选择作品」按钮' };
-  let n = await until(() => cardCount(page), listMs);
-  if (!n) return { ok: false, detail: `打开「选择作品」${Math.round(listMs / 1000)} 秒内作品列表没出来` };
+  const fail = async (detail) => { await closePicker(page); return { ok: false, detail }; };
+  const seen = new Set(await until(async () => { const x = await cardIds(page); return x.length ? x : null; }, listMs) ?? []);
+  if (!seen.size) return fail(`打开「选择作品」${Math.round(listMs / 1000)} 秒内作品列表没出来`);
   for (let pages = 1; ; pages++) {
-    const picked = await clickMarked(page, `() => { ${WORK_CARDS} return cards().filter((c) => c.id === ${JSON.stringify(id)}).at(-1)?.el ?? null; }`, 'pick a work');
+    const picked = await clickMarked(page, `() => { ${WORK_CARDS} return cards().filter((c) => c.id === ${JSON.stringify(want)}).at(-1)?.el ?? null; }`, 'pick a work');
     if (picked) { await sleep(2500); return { ok: true, detail: null }; }
-    if (pages >= maxPages) return { ok: false, detail: `作品列表翻了 ${pages} 页（${n} 个作品）到上限，还没有这个作品` };
-    await page.evaluate(new Function(SCROLL_CARDS));
-    const before = n;
-    n = (await until(async () => { const m = await cardCount(page); return m > before ? m : 0; }, pageMs)) || before;
-    if (n === before) return { ok: false, detail: `作品列表翻到底了（${n} 个作品），没有这个作品` };
+    if (pages >= maxPages) return fail(`作品列表翻了 ${pages} 页（${seen.size} 个作品）到上限，还没有这个作品`);
+    // 等下一页的时候每次都再滚一下：上一页刚渲染完时那一下滚动可能没触发加载
+    const grew = await until(async () => {
+      await page.evaluate(new Function(SCROLL_CARDS));
+      const fresh = (await cardIds(page)).filter((x) => !seen.has(x));
+      fresh.forEach((x) => seen.add(x));
+      return fresh.length > 0;
+    }, pageMs, 500);
+    if (!grew) return fail(`作品列表翻到底了（${seen.size} 个作品），没有这个作品`);
   }
 }
 

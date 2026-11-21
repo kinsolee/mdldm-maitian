@@ -13,6 +13,7 @@
   .douyin-creator-interactive-sidesheet-body { height: 420px; overflow-y: auto; }
   .card-OiVt4v { height: 72px; border-bottom: 1px solid #eee; cursor: pointer; }
   .semi-toast-wrapper { position: fixed; top: 4px; right: 4px; }
+  .douyin-creator-interactive-sidesheet-mask { position: fixed; inset: 0; background: rgba(0,0,0,.2); z-index: 9; }
 </style>
 </head>
 <body>
@@ -30,7 +31,11 @@
   - 点作品卡片后抽屉关掉，页面请求这个作品的一楼列表：每页 10 条，has_more、cursor、total；滚到页面底部才请求下一页（cursor=10、20…）。
     列表底部 div.loading-NTmKHl「没有更多评论」也是一直显示的，不能当到底的依据。
   评论块、操作区、回复框的结构同 douyin-comments-real.html。
+  - 抽屉下面有全屏遮罩（Semi SideSheet 默认），点遮罩关抽屉；抽屉开着时「选择作品」按钮被遮罩盖住，点它只会点到遮罩。
   参数：?mode= ok | race（默认作品的一楼列表晚到，会盖掉已经切过去的作品）| replied（每个作品的第 16 条一楼下已有我的回复）
+       | emptydefault（默认作品没有评论）| nopicker（没有「选择作品」按钮）| noload（点了作品后一楼列表一直不来）
+       &roots= 每个作品几条一楼（默认 19）&renderDelay= 一楼响应到了之后多久才渲染（默认 0）
+       &subsAll=1 每条一楼下都有 1 条楼中楼 &emptyTail=1 最后一页满 10 条时接口仍说 has_more，再翻一页才回空页
        &drawerDelay= 打开抽屉后多久出作品列表（默认 3500ms，race 默认 200ms）&listDelay= 默认作品的一楼列表多久到（默认 600ms，race 默认 4000ms）
   作品 w00…w44（w00 最新、默认选中），每页 20 个；每个作品 19 条一楼 <作品>-c0…c18，c0 下有 1 条楼中楼 <作品>-c0r1。
 -->
@@ -47,6 +52,10 @@ const q = new URLSearchParams(location.search);
 const mode = q.get('mode') || 'ok';
 const drawerDelay = Number(q.get('drawerDelay') ?? (mode === 'race' ? 200 : 3500));
 const listDelay = Number(q.get('listDelay') ?? (mode === 'race' ? 4000 : 600));
+const rootsN = Number(q.get('roots') ?? 19);
+const renderDelay = Number(q.get('renderDelay') ?? 0);
+const subsAll = q.get('subsAll') === '1';
+const emptyTail = q.get('emptyTail') === '1';
 const ME = '106';
 const FK = '__reactFiber$wtest';
 window.__loginUser = { uid: ME, nickname: '麦田测试号' };
@@ -61,11 +70,12 @@ const C = (aweme, cid, uid, nick, text, extra = {}) => ({ cid, aweme_id: aweme, 
 const data = {};
 function dataOf(w) {
   if (data[w]) return data[w];
-  const roots = Array.from({ length: 19 }, (_, i) => C(w, `${w}-c${i}`, String(600 + i), '用户' + i, '一楼评论' + i));
-  const subs = { [`${w}-c0`]: [C(w, `${w}-c0r1`, '599', '乙', '楼中楼一条', { reply_id: `${w}-c0` })] };
-  roots[0].reply_comment_total = 1;
-  if (mode === 'replied') { roots[15].reply_comment_total = 1; subs[`${w}-c15`] = [C(w, `${w}-c15me`, ME, '麦田测试号', '之前回过了', { reply_id: `${w}-c15` })]; }
-  return (data[w] = { roots, subs, loaded: 0, expanded: {} });
+  const n = mode === 'emptydefault' && w === DEFAULT ? 0 : rootsN;
+  const roots = Array.from({ length: n }, (_, i) => C(w, `${w}-c${i}`, String(600 + i), '用户' + i, '一楼评论' + i));
+  const subs = {};
+  for (const r of roots) if (subsAll || r === roots[0]) { subs[r.cid] = [C(w, `${r.cid}r1`, '599', '乙', '楼中楼一条', { reply_id: r.cid })]; r.reply_comment_total = 1; }
+  if (mode === 'replied' && roots[15]) { roots[15].reply_comment_total = 1; subs[`${w}-c15`] = [C(w, `${w}-c15me`, ME, '麦田测试号', '之前回过了', { reply_id: `${w}-c15` })]; }
+  return (data[w] = { roots, subs, loaded: 0, done: false, expanded: {} });
 }
 
 // —— 一楼列表：每页 10 条，滚到页面底部加载下一页 ——
@@ -74,19 +84,24 @@ function pushSelect(w, from) {
   const d = dataOf(w);
   const page = d.roots.slice(from, from + 10);
   d.loaded = from + page.length;
-  cap.push({ url: API + `read/aweme/v1/web/comment/list/select/?cursor=${from}`, t: Date.now(), body: JSON.stringify({ status_code: 0, comments: page, cursor: from + 10, has_more: d.loaded < d.roots.length ? 1 : 0, total: d.roots.length }) });
+  if (!page.length) d.done = true;
+  const more = d.loaded < d.roots.length || (emptyTail && page.length > 0);
+  cap.push({ url: API + `read/aweme/v1/web/comment/list/select/?cursor=${from}`, t: Date.now(), body: JSON.stringify({ status_code: 0, comments: page, cursor: from + 10, has_more: more ? 1 : 0, total: d.roots.length }) });
 }
+const hasNext = (d) => d.loaded < d.roots.length || (emptyTail && d.roots.length > 0 && !d.done);
 function showWork(w) { shown = w; render(); }
-setTimeout(() => { pushSelect(DEFAULT, 0); showWork(DEFAULT); }, listDelay);
+// 一楼响应先到（钩子先抄到），渲染晚 renderDelay
+setTimeout(() => { pushSelect(DEFAULT, 0); setTimeout(() => showWork(DEFAULT), renderDelay); }, listDelay);
 addEventListener('scroll', () => {
   if (!shown || loadingMore) return;
   const d = dataOf(shown);
-  if (d.loaded >= d.roots.length) return;
+  if (!hasNext(d)) return;
   const el = document.scrollingElement;
   if (el.scrollTop + innerHeight < el.scrollHeight - 120) return;
   loadingMore = true;
   const w = shown;
-  setTimeout(() => { pushSelect(w, d.loaded); loadingMore = false; if (shown === w) render(); }, 400);
+  // 渲染完才放开 loading：这之前再滚也不会请求下一页
+  setTimeout(() => { pushSelect(w, d.loaded); setTimeout(() => { loadingMore = false; if (shown === w) render(); }, renderDelay); }, 400);
 });
 
 // —— 「选择作品」抽屉 ——
@@ -110,9 +125,16 @@ function renderCards(ul) {
     ul.appendChild(card);
   }
 }
-document.getElementById('picker').onclick = () => {
+function closeDrawer() { document.querySelectorAll('[role=dialog], .douyin-creator-interactive-sidesheet-mask').forEach((x) => x.remove()); }
+if (mode === 'nopicker') document.getElementById('picker').remove();
+const pickerBtn = document.getElementById('picker');
+if (pickerBtn) pickerBtn.onclick = () => {
   pickerOpens++;
-  document.querySelectorAll('[role=dialog]').forEach((x) => x.remove());
+  closeDrawer();
+  const mask = document.createElement('div');
+  mask.className = 'douyin-creator-interactive-sidesheet-mask';
+  mask.onclick = closeDrawer;
+  document.body.appendChild(mask);
   drawerLoaded = 0;
   const dlg = document.createElement('div');
   dlg.setAttribute('role', 'dialog');
@@ -131,13 +153,14 @@ document.getElementById('picker').onclick = () => {
   });
 };
 function pick(w) {
-  document.querySelectorAll('[role=dialog]').forEach((x) => x.remove());
+  closeDrawer();
   current = w;
-  dataOf(w).loaded = 0;
+  Object.assign(dataOf(w), { loaded: 0, done: false });
   document.getElementById('list').innerHTML = '';
   shown = null;
   scrollTo(0, 0);
-  setTimeout(() => { pushSelect(w, 0); showWork(w); }, 800);
+  if (mode === 'noload') return;
+  setTimeout(() => { pushSelect(w, 0); setTimeout(() => showWork(w), renderDelay); }, 800);
 }
 
 // —— 评论块（同 douyin-comments-real.html） ——
@@ -227,7 +250,7 @@ function onSend(target, ed) {
 }
 
 window.__probe = () => ({
-  sendClicks, deleteClicks, reportClicks, pickerOpens, current, shown,
+  sendClicks, deleteClicks, reportClicks, pickerOpens, current, shown, drawerOpen: !!document.querySelector('[role=dialog]'),
   top: document.getElementById('top-box').innerText,
   boxes: [...document.querySelectorAll('[class*=reply-content-] [contenteditable=true]')].map((b) => b.innerText),
   mine: Object.values(data).flatMap((d) => Object.values(d.subs).flat()).filter((x) => x.user.uid === ME && x.cid.startsWith('n'))

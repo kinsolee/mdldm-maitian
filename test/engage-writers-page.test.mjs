@@ -235,14 +235,41 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
     });
     test('翻页找到的评论下已有我的回复：already-replied，不发', async () => assertNoSend(await reply('replied', on('w30', 15), {}, { drawerDelay: 300 }), 'already-replied'));
 
+    // 第一轮评审（Gemini、GPT）指出的边界
+    test('默认作品没有评论：照样切过去发出', async () => sentOn(await reply('emptydefault', {}, {}, { drawerDelay: 300 }), 'w05', 'w05-c1'));
+    test('一楼要翻 4 页、响应比渲染早到：每次等页面渲染好再滚，「回复」等它渲染出来', async () =>
+      sentOn(await reply('ok', on('w05', 33), {}, { drawerDelay: 300, roots: 35, renderDelay: 1500 }), 'w05', 'w05-c33'));
+    test('前面 30 条一楼都有楼中楼、目标是第 31 条下的楼中楼：先展开目标所在的楼', async () => {
+      const x = await reply('ok', { commentId: 'w05-c30r1', workId: 'w05', parentId: 'w05-c30', rootId: 'w05-c30' }, {}, { drawerDelay: 300, roots: 35, subsAll: '1' });
+      sentOn(x, 'w05', 'w05-c30');
+      assert.deepEqual(x.probe.mine.map((m) => m.reply_to_reply_id), ['w05-c30r1']);
+    });
+    test('最后一页满 10 条、接口还说有下一页、下一页是空的：按翻到底报 target-not-found', async () => {
+      const x = await reply('ok', { commentId: 'w05-nope', workId: 'w05', rootId: 'w05-nope' }, {}, { drawerDelay: 300, roots: 20, emptyTail: '1' });
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /翻到底（3 页）/);
+    });
+    test('要切作品但页面上没有「选择作品」：target-not-found，写明原因', async () => {
+      const x = await reply('nopicker');
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /没有「选择作品」/);
+    });
+    test('点了作品后一楼列表一直不来：target-not-found，写明没加载出列表', async () => {
+      const x = await reply('noload', {}, {}, { drawerDelay: 300 });
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /没加载出.*一楼列表/);
+    });
+
     // 读适配器（抓评论）用同一个 switchTo
-    const switchTo = async (work, opts = {}) => {
+    const switchTo = async (work, opts = {}, then = null) => {
       const res = await runEgoTask({ space: s, timeoutMs: 120_000, params: { adapterUrl: new URL('../src/ops/engage/adapters/douyin.mjs', import.meta.url).href,
-        libUrl: new URL('../src/ops/engage/adapters/page-lib.mjs', import.meta.url).href, url: pageUrl('douyin-comments-picker.html', { mode: 'ok' }), work, opts },
+        libUrl: new URL('../src/ops/engage/adapters/page-lib.mjs', import.meta.url).href, url: pageUrl('douyin-comments-picker.html', { mode: 'ok' }), work, opts, then },
       script: `const m = await import(params.adapterUrl); const L = await import(params.libUrl);
 const page = await L.mainPage(task); await L.open(page, params.url); await L.sleep(1500);
 const r = await m.switchTo(page, params.work, params.opts); await L.sleep(1500);
-return { r, probe: await page.evaluate(() => window.__probe()) };` });
+const afterFirst = await page.evaluate(() => window.__probe());
+const r2 = params.then ? await m.switchTo(page, params.then) : null; if (params.then) await L.sleep(1500);
+return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) };` });
       assert.equal(res.ok, true, `${res.reason}: ${res.error}`);
       return res.result;
     };
@@ -257,6 +284,13 @@ return { r, probe: await page.evaluate(() => window.__probe()) };` });
       assert.equal(x.r.ok, false);
       assert.match(x.r.detail, /到底/);
       assert.equal(x.probe.current, 'w00');
+    });
+    test('读适配器 switchTo：没找到时关掉抽屉，下一个作品照常切过去', async () => {
+      const x = await switchTo('w99', {}, 'w44');
+      assert.equal(x.r.ok, false);
+      assert.equal(x.afterFirst.drawerOpen, false);
+      assert.equal(x.r2.ok, true, JSON.stringify(x.r2));
+      assert.equal(x.probe.current, 'w44');
     });
   });
 
