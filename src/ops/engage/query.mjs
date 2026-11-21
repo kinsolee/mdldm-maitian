@@ -24,9 +24,9 @@ function checkTime(v, name) {
   return iso(Date.parse(v));
 }
 
-function checkLimit(limit, max = MAX_LIMIT) {
+function checkLimit(limit, max = MAX_LIMIT, name = 'limit') {
   if (limit == null) return Math.min(DEFAULT_LIMIT, max);
-  if (!Number.isInteger(limit) || limit < 1) throw new Error(`limit 要是正整数：${limit}`);
+  if (!Number.isInteger(limit) || limit < 1) throw new Error(`${name} 要是正整数：${limit}`);
   return Math.min(limit, max);
 }
 
@@ -99,7 +99,13 @@ const toWork = (r) => ({
 
 const COMMENT_COLS = `c.*, ${REPLIED} AS replied`;
 
-export function listComments(db, { workId, platforms, since, replied, includeGone = false, cursor, limit } = {}) {
+// compact：给回评官省 token 的扁平形状，每条只带这几项（评论已删的多一个 gone: true）
+export const toCompactComment = (c) => ({
+  id: c.id, author: c.author.nickname, isMe: c.author.isMe, replyTo: c.replyTo?.nickname ?? null, text: c.text, at: c.createdAt, depth: c.depth,
+  ...(c.goneAt ? { gone: true } : {}),
+});
+
+export function listComments(db, { workId, platforms, since, replied, includeGone = false, cursor, limit, compact = false } = {}) {
   const where = [], params = [];
   if (workId != null) { splitId(workId, 'workId'); where.push('workId = ?'); params.push(workId); }
   inList('platformCode', checkPlatforms(platforms), where, params);
@@ -109,7 +115,7 @@ export function listComments(db, { workId, platforms, since, replied, includeGon
   if (replied === true) where.push('replied = 1');
   if (replied === false) where.push('replied = 0 AND authorIsMe = 0');
   if (!includeGone) where.push('goneAt IS NULL');
-  return page(db, { prefix: REPLIED_CTE, cols: COMMENT_COLS, from: 'comments c', where, params, key: "coalesce(c.createdAt, '')", desc: true, limit, cursor, map: toComment });
+  return page(db, { prefix: REPLIED_CTE, cols: COMMENT_COLS, from: 'comments c', where, params, key: "coalesce(c.createdAt, '')", desc: true, limit, cursor, map: compact ? (r) => toCompactComment(toComment(r)) : toComment });
 }
 
 const workBrief = (db, workId) => {
@@ -120,9 +126,13 @@ const workBrief = (db, workId) => {
 /**
  * 整楼嵌套树。所在楼的一楼不在库里时 root 是占位（missing: true）。
  * partial：作品标了楼中楼不全，或这楼里有 parent 不在库里的评论（被删的楼中楼，子评论只能挂到一楼），或一楼缺失。
+ * compact：改成扁平列表（先序：一楼、再按时间逐个子树），每条见 toCompactComment；total 是楼里的条数（含一楼）。
+ *   around（评论 id）+ n：只取目标前后各 n 条（默认 5，最多 50），一楼总在第一条；omitted 是没给出的条数。
  */
-export function getCommentThread(db, commentId) {
+export function getCommentThread(db, commentId, { compact = false, around, n } = {}) {
   splitId(commentId, 'commentId');
+  if (around != null && !compact) throw new Error('around 只能和 compact: true 一起用');
+  if (n != null && around == null) throw new Error('n 只能和 around 一起用');
   const hit = db.prepare('SELECT rootId, workId FROM comments WHERE id = ?').get(commentId);
   if (!hit) throw new Error(`没有这条评论：${commentId}`);
   const rows = db.prepare(`${REPLIED_CTE} SELECT ${COMMENT_COLS} FROM comments c WHERE c.rootId = ? OR c.id = ? ORDER BY coalesce(c.createdAt, ''), c.id`).all(hit.rootId, hit.rootId);
@@ -130,14 +140,27 @@ export function getCommentThread(db, commentId) {
   let root = nodes.get(hit.rootId);
   if (!root) root = { id: hit.rootId, missing: true, children: [] };
   let orphan = false;
-  for (const n of nodes.values()) {
-    if (n === root) continue;
-    const parent = nodes.get(n.parentId);
+  for (const node of nodes.values()) {
+    if (node === root) continue;
+    const parent = nodes.get(node.parentId);
     if (!parent) orphan = true;
-    (parent ?? root).children.push(n);
+    (parent ?? root).children.push(node);
   }
   const flag = db.prepare('SELECT partial FROM thread_partial WHERE workId = ?').get(hit.workId);
-  return { work: workBrief(db, hit.workId), partial: flag?.partial === 1 || orphan || !!root.missing, root };
+  const partial = flag?.partial === 1 || orphan || !!root.missing;
+  if (!compact) return { work: workBrief(db, hit.workId), partial, root };
+  const flat = [];
+  const walk = (node) => { flat.push(node.missing ? { id: node.id, missing: true } : toCompactComment(node)); node.children.forEach(walk); };
+  walk(root);
+  const out = { work: workBrief(db, hit.workId), partial, total: flat.length, items: flat };
+  if (around == null) return out;
+  splitId(around, 'around');
+  const at = flat.findIndex((c) => c.id === around);
+  if (at < 0) throw new Error(`around 不在这栋楼里：${around}`);
+  const k = n == null ? 5 : checkLimit(n, 50, 'n');
+  const from = Math.max(1, at - k), to = Math.min(flat.length, at + k + 1);
+  const items = at === 0 ? flat.slice(0, to) : [flat[0], ...flat.slice(from, to)];
+  return { ...out, items, omitted: flat.length - items.length };
 }
 
 // ---------- 私信 ----------
@@ -171,7 +194,20 @@ const EVENT_COLS = `e.*, coalesce((SELECT max(attempts) FROM event_deliveries d 
   (SELECT max(lastAttemptAt) FROM event_deliveries d WHERE d.eventId = e.id) AS lastAttemptAt,
   (SELECT min(deliveredAt) FROM event_deliveries d WHERE d.eventId = e.id) AS deliveredAt`;
 
-export function listEvents(db, { types, platforms, unhandled, since, cursor, limit } = {}) {
+// compact 事件：评论事件按库里的评论补 isMe、replyTo、depth；subjectId 留着，回复时要用
+function compactEvent(db) {
+  const get = db.prepare('SELECT depth, authorIsMe, replyToNickname FROM comments WHERE id = ?');
+  return (r) => {
+    const p = json(r.payload) ?? {};
+    const c = r.type === 'comment.created' && r.subjectId ? get.get(r.subjectId) : null;
+    return {
+      id: r.id, type: r.type, subjectId: r.subjectId, author: p.nickname ?? null, isMe: c ? c.authorIsMe === 1 : false,
+      replyTo: c?.replyToNickname ?? null, text: p.text ?? null, at: r.createdAt, depth: c?.depth ?? null,
+    };
+  };
+}
+
+export function listEvents(db, { types, platforms, unhandled, since, cursor, limit, compact = false } = {}) {
   const where = [], params = [];
   if (types != null) {
     if (!Array.isArray(types) || !types.length) throw new Error('types 要是非空数组');
@@ -181,7 +217,7 @@ export function listEvents(db, { types, platforms, unhandled, since, cursor, lim
   if (unhandled != null) where.push(unhandled ? 'handledAt IS NULL' : 'handledAt IS NOT NULL');
   const s = checkTime(since, 'since');
   if (s) { where.push('createdAt >= ?'); params.push(s); }
-  return page(db, { cols: EVENT_COLS, from: 'events e', where, params, key: 'e.createdAt', desc: false, limit, cursor, map: (r) => toEvent(r) });
+  return page(db, { cols: EVENT_COLS, from: 'events e', where, params, key: 'e.createdAt', desc: false, limit, cursor, map: compact ? compactEvent(db) : (r) => toEvent(r) });
 }
 
 /** 回执。同一事件可以再回执一次（例如 pending_human 之后人工回复了改成 replied），以最后一次为准。 */

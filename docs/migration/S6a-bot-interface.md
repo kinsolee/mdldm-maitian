@@ -35,18 +35,28 @@ MCP 客户端配置示例（JSON 形式，各平台字段名可能不同）：
 |---|---|---|
 | `list_accounts` | — | Account[]：`loginState`、`capabilities`、`lastSync`（各 kind 最近一次抓取成功的时间） |
 | `inbox` | `platforms?` | 每个平台的 `unhandledEvents`、`unreadConversations`、`unrepliedComments` |
-| `list_events` | `types?`、`platforms?`、`unhandled?`、`since?`、`cursor?`、`limit?` | Event[]，旧的在前 |
+| `list_events` | `types?`、`platforms?`、`unhandled?`、`since?`、`cursor?`、`limit?`、`compact?` | Event[]，旧的在前。`compact` 的返回见下 |
 | `ack_event` | `eventId`、`outcome`、`note?` | `{ eventId, handled }` |
 | `subscribe_events` | `subscriberId`、`url`、`types[]`、`platforms?` | 见第 2 节 |
 | `unsubscribe_events` | `subscriberId` | `{ subscriberId, active: false }` |
 | `list_works` | `platforms?`、`since?`、`until?`、`cursor?`、`limit?` | Work[]，新的在前（按 `postTime`） |
 | `get_work` | `workId` | `{ work, samples: [], topComments }`。`topComments` 是最新的 20 条一楼评论。`samples` 等 S3 上线后才有数据 |
 | `get_work_flow` | `workId`、`hours?` | `{ workId, hours: [], note }`。流速数据等 S5 上线后才有 |
-| `list_comments` | `workId?`、`platforms?`、`since?`、`replied?`、`includeGone?`、`cursor?`、`limit?` | 扁平的 Comment[]，新的在前 |
-| `get_comment_thread` | `commentId` | `{ work: { id, title, url }, partial, root }`。`root` 是整楼的嵌套树，每个节点有 `children` |
+| `list_comments` | `workId?`、`platforms?`、`since?`、`replied?`、`includeGone?`、`cursor?`、`limit?`、`compact?` | 扁平的 Comment[]，新的在前。`compact` 的返回见下 |
+| `get_comment_thread` | `commentId`、`compact?`、`around?`、`n?` | `{ work: { id, title, url }, partial, root }`。`root` 是整楼的嵌套树，每个节点有 `children`。`compact` 的返回见下 |
 | `list_conversations` | `platforms?`、`unread?`、`lastBy?`（`me` 或 `peer`）、`since?`、`cursor?`、`limit?` | Conversation[]，最近的在前 |
 | `get_conversation` | `conversationId`、`limit?` | `{ conversation, messages }`。`messages` 是最近 `limit` 条，旧的在前 |
 | `refresh_now` | `kind`（`comments` 或 `dms`）、`platform`（只接受 `Douyin`、`Channels`、`XiaoHongShu`、`Bili`，其他平台报错） | `{ jobId, deduped, status }`。同一平台同一 kind 已经有在排队或在跑的任务，或者 5 分钟内刚结束过一次（成功、跳过、失败都算）时，不新建任务，返回那条任务（`deduped: true`）。守护进程崩溃时留下的任务，开始 30 分钟后还没收尾就会记成失败（`error` 写「遗留的 running 任务已回收」），之后再调 `refresh_now` 会新建任务 |
+
+### compact 模式
+
+`get_comment_thread`、`list_comments`、`list_events` 传 `compact: true` 时，返回扁平的精简列表，JSON 不缩进。不传时返回内容不变。回评官判断「要不要回、回谁」用 compact 就够了，比完整版少约 80% 字符（库里最大的 5 栋楼实测 77,927 → 16,547 字符）。
+
+- 每条评论只有 `id`、`author`（昵称）、`isMe`、`replyTo`（被回复的人的昵称，没有为 `null`）、`text`、`at`（评论时间）、`depth`。已被删的评论多一个 `gone: true`。
+- `get_comment_thread` 返回 `{ work, partial, total, items }`。`items` 按先序排：一楼在前，然后逐条回复和它下面的回复，同级按时间。`total` 是整栋楼的条数，含一楼。一楼不在库里时，第一条是 `{ id, missing: true }`。
+- `get_comment_thread` 再加 `around: <评论 id>` 时，只返回这条评论前后各 `n` 条（`n` 默认 5，最多 50）。一楼总是第一条。返回里多一个 `omitted`，是没返回的条数。`around` 必须在这栋楼里，并且要和 `compact: true` 一起用；`n` 要和 `around` 一起用。`partial` 的含义不变，只表示麦田的数据是否完整，和 `around` 截掉多少无关。
+- `list_events` 的每条是 `id`、`type`、`subjectId`、`author`、`isMe`、`replyTo`、`text`、`at`（事件时间）、`depth`。`subjectId` 是回复时要用的评论或会话 id。评论事件的 `isMe`、`replyTo`、`depth` 取自库里的评论；私信和其他事件的 `depth` 为 `null`。
+- 分页（`cursor`、`nextCursor`）和过滤条件都和完整版一样。
 
 评论字段的含义：
 
