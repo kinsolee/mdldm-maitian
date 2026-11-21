@@ -158,10 +158,20 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
       untouched(x);
       assert.deepEqual(x.probe.mine, [{ cid: 'n1', text: TEXT, reply_id: 'c1', reply_to_reply_id: '0' }]);
     });
-    test('回复一楼：没有可抄的写接口响应时，从页面渲染出的新回复回读', async () => {
+    test('没有写接口响应、页面上的新回复看不出回的是谁：不算 sent（needs_readback）', async () => {
       const x = await reply('okdom');
-      assertSent(x, 'n1');
+      assertNotReadBack(x);
       untouched(x);
+    });
+    test('楼中楼没抓到接口、楼里有我一条看不出回谁的回复：thread-incomplete，不发', async () => {
+      const x = await reply('nocapsub', sub);
+      assertNoSend(x, 'thread-incomplete');
+      assert.deepEqual(x.probe.boxes, []);
+    });
+    test('点「回复」后打开的是别的评论的框：no-input-box，不往那个框里写', async () => {
+      const x = await reply('otherbox');
+      assertNoSend(x, 'no-input-box');
+      assert.deepEqual(x.probe.boxes, ['']);
     });
     test('回复楼中楼：展开后找到那条楼中楼自己的「回复」', async () => {
       const x = await reply('ok', sub);
@@ -206,7 +216,8 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
       assertSent(x, 'new1');
       assert.equal(x.r.uidSeen, 'v2_me');
       assert.equal(x.probe.likeClicks, 0);
-      assert.deepEqual(x.probe.mine, [{ commentId: 'new1', text: TEXT, replyCommentId: null }]);
+      assert.equal(x.probe.hiddenClicks, 0);
+      assert.deepEqual(x.probe.mine, [{ commentId: 'new1', text: TEXT, replyCommentId: 'cc1' }]);
     });
     test('回复二楼：回复对象是那条二楼', async () => {
       const x = await reply('ok', { commentId: 'cc1r1', parentId: 'cc1', authorNickname: '乙', commentText: '二楼一条' });
@@ -222,6 +233,8 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
     test('输入框内容不一致：input-mismatch，框已清空', async () => { const x = await reply('mangle'); assertNoSend(x, 'input-mismatch'); assertCleared(x); });
     test('点了发送但回读不到', async () => { const x = await reply('silent'); assertNotReadBack(x); assert.equal(x.r.sendError, undefined); });
     test('页面报错：sendError', async () => { const x = await reply('fail'); assertNotReadBack(x); assert.match(x.r.sendError, /回复失败/); });
+    // 2026-11-21 真实页面：发送按钮是 .create-ft 里文字「评论」的 tag-wrap，没字时带 disabled class
+    test('输入后「评论」仍是 disabled：cannot-send，框已清空，不点', async () => { const x = await reply('locked'); assertNoSend(x, 'cannot-send'); assertCleared(x); assert.equal(x.probe.hiddenClicks, 0); });
 
     test('私信：只点一次发送、回读到一条', async () => {
       const x = await dm('ok');

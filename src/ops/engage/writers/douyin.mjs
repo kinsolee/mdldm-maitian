@@ -66,14 +66,15 @@ const __pickCid = (p) => { const c = __pickComment(p); if (c) return String(c.ci
 const __GONE = /^(该评论已(被)?删除|评论已(被)?删除)/;
 `;
 
-/** 评论对象 → 比对用的形状。root：所在楼的一楼（一楼自己为 null）；to：直接回复的那条（回复一楼时为 null）。 */
+/** 评论对象 → 比对用的形状。root：所在楼的一楼（一楼自己为 null）；to：直接回复的那条（回复一楼时为 null）；
+ *  toKnown：知不知道直接回复的是谁。接口对象带 reply_to_reply_id（"0" 是回一楼），页面视图模型没有，为 false。 */
 export function slimComment(c) {
   const s = (v) => (v == null || String(v) === '0' || v === '' ? null : String(v));
-  return { id: String(c.cid), uid: c.user?.uid != null ? String(c.user.uid) : null, text: c.text ?? '', root: s(c.reply_id), to: s(c.reply_to_reply_id),
+  return { id: String(c.cid), uid: c.user?.uid != null ? String(c.user.uid) : null, text: c.text ?? '', root: s(c.reply_id), to: s(c.reply_to_reply_id), toKnown: c.reply_to_reply_id != null,
     aweme: s(c.aweme_id), total: Number.isFinite(Number(c.reply_comment_total)) && c.reply_comment_total != null ? Number(c.reply_comment_total) : null };
 }
-/** 直接回复的对象：楼中楼回复楼中楼时是 to，回复一楼时是 root；一楼自己为 null。 */
-export const directTo = (x) => x.to ?? x.root ?? null;
+/** 直接回复的对象：楼中楼回复楼中楼时是 to，回复一楼时是 root；一楼自己、以及楼中楼不知道回的是谁时为 null。 */
+export const directTo = (x) => (x.root == null ? null : x.to ?? (x.toKnown ? x.root : null));
 
 const COMMENTS_SRC = FIBER + `const out = {};
   for (const el of document.querySelectorAll('[class*=comment], [class*=reply], [class*=operations-]')) {
@@ -97,7 +98,7 @@ async function comments(page) {
   // 页面上的在前、接口响应在后：同一条两边都有时接口的字段盖过页面的（视图模型缺 reply_to_reply_id、aweme_id）
   for (const c of [...list, ...fromCap]) { const x = slimComment(c); m.set(x.id, { ...m.get(x.id), ...Object.fromEntries(Object.entries(x).filter(([, v]) => v != null)) }); }
   for (const id of gone) if (m.has(id)) m.get(id).gone = true;
-  return [...m.values()].map((x) => ({ root: null, to: null, uid: null, aweme: null, total: null, gone: false, ...x }));
+  return [...m.values()].map((x) => ({ root: null, to: null, toKnown: false, uid: null, aweme: null, total: null, gone: false, ...x }));
 }
 
 // 回复框所在 reply-content- 里唯一的、可点的「发送」button（没字时页面给它 disabled，点了没反应却会被记成点过发送）
@@ -140,6 +141,9 @@ async function prepareReply({ page, params, t, me }) {
   const mine = (x) => x.uid != null && x.uid === String(me.uid);
   const prior = list.find((x) => mine(x) && x.id !== id && directTo(x) === id);
   if (prior) return { blocked: 'already-replied', detail: `评论 ${id} 下已有我的回复 ${prior.id}` };
+  // 楼里有我的回复、但只从页面视图模型读到（没抓到楼中楼接口），不知道它回的是谁：可能就是回目标的，不发
+  const unsure = list.find((x) => mine(x) && x.id !== id && x.root === root && !x.toKnown);
+  if (unsure) return { blocked: 'thread-incomplete', detail: `楼 ${root} 里有我的回复 ${unsure.id}，但读不到它回的是哪条，判断不了是否已回复，没发` };
   // 展开到上限还没加载全：看不到的那部分可能有我的旧回复，不发
   const r = list.find((x) => x.id === root);
   const loaded = list.filter((x) => x.root === root).length;
@@ -153,11 +157,11 @@ async function prepareReply({ page, params, t, me }) {
     .find((e) => (e.textContent || '').replace(/\\s+/g, '') === '回复' && __findUp(e, __pickCid) === arg) || null;`, id);
   if (!found) return { blocked: 'target-not-found', detail: `找到了评论 ${id}，但没找到它的「回复」按钮` };
   await page.click(markSel('reply'), { label: 'open reply box' });
-  // 只认 reply-content- 里的框：优先挂在目标评论下的那个，否则页面上唯一的那个
+  // 只认 reply-content- 里、按 fiber 属于目标评论的那个框；页面上开着的是别人的框（点偏了）就不写
   const box = await waitFor(() => mark(page, 'box', FIBER + `const all = [...document.querySelectorAll('[class*=reply-content-] [contenteditable=true]')].filter((e) => e.getClientRects().length);
     const own = all.filter((e) => __findUp(e, __pickCid) === arg);
-    return own.length === 1 ? own[0] : all.length === 1 ? all[0] : null;`, id), t.boxMs);
-  if (!box) return { blocked: 'no-input-box', detail: '点了「回复」后没出现唯一的回复框（[class*=reply-content-] [contenteditable=true]）' };
+    return own.length === 1 ? own[0] : null;`, id), t.boxMs);
+  if (!box) return { blocked: 'no-input-box', detail: '点了「回复」后没出现属于这条评论的唯一回复框（[class*=reply-content-] [contenteditable=true]）' };
   return {
     send: SEND,
     items: async () => (await comments(page)).map((x) => ({ id: x.id, mine: mine(x), rel: directTo(x) === id, text: x.text })),

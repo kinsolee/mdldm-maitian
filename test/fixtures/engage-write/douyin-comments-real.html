@@ -30,7 +30,7 @@
   模式（?mode=）：ok 发出后渲染我的回复并有写接口响应 | okdom 发出后只渲染、没有可抄的写接口响应
     | fail 弹「回复失败」 | silent 点了没反应 | mangle 输入后框里内容被改 | locked 输入后「发送」仍是 disabled
     | gone 目标评论显示已删除 | replied 一楼下已有我的直接回复 | otherreply 我在这楼里回过楼中楼乙（不是直接回一楼）
-    | nouid 页面读不到登录账号
+    | nouid 页面读不到登录账号 | nocapsub 楼中楼直接渲染、没抓到楼中楼接口 | otherbox 点「回复」后打开的是别的评论的框
 -->
 <div class="content-wWJcbN"><div class="wrap-NeUN4f"><div class="container-caZWO6"><div class="input-d24X73" contenteditable="true" placeholder="有爱评论，说点好听的~" id="top-box"></div></div>
   <div class="footer-oZJTJd"><div class="right-zLR6K3"><button class="douyin-creator-interactive-button" disabled type="button"><span class="douyin-creator-interactive-button-content">发送</span></button></div></div></div></div>
@@ -53,6 +53,9 @@ const subs = { c1: [C('c1r1', '502', '乙', '楼中楼一条', { reply_id: 'c1' 
 if (mode === 'replied') { roots[0].reply_comment_total = 2; subs.c1.push(C('c1me', ME, '麦田测试号', '之前回过了', { reply_id: 'c1' })); }
 if (mode === 'otherreply') { roots[0].reply_comment_total = 2; subs.c1.push(C('c1me', ME, '麦田测试号', '回乙的', { reply_id: 'c1', reply_to_reply_id: 'c1r1' })); }
 const expanded = {};
+// nocapsub：楼中楼一开始就渲染出来了，页面没发 comment/list/reply（抓不到接口里的 reply_to_reply_id），楼里有我回楼中楼乙的一条
+if (mode === 'nocapsub') { roots[0].reply_comment_total = 2; subs.c1.push(C('c1me', ME, '麦田测试号', '回乙的', { reply_id: 'c1', reply_to_reply_id: 'c1r1' })); expanded.c1 = true; }
+const blocks = {};
 // 页面加载时自己拉的一楼列表
 cap.push({ url: API + 'read/aweme/v1/web/comment/list/select/', t: Date.now(), body: JSON.stringify({ status_code: 0, comments: roots, has_more: 0 }) });
 
@@ -87,7 +90,9 @@ function item(c) {
   const chainOf = (btn) => [{ className: btn.className, onClick() {} }, { className: ops.className }, { className: '' }, opsProps(c), {}, { className: 'content' }, {}, itemProps(c)];
   for (const b of ops.children) fiberize(b, chainOf(b));
   fiberize(ops, chainOf(ops).slice(1));
-  ops.querySelector('[data-op=reply]').onclick = () => openReply(ops.parentElement, c);
+  blocks[c.cid] = ops.parentElement;
+  // otherbox：点 c1 的「回复」，页面却打开了 c2 的回复框（点偏、或 c2 的框原本就开着）
+  ops.querySelector('[data-op=reply]').onclick = () => (mode === 'otherbox' && c.cid === 'c1' ? openReply(blocks.c2, roots[1]) : openReply(ops.parentElement, c));
   ops.querySelector('[data-op=delete]').onclick = () => { deleteClicks++; };
   ops.querySelector('[data-op=report]').onclick = () => { reportClicks++; };
   return el;

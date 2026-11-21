@@ -5,7 +5,9 @@
 //   回复：左侧作品列表组件的 commentFeeds 找到 objectNonce（或 objectId）等于 workId 的作品点开，
 //        读 .comment-item 的 __vue__.$props.dataSource（二楼同时在一楼的 levelTwoComment 里），找不到就点「展开更多回复」（只读）。
 //        「已有我的回复」：昵称是我、直接回复的是目标（replyCommentId 是它；嵌在它 levelTwoComment 里且没有 replyCommentId 也算）。
-//        回复入口 .weui-icon-outlined-comment，输入框 textarea.create-input。
+//        回复入口 .weui-icon-outlined-comment，输入框 textarea.create-input（只认挂在目标 .comment-item 里的那个）。
+//        发送按钮（2026-11-21 真实页面只读核对）：输入框所在 .comment-create-content 里 .create-ft 下文字为「评论」的 .tag-wrap
+//        （div，不是 button，文字也不是「发送」）；框里没字时它的 class 带 disabled，有字后去掉。
 //   私信：.session-wrap 往上的 Vue 实例 $data.sessionList（同读适配器）；messageList 取 ts 最大的判最后一句
 //        （fromUsername == sessionInfo.username 是对方）。输入框 textarea.edit_area。
 // 不点 .like-action、不置顶、不删除。
@@ -66,6 +68,11 @@ const items = async (page) => (await inShadow(page, ITEMS_SRC)) ?? [];
 /** 直接回复的对象：replyCommentId，没有就看嵌在哪条一楼下；一楼自己为 null。 */
 export const directTo = (x) => x.reply ?? x.root ?? null;
 
+// 回复框旁唯一的、没 disabled 的「评论」tag-wrap
+const SEND = `const box = __marked('box'); const wrap = box && box.closest('.comment-create-content'); if (!wrap) return null;
+  const hits = [...wrap.querySelectorAll('.create-ft .tag-wrap')].filter((e) => (e.innerText || e.textContent || '').trim() === '评论');
+  return hits.length === 1 && !hits[0].classList.contains('disabled') ? hits[0] : null;`;
+
 const myNickOf = (me, params) => me.nickname ?? params.nickname ?? null;
 
 async function prepareReply({ page, params, t, me }) {
@@ -112,10 +119,10 @@ async function prepareReply({ page, params, t, me }) {
   const box = await waitFor(() => mark(page, 'box', `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
     const all = [...sr.querySelectorAll('textarea.create-input')].filter((e) => e.getClientRects().length);
     const own = all.filter((e) => String(e.closest('.comment-item')?.__vue__?.$props?.dataSource?.commentId) === arg);
-    return own.length === 1 ? own[0] : all.length === 1 ? all[0] : null;`, id), t.boxMs);
-  if (!box) return { blocked: 'no-input-box', detail: '点了回复后没出现唯一的回复框（textarea.create-input）' };
+    return own.length === 1 ? own[0] : null;`, id), t.boxMs);
+  if (!box) return { blocked: 'no-input-box', detail: '点了回复后没出现属于这条评论的唯一回复框（textarea.create-input）' };
   return {
-    send: sendNearBox('^(发送|回复)$', 3),
+    send: SEND,
     items: async () => (await items(page)).map((x) => ({ id: x.id, mine: x.nick === myNick, rel: directTo(x) === id, text: x.text })),
   };
 }

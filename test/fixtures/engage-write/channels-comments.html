@@ -2,20 +2,34 @@
 <html lang="zh">
 <head><meta charset="utf-8"><title>视频号互动管理-评论（写入测试页）</title></head>
 <body>
-<!-- 仿 S0：业务页面在 wujie 微前端的开放 shadowRoot 里，组件数据挂在元素的 __vue__ 上 -->
+<!--
+  仿 S0：业务页面在 wujie 微前端的开放 shadowRoot 里，组件数据挂在元素的 __vue__ 上。
+  评论块结构仿 2026-11-21 在视频号助手评论管理页上只读导出的结构（昵称、正文换成占位）：
+  - .comment-item > .comment-item-main > .comment-main-content > { .comment-row（昵称、时间）, .comment-row（正文 + .comment-actions）, .comment-reply-list }
+  - 操作区 .action-list：点赞 .like-action、回复 .weui-icon-outlined-comment（tooltip「回复」）、删除（popover 里藏着「取消」「删除」button）、
+    更多（popover 里藏着「置顶」「投诉」，还有一个藏着「取消」「替换置顶」button 的对话框）。这些隐藏按钮写入时绝不能碰。
+  - 二楼嵌在一楼的 .comment-reply-list 里，也是 .comment-item；dataSource 带 replyCommentId（回一楼的也带，等于一楼 id）。
+  - 点回复后，那条评论的 .comment-reply-list 里出现 .comment-create-wrap > .comment-create-content >
+      { .create-hd（我的昵称）, .input-area > textarea.create-input, .create-ft > { .tag-wrap.cancel「取消」, .tag-wrap.primary「评论」 } }。
+    框里没字时「评论」那个 tag-wrap 的 class 里多一个 disabled，有字后去掉。发送按钮的文字是「评论」，不是「发送」，也不是 button。
+  模式（?mode=）：ok | fail | silent | mangle | gone | replied | nouid | stuck | locked（输入后「评论」仍是 disabled）
+-->
 <wujie-app></wujie-app>
 <script>
-// 模式（?mode=）：ok | fail | silent | mangle | gone | replied | nouid
 const mode = new URLSearchParams(location.search).get('mode') || 'ok';
 const ME_NICK = '麦田测试号';
 if (mode !== 'nouid') window.__loginUser = { uniqId: 'v2_me', nickname: ME_NICK };
-let sendClicks = 0, likeClicks = 0, seq = 0, current = 'n1';
+let sendClicks = 0, likeClicks = 0, hiddenClicks = 0, seq = 0, current = 'n1';
 const sr = document.querySelector('wujie-app').attachShadow({ mode: 'open' });
 sr.innerHTML = `<style>
   .comment-feed-wrap { padding: 6px; border-bottom: 1px solid #eee; cursor: pointer; }
   .comment-item { padding: 6px; border-bottom: 1px solid #eee; }
-  .weui-icon-outlined-comment { display: inline-block; width: 18px; height: 18px; background: #ccc; cursor: pointer; }
-  .like-action { margin-left: 12px; }
+  .comment-reply-list { margin-left: 32px; }
+  .action-list { display: flex; gap: 12px; }
+  .action-icon { display: inline-block; width: 18px; height: 18px; background: #ccc; cursor: pointer; }
+  .weui-desktop-popover, .weui-desktop-dialog__wrp { display: none; }
+  .tag-wrap { display: inline-block; padding: 2px 8px; cursor: pointer; }
+  .tag-wrap.disabled { opacity: .4; }
   textarea { width: 300px; }
   .weui-desktop-toast { position: fixed; top: 4px; right: 4px; }
 </style><div class="page"><div class="feeds-col"></div><div class="comments-col"></div><div class="toast-holder"></div></div>`;
@@ -27,9 +41,9 @@ const feeds = [
 const C = (commentId, nick, text, extra = {}) => ({ commentId, commentNickname: nick, commentContent: text, commentCreatetime: String(now - 600), commentLikeCount: 0, levelTwoComment: [], ...extra });
 const comments = {
   n1: [C('x1', '丁', '作品一的评论')],
-  n2: [C('cc1', '甲', '视频号评论一', { levelTwoComment: [C('cc1r1', '乙', '二楼一条')] }), C('cc2', '丙', '视频号评论二')],
+  n2: [C('cc1', '甲', '视频号评论一', { levelTwoComment: [C('cc1r1', '乙', '二楼一条', { replyCommentId: 'cc1' })] }), C('cc2', '丙', '视频号评论二')],
 };
-if (mode === 'replied') comments.n2[0].levelTwoComment.push(C('cc1me', ME_NICK, '之前回过了'));
+if (mode === 'replied') comments.n2[0].levelTwoComment.push(C('cc1me', ME_NICK, '之前回过了', { replyCommentId: 'cc1' }));
 
 const feedsCol = sr.querySelector('.feeds-col');
 feedsCol.__vue__ = { commentFeeds: feeds };
@@ -46,31 +60,54 @@ function item(c) {
   el.className = 'comment-item';
   el.__vue__ = { $props: { dataSource: c } };
   const gone = mode === 'gone' && c.commentId === 'cc1';
-  el.innerHTML = `<span class="nick">${c.commentNickname}</span>：<span class="content">${gone ? '该评论已删除' : c.commentContent}</span>
-    <div class="ops"><i class="weui-icon-outlined-comment" title="回复"></i><span class="like-action">赞</span></div>`;
+  el.innerHTML = `<div class="comment-item-main"><img class="comment-avatar"><div class="comment-main-content">
+    <div class="comment-row"><span class="comment-user-name">${c.commentNickname}</span><span class="comment-time">2026/11/18</span></div>
+    <div class="comment-row align-end"><div class="comment-row__main"><span class="comment-content">${gone ? '该评论已删除' : c.commentContent}</span></div>
+      <div class="comment-actions"><div class="action-list">
+        <div class="action-item like-action"><div class="weui-desktop-tooltip__wrp"><span class="weui-desktop-tooltip">点赞</span></div></div>
+        <div class="action-item"><div class="weui-desktop-tooltip__wrp"><span class="action-icon weui-icon-outlined-comment"></span><span class="weui-desktop-tooltip">回复</span></div></div>
+        <div class="action-item"><div class="weui-desktop-popover__wrp"><span class="action-icon weui-icon-outlined-delete"></span>
+          <div class="weui-desktop-popover"><div class="dialog-ft"><div class="weui-desktop-btn_wrp cancel"><button type="button" class="weui-desktop-btn">取消</button></div><div class="weui-desktop-btn_wrp"><button type="button" class="weui-desktop-btn weui-desktop-btn_primary">删除</button></div></div></div></div></div>
+        <div class="action-item"><div class="weui-desktop-popover__wrp"><span class="action-icon weui-icon-outlined-more"></span>
+          <div class="weui-desktop-popover"><div class="menu-item">置顶</div><div class="menu-item">投诉</div></div></div>
+          <div class="common-dialog"><div class="weui-desktop-dialog__wrp"><div class="footer"><div class="weui-desktop-btn_wrp cancel"><button type="button" class="weui-desktop-btn">取消</button></div><div class="weui-desktop-btn_wrp"><button type="button" class="weui-desktop-btn weui-desktop-btn_primary">替换置顶</button></div></div></div></div></div>
+      </div></div></div>
+    <div class="comment-reply-list"></div>
+  </div></div>`;
   el.querySelector('.weui-icon-outlined-comment').onclick = () => openReply(el, c);
   el.querySelector('.like-action').onclick = () => { likeClicks++; };
+  for (const h of el.querySelectorAll('.weui-desktop-popover *, .common-dialog *')) h.addEventListener('click', (e) => { e.stopPropagation(); hiddenClicks++; });
+  const rl = el.querySelector('.comment-reply-list');
+  for (const r of c.levelTwoComment || []) rl.appendChild(item(r));
   return el;
 }
 
 function render() {
   const col = sr.querySelector('.comments-col');
   col.innerHTML = '';
-  // 仿 S6a：二楼同时在一楼的 levelTwoComment 里，也单独渲染成一个 .comment-item
-  for (const c of comments[current]) { col.appendChild(item(c)); for (const r of c.levelTwoComment) col.appendChild(item(r)); }
+  for (const c of comments[current]) col.appendChild(item(c));
   // stuck：还有没展开的回复（我的旧回复藏在里面），「展开更多回复」点了没反应
   if (mode === 'stuck') { const m = document.createElement('div'); m.className = 'more'; m.innerHTML = '<span>展开更多回复</span>'; col.appendChild(m); }
 }
 
 function openReply(el, c) {
-  sr.querySelectorAll('.reply-box').forEach((x) => x.remove());
-  const box = document.createElement('div');
-  box.className = 'reply-box';
-  box.innerHTML = `<textarea class="create-input" placeholder="回复 ${c.commentNickname}"></textarea><div class="btn-row"><button class="weui-desktop-btn weui-desktop-btn_primary">发送</button></div>`;
-  el.appendChild(box);
-  const ta = box.querySelector('textarea');
-  if (mode === 'mangle') ta.addEventListener('input', () => { if (!ta.dataset.m) { ta.dataset.m = '1'; ta.value = ta.value + '！'; } });
-  box.querySelector('button').onclick = () => onSend(c, ta);
+  sr.querySelectorAll('.comment-create-wrap').forEach((x) => x.remove());
+  const wrap = document.createElement('div');
+  wrap.className = 'comment-create-wrap';
+  wrap.innerHTML = `<img class="avatar"><div class="comment-create-content">
+    <div class="create-hd"><div class="author-name">${ME_NICK}</div><div class="bandage">作者</div></div>
+    <div class="input-area"><textarea class="create-input" placeholder="回复 ${c.commentNickname}：" rows="1"></textarea><div class="emoji-area"></div></div>
+    <div class="create-ft"><div class="tag-wrap cancel default"><div class="tag-inner">取消</div></div><div class="tag-wrap disabled primary"><div class="tag-inner">评论</div></div></div>
+  </div>`;
+  el.querySelector('.comment-reply-list').prepend(wrap);
+  const ta = wrap.querySelector('textarea');
+  const send = wrap.querySelector('.tag-wrap.primary');
+  ta.addEventListener('input', () => {
+    if (mode === 'mangle' && !ta.dataset.m) { ta.dataset.m = '1'; ta.value = ta.value + '！'; }
+    send.classList.toggle('disabled', !ta.value.trim() || mode === 'locked');
+  });
+  wrap.querySelector('.tag-wrap.cancel').onclick = () => wrap.remove();
+  send.onclick = () => { if (send.classList.contains('disabled')) return; onSend(c, ta); };
 }
 
 function toast(msg) { sr.querySelector('.toast-holder').innerHTML = `<div class="weui-desktop-toast"><span>${msg}</span></div>`; }
@@ -81,12 +118,12 @@ function onSend(target, ta) {
   if (mode === 'fail') { setTimeout(() => toast('回复失败'), 200); return; }
   if (mode === 'silent') return;
   const root = comments[current].find((c) => c.commentId === target.commentId || c.levelTwoComment.some((r) => r.commentId === target.commentId));
-  const n = C('new' + (++seq), ME_NICK, text, root.commentId === target.commentId ? {} : { replyCommentId: target.commentId });
+  const n = C('new' + (++seq), ME_NICK, text, { replyCommentId: target.commentId });
   setTimeout(() => { root.levelTwoComment.push(n); render(); }, 300);
 }
 
 window.__probe = () => ({
-  sendClicks, likeClicks,
+  sendClicks, likeClicks, hiddenClicks,
   boxes: [...sr.querySelectorAll('textarea.create-input')].map((b) => b.value),
   mine: Object.values(comments).flat().flatMap((c) => c.levelTwoComment).filter((r) => r.commentId.startsWith('new')).map((r) => ({ commentId: r.commentId, text: r.commentContent, replyCommentId: r.replyCommentId ?? null })),
 });
