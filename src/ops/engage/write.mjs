@@ -350,7 +350,11 @@ export async function engageWrite(db, input, deps = {}) {
     if (req.spec.family === 'moderate') { delete params.text; params.selfUids = selfUids(db, req.platformCode); }
     r = await runWriter({ account, params });
   } catch (e) { r = { ok: false, reason: 'threw', error: e?.message ?? String(e) }; }
-  const res = classify(r, account);
+  let res = classify(r, account);
+  // 处置组：调过接口、回读又没确认生效的，一律 needs_readback（含接口报错），换 key 也不再调第二次
+  if (req.spec.family === 'moderate' && res.status === 'failed' && res.sendAttempted) {
+    res = { ...res, status: 'needs_readback', reason: 'send-error-unconfirmed', detail: `${res.detail ?? ''}；接口报错、回读也没确认生效，不再调，请人工去平台上看`.replace(/^；/, '') };
+  }
 
   const fin = tx(db, () => {
     finishAction(db, actionId, res, now);

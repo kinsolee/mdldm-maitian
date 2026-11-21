@@ -171,6 +171,21 @@ describe('B站 delete（假接口）', () => {
     assert.equal(r.readBack.found, true);
   });
 
+  test('X-B2：reply/reply 声明 count=100 却只给了 2 条（不到 20 条就停）→ 没读全：发前 thread-incomplete；回读不算删掉', async () => {
+    const f = fakeBili();
+    const get = f.api.get;
+    f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = '100'; return j; };
+    const r = await deleteComment(f.api, P('delete', { ...sub, commentId: '999' }));
+    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
+    // 发前读全了，回读时声明的 count 对不上（空页）→ 不能说删掉了
+    const g = fakeBili();
+    const get2 = g.api.get;
+    g.api.get = async (url) => { const j = await get2(url); if (url.includes('reply/reply') && j.data && g.posts.length) { j.data.page.count = 100; j.data.replies = []; } return j; };
+    const r2 = await deleteComment(g.api, P('delete', sub));
+    assert.deepEqual([r2.sendAttempted, r2.readBack.found], [true, false]);
+    assert.equal(f.posts.length, 0);
+  });
+
   test('页面里没有 bili_jct：没调接口，sendAttempted:false', async () => {
     const f = fakeBili();
     f.api.post = async () => ({ code: -111, message: '页面里没有 bili_jct，没调接口', noCsrf: true });
@@ -252,6 +267,19 @@ describe('B站 deleteConversation（假接口）', () => {
     const f = fakeBili({ sessions, pageSize: 1 });
     assert.equal((await deleteConversation(f.api, C('777'))).blocked, 'list-incomplete');
     assert.equal(f.posts.length, 0);
+  });
+
+  test('X-B3：get_sessions 给了空页却 has_more=1 → 翻不完：发前 list-incomplete；回读不算删掉', async () => {
+    const f = fakeBili();
+    const get = f.api.get;
+    f.api.get = async (url) => (url.includes('get_sessions') ? { code: 0, data: { session_list: [], has_more: 1 } } : get(url));
+    assert.equal((await deleteConversation(f.api, P('deleteConversation', { conversationId: '777' }))).blocked, 'list-incomplete');
+    assert.equal(f.posts.length, 0);
+    const g = fakeBili();
+    const get2 = g.api.get;
+    g.api.get = async (url) => (url.includes('get_sessions') && g.posts.length ? { code: 0, data: { session_list: [], has_more: 1 } } : get2(url));
+    const r = await deleteConversation(g.api, P('deleteConversation', { conversationId: '777' }));
+    assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false]);
   });
 
   test('接口说成功但会话还在 → found:false；接口报错 → sendError', async () => {

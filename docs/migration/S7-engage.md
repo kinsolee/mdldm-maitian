@@ -240,7 +240,8 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 - 接口只调一次。调过之后出任何错都只回读，不重调。
 - 回读不满足时记 `needs_readback`，**绝不重试**。同一个目标换 key 也会被拦（`target-needs-readback`），人工处理方法同第 4 节。
-- 接口明确报错（`code` 不是 0）时，即使回读看到已生效也记 `failed` / `send-error`。例外：`reply/del` 返回 `12022`（调的时候已经被删了），回读确认不在就算 `sent`。
+- 接口明确报错（`code` 不是 0）时不算生效。和回复组不同，处置组调过接口却没确认生效的，一律记 `needs_readback` / `send-error-unconfirmed`（不记 `failed`），所以换 key 也不会再调第二次。例外：`reply/del` 返回 `12022`（调的时候已经被删了），回读确认不在就算 `sent`。
+- 「读全」要求严格：整楼累计读到的条数要达到接口声明的 `page.count`；会话列表 `has_more` 为真时给了空页、或翻页游标没往前走，都算没翻完。
 
 ### 绝不对自己动手
 
@@ -255,8 +256,7 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 |---|---|
 | `rejected` | `self-target`、`unknown-target`、`ambiguous-target`、`capability-off`、`round-limit`、`lease-busy`、`in-progress`、`unsupported-platform`、`event-mismatch`、`idempotency-key-reused` |
 | `failed`（没调接口） | `already-gone`（评论已不在，或会话已不在列表里；库里已标 `goneAt`、之前已删过的同一目标也是这个）、`already-blocked`（已在黑名单里，或之前已拉黑过这个 mid）、`not-my-work`、`thread-incomplete`、`list-incomplete`、`target-not-found`、`self-target`、`uid-mismatch`、`no-uid`、`login-lost`、`precheck-error`、`send-error`（页面里没有 `bili_jct`）；space：`space-busy`、`space-user-controlled` |
-| `failed`（调了接口） | `send-error` |
-| `needs_readback` | `readback-missing`、`target-needs-readback`、`previous-needs-readback`、`runner-timeout`、`runner-exit-code`、`interrupted` |
+| `needs_readback` | `send-error-unconfirmed`、`readback-missing`、`target-needs-readback`、`previous-needs-readback`、`runner-timeout`、`runner-exit-code`、`interrupted` |
 
 `already-gone`、`already-blocked` 时事件不自动回执，需要时调用方自己 `ack_event`。
 

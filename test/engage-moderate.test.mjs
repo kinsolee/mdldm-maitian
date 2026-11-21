@@ -89,6 +89,31 @@ describe('delete_comment', () => {
     assert.equal(w.calls.length, 0);
   });
 
+  test('X-B1：接口调了但报错、回读也没确认 → needs_readback（不是 failed）；换 key 也不再调第二次', async () => {
+    const w = fakeWriter({ uidSeen: ME, sendAttempted: true, sendError: 'reply/del code=-403 没权限', readBack: { found: false, count: 0 } });
+    const r = await engageWrite(s.db, del(), s.deps(w));
+    assert.deepEqual([r.status, r.reason, r.sendAttempted], ['needs_readback', 'send-error-unconfirmed', true]);
+    const again = await engageWrite(s.db, del({ idempotencyKey: 'k-new' }), s.deps(w));
+    assert.deepEqual([again.status, again.reason], ['needs_readback', 'target-needs-readback']);
+    assert.equal(w.calls.length, 1);
+  });
+
+  test('登记的第二个 B站账号也算我自己：它的评论不删、它不拉黑', async () => {
+    s.db.prepare('INSERT INTO accounts (platformCode, platformName, uid, nickname, profileId, spaceName, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('Bili', 'B站', '5550001', '小号', 'Profile 5', 'kinso/Bili/5550001', '{}');
+    const acct = getAccount(s.db, BILI);
+    ingestSnapshot(s.db, acct, snap('comments', [comment('r1', { uid: '9001' }), comment('a', { parent: 'r1', root: 'r1', uid: '9002' }),
+      comment('m', { parent: 'r1', root: 'r1', uid: ME, isMe: true }), comment('alt', { parent: 'r1', root: 'r1', uid: '5550001' })]), { now: () => T0 + 2 * MIN });
+    const w = fakeWriter(DONE);
+    const d = await engageWrite(s.db, del({ targetId: 'Bili:alt', idempotencyKey: 'k-alt' }), s.deps(w));
+    assert.deepEqual([d.status, d.reason], ['rejected', 'self-target']);
+    for (const [targetId, key] of [['Bili:5550001', 'b1'], ['Bili:alt', 'b2']]) {
+      const b = await engageWrite(s.db, blk({ targetId, idempotencyKey: key }), s.deps(w));
+      assert.deepEqual([b.status, b.reason], ['rejected', 'self-target'], targetId);
+    }
+    assert.equal(w.calls.length, 0);
+  });
+
   test('能力位 deleteComment 关着 → capability-off；只开 block 也删不了', async () => {
     const t = setup({ caps: ['block'] });
     const r = await engageWrite(t.db, del(), t.deps(fakeWriter(DONE)));

@@ -78,11 +78,13 @@ async function thread(api, oid, root) {
     if (GONE_CODES.has(j.code)) return { gone: true, code: j.code };
     if (j.code !== 0) return { error: `reply/reply code=${j.code} ${j.message ?? ''}`.trim() };
     rootNode = j.data?.root ?? rootNode;
-    const count = j.data?.page?.count;
+    const raw = j.data?.page?.count;
+    const count = raw == null || raw === '' ? NaN : Number(raw);
     if (!Array.isArray(j.data?.replies) && !(j.data?.replies === null && count === 0)) return { ok: true, root: rootNode, replies, complete: false };
     const rs = j.data.replies ?? [];
     replies.push(...rs);
-    if (rs.length < 20 || (Number.isFinite(count) && pn * 20 >= count)) return { ok: true, root: rootNode, replies, complete: true };
+    // 读到最后一页：累计条数要够声明的 count 才算读全（count 读不到的按「没读全」）
+    if (rs.length < 20 || (Number.isFinite(count) && pn * 20 >= count)) return { ok: true, root: rootNode, replies, complete: Number.isFinite(count) && replies.length >= count };
   }
   return { ok: true, root: rootNode, replies, complete: false };
 }
@@ -191,8 +193,11 @@ async function findSession(api, talker) {
     if (!Array.isArray(j.data?.session_list)) return { error: 'get_sessions code=0 但缺 data.session_list' };
     const l = j.data.session_list;
     if (l.some((s) => String(s.talker_id) === talker && Number(s.session_type ?? 1) === 1)) return { present: true, complete: true };
-    if (!j.data?.has_more || !l.length) return { present: false, complete: true };
-    endTs = l.at(-1).session_ts;
+    if (!j.data?.has_more) return { present: false, complete: true };
+    // 还有下一页却给了空页、或者翻页游标没往前走：翻不完
+    const next = l.at(-1)?.session_ts;
+    if (!l.length || next == null || String(next) === String(endTs)) return { present: false, complete: false };
+    endTs = next;
     await api.sleep(300);
   }
   return { present: false, complete: false };
