@@ -36,7 +36,7 @@
        | emptydefault（默认作品没有评论）| nopicker（没有「选择作品」按钮）| noload（点了作品后一楼列表一直不来）
        &roots= 每个作品几条一楼（默认 19）&renderDelay= 一楼响应到了之后多久才渲染（默认 0）
        &subsAll=1 每条一楼下都有 1 条楼中楼 &emptyTail=1 最后一页满 10 条时接口仍说 has_more，再翻一页才回空页
-       | nostatus（切过去的作品一楼响应没有 status_code）| nototal（一楼接口和页面都没有楼中楼总数）| slowexpand（点「查看 N 条回复」2 秒后才出来）
+       | nostatus（切过去的作品一楼响应没有 status_code）| nototal（一楼接口和页面都没有楼中楼总数）| nulltotal（楼中楼总数是 null）| slowexpand（点「查看 N 条回复」2 秒后才出来）
        &maskClosable=0 点遮罩不关抽屉（只能点右上角关闭）
        &noCardIds=1 抽屉里的作品卡片 fiber 上没有 item_id_plain（2026-11-21 真实页面偶尔出现的另一个版本，只有页头的当前作品带作品对象）
        &drawerDelay= 打开抽屉后多久出作品列表（默认 3500ms，race 默认 200ms）&listDelay= 默认作品的一楼列表多久到（默认 600ms，race 默认 4000ms）
@@ -80,6 +80,7 @@ function dataOf(w) {
   const subs = {};
   for (const r of roots) if (subsAll || r === roots[0]) { subs[r.cid] = [C(w, `${r.cid}r1`, '599', '乙', '楼中楼一条', { reply_id: r.cid })]; r.reply_comment_total = 1; }
   if (mode === 'nototal') for (const r of roots) delete r.reply_comment_total;
+  if (mode === 'nulltotal') for (const r of roots) r.reply_comment_total = null;
   if (mode === 'replied' && roots[15]) { roots[15].reply_comment_total = 1; subs[`${w}-c15`] = [C(w, `${w}-c15me`, ME, '麦田测试号', '之前回过了', { reply_id: `${w}-c15` })]; }
   return (data[w] = { roots, subs, loaded: 0, done: false, expanded: {} });
 }

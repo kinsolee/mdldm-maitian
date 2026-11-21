@@ -59,9 +59,11 @@ const __asComment = (v) => {
   if (v.id != null && 'content' in v && 'levelOneCid' in v) {
     const one = v.levelOneCid == null || String(v.levelOneCid) === String(v.id);
     return { cid: v.id, text: v.content ?? '', user: v.uid != null ? { uid: v.uid } : null, reply_id: one ? '0' : v.levelOneCid,
-      reply_comment_total: one && v.replyComments && Number.isFinite(Number(v.replyComments.count)) ? Number(v.replyComments.count) : null };
+      reply_comment_total: one && v.replyComments ? __count(v.replyComments.count) : null };
   }
   return null; };
+// 楼中楼总数：只认数字或数字字符串；null、''、布尔值算不知道（Number(null)、Number('') 都是 0）
+const __count = (v) => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) ? Number(v) : null;
 const __pickComment = (p) => __asComment(p) || Object.values(p).map(__asComment).find(Boolean) || null;
 // 元素属于哪条评论：评论对象的 cid，或操作区组件 props 的 cid（按钮、回复框往上先碰到的是它）
 const __pickCid = (p) => { const c = __pickComment(p); if (c) return String(c.cid); return p.cid != null && 'levelOneCid' in p ? String(p.cid) : null; };
@@ -70,10 +72,11 @@ const __GONE = /^(该评论已(被)?删除|评论已(被)?删除)/;
 
 /** 评论对象 → 比对用的形状。root：所在楼的一楼（一楼自己为 null）；to：直接回复的那条（回复一楼时为 null）；
  *  toKnown：知不知道直接回复的是谁。接口对象带 reply_to_reply_id（"0" 是回一楼），页面视图模型没有，为 false。 */
+const countOf = (v) => ((typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) ? Number(v) : null);
 export function slimComment(c) {
   const s = (v) => (v == null || String(v) === '0' || v === '' ? null : String(v));
   return { id: String(c.cid), uid: c.user?.uid != null ? String(c.user.uid) : null, text: c.text ?? '', root: s(c.reply_id), to: s(c.reply_to_reply_id), toKnown: c.reply_to_reply_id != null,
-    aweme: s(c.aweme_id), total: Number.isFinite(Number(c.reply_comment_total)) && c.reply_comment_total != null ? Number(c.reply_comment_total) : null };
+    aweme: s(c.aweme_id), total: countOf(c.reply_comment_total) };
 }
 /** 直接回复的对象：楼中楼回复楼中楼时是 to，回复一楼时是 root；一楼自己、以及楼中楼不知道回的是谁时为 null。 */
 export const directTo = (x) => (x.root == null ? null : x.to ?? (x.toKnown ? x.root : null));
@@ -158,7 +161,7 @@ async function prepareReply({ page, params, t, me }) {
     const sw = await switchTo(page, work, { maxPages: params.maxPickerPages ?? LIMITS.maxPickerPages });
     if (!sw.ok) return { blocked: 'target-not-found', detail: `切不到作品 ${work}：${sw.detail}` };
     const waitMs = Math.min(t.loadMs, 20000);
-    const got = await waitFor(async () => (await selectPages(page, work, from)).pages.length > 0 || (await comments(page)).some((x) => x.aweme === work || x.id === id), waitMs, 1000);
+    const got = await waitFor(async () => { const x = await selectPages(page, work, from); return x.pages.length > 0 || !!x.error || (await comments(page)).some((c) => c.aweme === work || c.id === id); }, waitMs, 1000);
     if (!got) {
       const { error } = await selectPages(page, work, from);
       return { blocked: 'target-not-found', detail: `切到作品 ${work} 后 ${Math.round(waitMs / 1000)} 秒内没加载出它的一楼列表${error ? `（接口 ${error}）` : ''}` };
@@ -197,7 +200,7 @@ async function prepareReply({ page, params, t, me }) {
     const capBefore = await capCount(page), nBefore = list.length;
     if (!(await clickMarked(page, EXPAND_FOR(root, !!r), 'expand comment replies'))) break;
     // 楼中楼接口可能 1 秒以上才回：最多等 3 秒，抓到楼中楼响应或评论变多才算点开了；都没有才标记不再点
-    const grew = await waitFor(async () => (await capturedJson(page, 'comment/list/reply', capBefore)).length > 0 || (await comments(page)).length > nBefore, 3000, 300);
+    const grew = await waitFor(async () => (await capturedJson(page, 'comment/list/reply', capBefore)).some((c) => c.json.status_code === 0 && Array.isArray(c.json.comments) && c.json.comments.length > 0) || (await comments(page)).length > nBefore, 3000, 300);
     if (!grew) await page.evaluate(() => document.querySelector('[data-eng-click]')?.setAttribute('data-eng-dead', '1'));
     await sleep(600);
     list = await comments(page);

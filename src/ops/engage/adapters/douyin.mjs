@@ -96,7 +96,7 @@ const PICKER_SRC = `() => [...document.querySelectorAll('button, [class*=-button
 
 // 抽屉里的作品项：类名会变（实测两个版本），按「发布于」文字找叶子，再沿 fiber 找 props 里的作品对象（item_id_plain）。
 // 只认抽屉（[class*=sidesheet]）里的：页头也显示当前作品的「发布于」，它的 fiber 上也有作品对象（2026-11-21 第二次核对），点它不会切作品。
-const WORK_CARDS = `const cards = () => [...document.querySelectorAll('[class*=sidesheet] *')].filter((el) => el.children.length === 0 && /^发布于/.test(el.textContent.trim())).map((el) => {
+const WORK_CARDS = `const cards = () => [...document.querySelectorAll('[class*=sidesheet] *')].filter((el) => el.children.length === 0 && /^发布于/.test(el.textContent.trim()) && el.getClientRects().length > 0).map((el) => {
     for (let e = el, i = 0; e && i < 8; e = e.parentElement, i++) {
       const k = Object.keys(e).find((k) => k.startsWith('__reactFiber'));
       for (let f = e[k], j = 0; f && j < 8; f = f.return, j++) { const p = f.memoizedProps; if (p && typeof p === 'object') for (const v of Object.values(p)) if (v && typeof v === 'object' && v.item_id_plain != null) return { el, id: String(v.item_id_plain) }; }
@@ -123,7 +123,7 @@ async function closePicker(page) {
   await page.cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
   if (await until(closed, 1000)) return;
   for (const sel of ['[class*=sidesheet-mask]', '[class*=sidesheet-close]']) {
-    await page.evaluate((s) => document.querySelector(s)?.click(), sel);
+    await page.evaluate((s) => [...document.querySelectorAll(s)].filter((e) => e.getClientRects().length > 0).at(-1)?.click(), sel);
     if (await until(closed, 1500)) return;
   }
 }
@@ -139,10 +139,12 @@ export async function switchTo(page, id, { maxPages = LIMITS.maxPickerPages, lis
   const fail = async (detail) => { await closePicker(page); return { ok: false, detail }; };
   const seen = new Set(await until(async () => { const x = await cardIds(page); return x.length ? x : null; }, listMs) ?? []);
   if (!seen.size) return fail(`打开「选择作品」${Math.round(listMs / 1000)} 秒内作品列表没出来`);
-  for (let pages = 1; ; pages++) {
-    const picked = await clickMarked(page, `() => { ${WORK_CARDS} return cards().filter((c) => c.id === ${JSON.stringify(want)}).at(-1)?.el ?? null; }`, 'pick a work');
+  // 上限按实际加载的作品个数算（第一页的个数当每页大小）：滚动可能多带出一页，只在前 maxPages 页的作品里找
+  const cap = seen.size * maxPages;
+  for (;;) {
+    const picked = await clickMarked(page, `() => { ${WORK_CARDS} return cards().slice(0, ${cap}).filter((c) => c.id === ${JSON.stringify(want)}).at(-1)?.el ?? null; }`, 'pick a work');
     if (picked) { await sleep(2500); return { ok: true, detail: null }; }
-    if (pages >= maxPages) return fail(`作品列表翻了 ${pages} 页（${seen.size} 个作品）到上限，还没有这个作品`);
+    if (seen.size >= cap) return fail(`作品列表翻了 ${maxPages} 页（前 ${cap} 个作品）到上限，还没有这个作品`);
     // 先看有没有新作品，没有再滚（上一页刚渲染完时那一下滚动可能没触发加载，所以等的时候反复滚）
     const grew = await until(async () => {
       const fresh = (await cardIds(page)).filter((x) => !seen.has(x));

@@ -268,6 +268,12 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
       assertNoSend(x, 'thread-incomplete');
       assert.deepEqual(x.probe.boxes, []);
     });
+    // 第三轮评审（Gemini）：Number(null) 是 0，总数为 null 时不能当成 0
+    test('接口和页面的楼中楼总数都是 null：不当成 0，thread-incomplete，不发', async () => {
+      const x = await reply('nulltotal', on('w05', 2), {}, { drawerDelay: 300 });
+      assertNoSend(x, 'thread-incomplete');
+      assert.deepEqual(x.probe.boxes, []);
+    });
     test('要切作品但页面上没有「选择作品」：target-not-found，写明原因', async () => {
       const x = await reply('nopicker');
       assertNoSend(x, 'target-not-found');
