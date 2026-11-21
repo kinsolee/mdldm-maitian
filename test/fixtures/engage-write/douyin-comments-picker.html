@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>抖音评论管理（选择作品、一楼翻页写入测试页）</title>
+<style>
+  body { font: 14px sans-serif; margin: 20px; }
+  [contenteditable] { border: 1px solid #999; min-height: 22px; padding: 4px; }
+  .operations-WFV7Am { display: flex; gap: 12px; }
+  .item-M3fSkJ { cursor: pointer; color: #36c; }
+  .container-sXKyMs { display: flex; gap: 8px; padding: 6px; border-bottom: 1px solid #eee; min-height: 90px; }
+  .reply-list-QwXCb_ { margin-left: 32px; }
+  .load-more-pDyh1o { color: #36c; cursor: pointer; }
+  .douyin-creator-interactive-sidesheet-inner { position: fixed; top: 0; right: 0; width: 420px; height: 100vh; background: #fff; border-left: 1px solid #ccc; z-index: 10; }
+  .douyin-creator-interactive-sidesheet-body { height: 420px; overflow-y: auto; }
+  .card-OiVt4v { height: 72px; border-bottom: 1px solid #eee; cursor: pointer; }
+  .semi-toast-wrapper { position: fixed; top: 4px; right: 4px; }
+</style>
+</head>
+<body>
+<!--
+  仿 2026-11-21 在 Douyin:106707338905 评论管理页上只读核对的「选择作品」和一楼翻页（标题、昵称、正文已换成占位，id 换成假的）：
+  - 「选择作品」按钮比评论列表先出来；页面默认选中最新作品，它的一楼列表（comment/list/select）要等几秒才到，
+    这时已经切到别的作品的话，晚到的响应会把列表盖回默认作品（实测：切到 7706755631885126912 后，列表里是 7708984451971452170 的评论）。
+  - 点「选择作品」打开侧边抽屉 div[role=dialog].douyin-creator-interactive-sidesheet-inner；作品列表是打开后才请求的
+    /aweme/v1/creator/item/list?cursor=（每页 20 个，has_more、cursor 是上一页最后一个的发布时间），实测 0 到 3.3 秒才渲染出来。
+    作品卡片 div.card-OiVt4v > div.content-vwj9AA > div.cardTitle-Hga6iC（标题）+ div.desc-tgwUOz > div.time-a_67WG「发布于…」；
+    「发布于」叶子的 fiber 往上 4 层 props 里有作品对象 { item_id_plain, item_id, comment_count, create_time, title, ... }。
+    抽屉滚动容器是 div.douyin-creator-interactive-sidesheet-body，滚到底才请求下一页；
+    底部 div.loading-W3YH0U「没有更多视频」一直显示（还有下一页时也显示），不能当到底的依据。
+    页头当前作品也有一个「发布于」叶子，不在抽屉里、fiber 上没有 item_id_plain。
+  - 点作品卡片后抽屉关掉，页面请求这个作品的一楼列表：每页 10 条，has_more、cursor、total；滚到页面底部才请求下一页（cursor=10、20…）。
+    列表底部 div.loading-NTmKHl「没有更多评论」也是一直显示的，不能当到底的依据。
+  评论块、操作区、回复框的结构同 douyin-comments-real.html。
+  参数：?mode= ok | race（默认作品的一楼列表晚到，会盖掉已经切过去的作品）| replied（每个作品的第 16 条一楼下已有我的回复）
+       &drawerDelay= 打开抽屉后多久出作品列表（默认 3500ms，race 默认 200ms）&listDelay= 默认作品的一楼列表多久到（默认 600ms，race 默认 4000ms）
+  作品 w00…w44（w00 最新、默认选中），每页 20 个；每个作品 19 条一楼 <作品>-c0…c18，c0 下有 1 条楼中楼 <作品>-c0r1。
+-->
+<div class="content-wWJcbN"><div class="wrap-NeUN4f"><div class="container-caZWO6"><div class="input-d24X73" contenteditable="true" placeholder="有爱评论，说点好听的~" id="top-box"></div></div>
+  <div class="footer-oZJTJd"><div class="right-zLR6K3"><button class="douyin-creator-interactive-button" disabled type="button"><span class="douyin-creator-interactive-button-content">发送</span></button></div></div></div></div>
+<div class="header-work"><div class="cardTitle-Hga6iC">&lt;标题&gt;</div><div class="time-a_67WG" id="cur-time">发布于2026年11月17日 11:56</div>
+  <button class="douyin-creator-interactive-button" type="button" id="picker"><span class="douyin-creator-interactive-button-content">选择作品</span></button></div>
+<div class="operations-o6e97h"><div class="container-Pr4RHc"><span>全部评论</span><span>最新发布</span></div></div>
+<div id="list"></div>
+<div class="loading-NTmKHl">没有更多评论</div>
+<div id="toast" class="semi-toast-wrapper"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const mode = q.get('mode') || 'ok';
+const drawerDelay = Number(q.get('drawerDelay') ?? (mode === 'race' ? 200 : 3500));
+const listDelay = Number(q.get('listDelay') ?? (mode === 'race' ? 4000 : 600));
+const ME = '106';
+const FK = '__reactFiber$wtest';
+window.__loginUser = { uid: ME, nickname: '麦田测试号' };
+const cap = (window.__engCap ||= []);
+const API = 'https://creator.douyin.com/web/api/third_party/aweme/api/comment/';
+let sendClicks = 0, deleteClicks = 0, reportClicks = 0, pickerOpens = 0, seq = 0;
+
+const WORKS = Array.from({ length: 45 }, (_, i) => ({ item_id_plain: 'w' + String(i).padStart(2, '0'), item_id: '@enc' + i, title: '<标题>', comment_count: 20,
+  create_time: `发布于2026年${String(11 - Math.floor(i / 30)).padStart(2, '0')}月${String(28 - (i % 28)).padStart(2, '0')}日 12:00`, media_type: 4, duration: 60000 }));
+const DEFAULT = 'w00';
+const C = (aweme, cid, uid, nick, text, extra = {}) => ({ cid, aweme_id: aweme, user: { uid, nickname: nick }, text, reply_id: '0', reply_to_reply_id: '0', reply_comment_total: 0, ...extra });
+const data = {};
+function dataOf(w) {
+  if (data[w]) return data[w];
+  const roots = Array.from({ length: 19 }, (_, i) => C(w, `${w}-c${i}`, String(600 + i), '用户' + i, '一楼评论' + i));
+  const subs = { [`${w}-c0`]: [C(w, `${w}-c0r1`, '599', '乙', '楼中楼一条', { reply_id: `${w}-c0` })] };
+  roots[0].reply_comment_total = 1;
+  if (mode === 'replied') { roots[15].reply_comment_total = 1; subs[`${w}-c15`] = [C(w, `${w}-c15me`, ME, '麦田测试号', '之前回过了', { reply_id: `${w}-c15` })]; }
+  return (data[w] = { roots, subs, loaded: 0, expanded: {} });
+}
+
+// —— 一楼列表：每页 10 条，滚到页面底部加载下一页 ——
+let current = DEFAULT, shown = null, loadingMore = false;
+function pushSelect(w, from) {
+  const d = dataOf(w);
+  const page = d.roots.slice(from, from + 10);
+  d.loaded = from + page.length;
+  cap.push({ url: API + `read/aweme/v1/web/comment/list/select/?cursor=${from}`, t: Date.now(), body: JSON.stringify({ status_code: 0, comments: page, cursor: from + 10, has_more: d.loaded < d.roots.length ? 1 : 0, total: d.roots.length }) });
+}
+function showWork(w) { shown = w; render(); }
+setTimeout(() => { pushSelect(DEFAULT, 0); showWork(DEFAULT); }, listDelay);
+addEventListener('scroll', () => {
+  if (!shown || loadingMore) return;
+  const d = dataOf(shown);
+  if (d.loaded >= d.roots.length) return;
+  const el = document.scrollingElement;
+  if (el.scrollTop + innerHeight < el.scrollHeight - 120) return;
+  loadingMore = true;
+  const w = shown;
+  setTimeout(() => { pushSelect(w, d.loaded); loadingMore = false; if (shown === w) render(); }, 400);
+});
+
+// —— 「选择作品」抽屉 ——
+let drawerLoaded = 0, drawerLoading = false;
+function pushItems(from) {
+  const page = WORKS.slice(from, from + 20);
+  drawerLoaded = from + page.length;
+  cap.push({ url: `https://creator.douyin.com/aweme/v1/creator/item/list?cursor=${from ? 'c' + from : ''}`, t: Date.now(),
+    body: JSON.stringify({ status_code: 0, item_info_list: page, has_more: drawerLoaded < WORKS.length, cursor: 'c' + drawerLoaded, total_count: WORKS.length }) });
+}
+function fiberize(el, propsList) { let f = null; for (const p of [...propsList].reverse()) f = { memoizedProps: p, return: f }; el[FK] = f; }
+function renderCards(ul) {
+  ul.innerHTML = '';
+  for (const it of WORKS.slice(0, drawerLoaded)) {
+    const card = document.createElement('div');
+    card.className = 'card-OiVt4v' + (it.item_id_plain === current ? ' active-CiRg6S' : '');
+    card.innerHTML = `<img class="cover-ohOwm0"><div class="content-vwj9AA"><div class="cardTitle-Hga6iC">${it.title}</div><div class="desc-tgwUOz"><div class="time-a_67WG">${it.create_time}</div></div></div>
+      <div class="metrics-UeAUkj"><span role="img" class="dux-icon"><svg></svg></span><div>${it.comment_count}</div></div>`;
+    fiberize(card.querySelector('.time-a_67WG'), [{ className: 'time-a_67WG' }, { className: 'desc-tgwUOz' }, {}, { className: 'content-vwj9AA' }, { item: it, active: it.item_id_plain === current, onClick() {} }]);
+    card.onclick = () => pick(it.item_id_plain);
+    ul.appendChild(card);
+  }
+}
+document.getElementById('picker').onclick = () => {
+  pickerOpens++;
+  document.querySelectorAll('[role=dialog]').forEach((x) => x.remove());
+  drawerLoaded = 0;
+  const dlg = document.createElement('div');
+  dlg.setAttribute('role', 'dialog');
+  dlg.className = 'douyin-creator-interactive-sidesheet-inner douyin-creator-interactive-sidesheet-inner-wrap douyin-creator-interactive-sidesheet-size-small';
+  dlg.innerHTML = `<div class="douyin-creator-interactive-sidesheet-content"><div class="douyin-creator-interactive-sidesheet-header" role="heading"><div class="title-KMTyEo"><div>选择作品</div></div></div>
+    <div class="douyin-creator-interactive-sidesheet-body"><div><div class="douyin-creator-interactive-list"><ul class="douyin-creator-interactive-list-items"></ul></div>
+    <div class="loading-W3YH0U">没有更多视频</div></div></div></div>`;
+  document.body.appendChild(dlg);
+  const body = dlg.querySelector('.douyin-creator-interactive-sidesheet-body');
+  const ul = dlg.querySelector('ul');
+  setTimeout(() => { pushItems(0); renderCards(ul); }, drawerDelay);
+  body.addEventListener('scroll', () => {
+    if (drawerLoading || !drawerLoaded || drawerLoaded >= WORKS.length || body.scrollTop + body.clientHeight < body.scrollHeight - 60) return;
+    drawerLoading = true;
+    setTimeout(() => { pushItems(drawerLoaded); renderCards(ul); drawerLoading = false; }, 500);
+  });
+};
+function pick(w) {
+  document.querySelectorAll('[role=dialog]').forEach((x) => x.remove());
+  current = w;
+  dataOf(w).loaded = 0;
+  document.getElementById('list').innerHTML = '';
+  shown = null;
+  scrollTo(0, 0);
+  setTimeout(() => { pushSelect(w, 0); showWork(w); }, 800);
+}
+
+// —— 评论块（同 douyin-comments-real.html） ——
+const itemProps = (c, d) => ({ content: c.text, id: c.cid, uid: c.user.uid, levelOneCid: c.reply_id === '0' ? c.cid : c.reply_id, canReply: true, username: c.user.nickname, isAuthor: c.user.uid === ME,
+  ...(c.reply_id === '0' ? { replyComments: { show: true, count: c.reply_comment_total, list: [], hasMore: !d.expanded[c.cid] && c.reply_comment_total > 0 } } : {}) });
+const opsProps = (c) => ({ cid: c.cid, replyToUserName: c.user.nickname, levelOneCid: c.reply_id === '0' ? c.cid : c.reply_id, uid: c.user.uid, isAuthor: c.user.uid === ME });
+function item(c, d) {
+  const el = document.createElement('div');
+  el.className = 'container-sXKyMs';
+  fiberize(el, [{ className: el.className }, itemProps(c, d), { children: null }]);
+  el.innerHTML = `<span class="douyin-creator-interactive-avatar"><img></span>
+    <div class="content-FM0UMi"><div>
+      <div class="username-aLgaNB">${c.user.nickname}</div>
+      <div class="comment-content-text-JvmAKq">${c.text}</div>
+      <div class="op-parent"><div class="operations-WFV7Am">
+        <div class="item-M3fSkJ" data-op="reply"><span role="img" class="dux-icon"><svg></svg></span>回复</div>
+        <div class="item-M3fSkJ" data-op="delete"><span role="img" class="dux-icon"><svg></svg></span>删除</div>
+        <div class="item-M3fSkJ" data-op="report"><span role="img" class="dux-icon"><svg></svg></span>举报</div>
+      </div></div>
+    </div></div>`;
+  const ops = el.querySelector('.operations-WFV7Am');
+  el.querySelector('.op-parent').className = '';
+  const chainOf = (btn) => [{ className: btn.className, onClick() {} }, { className: ops.className }, { className: '' }, opsProps(c), {}, { className: 'content' }, {}, itemProps(c, d)];
+  for (const b of ops.children) fiberize(b, chainOf(b));
+  fiberize(ops, chainOf(ops).slice(1));
+  ops.querySelector('[data-op=reply]').onclick = () => openReply(ops.parentElement, c);
+  ops.querySelector('[data-op=delete]').onclick = () => { deleteClicks++; };
+  ops.querySelector('[data-op=report]').onclick = () => { reportClicks++; };
+  return el;
+}
+function render() {
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  if (!shown) return;
+  const d = dataOf(shown);
+  for (const r of d.roots.slice(0, d.loaded)) {
+    const block = item(r, d);
+    const s = d.subs[r.cid] || [];
+    if (s.length) {
+      const rl = document.createElement('div');
+      rl.className = 'reply-list-QwXCb_';
+      if (d.expanded[r.cid]) for (const x of s) rl.appendChild(item(x, d));
+      const more = document.createElement('div');
+      more.className = 'load-more-pDyh1o';
+      more.textContent = d.expanded[r.cid] ? '收起' : `查看 ${s.length} 条回复`;
+      more.onclick = () => {
+        if (d.expanded[r.cid]) return;
+        d.expanded[r.cid] = true;
+        cap.push({ url: API + `read/aweme/v1/web/comment/list/reply/?comment_id=${r.cid}&item_id=${shown}&cursor=0`, t: Date.now(), body: JSON.stringify({ status_code: 0, comments: s, has_more: 0, cursor: 10, total: s.length }) });
+        render();
+      };
+      rl.appendChild(more);
+      block.querySelector('.content-FM0UMi > div').appendChild(rl);
+    }
+    list.appendChild(block);
+  }
+}
+function openReply(opParent, c) {
+  document.querySelectorAll('.reply-content-obcMk0').forEach((x) => x.remove());
+  const box = document.createElement('div');
+  box.className = 'reply-content-obcMk0';
+  box.innerHTML = `<div class="wrap-NeUN4f"><div class="container-caZWO6"><div class="input-d24X73" contenteditable="true" placeholder="回复 ${c.user.nickname}："></div></div>
+    <div class="footer-oZJTJd"><div class="right-zLR6K3">
+      <button type="button" class="douyin-creator-interactive-button cancel-MbZdXf"><span class="douyin-creator-interactive-button-content">取消</span></button>
+      <button type="button" class="douyin-creator-interactive-button send-btn" disabled aria-disabled="true"><span class="douyin-creator-interactive-button-content">发送</span></button>
+    </div></div></div>`;
+  opParent.appendChild(box);
+  const ed = box.querySelector('[contenteditable]');
+  fiberize(ed, [{}, {}, {}, {}, {}, {}, {}, opsProps(c)]);
+  const send = box.querySelector('.send-btn');
+  ed.addEventListener('input', () => { const has = !!ed.innerText.trim(); send.disabled = !has; send.setAttribute('aria-disabled', String(!has)); });
+  box.querySelector('.cancel-MbZdXf').onclick = () => box.remove();
+  send.onclick = () => onSend(c, ed);
+}
+function onSend(target, ed) {
+  sendClicks++;
+  const text = ed.innerText;
+  const d = dataOf(shown);
+  const root = target.reply_id && target.reply_id !== '0' ? target.reply_id : target.cid;
+  const n = C(shown, 'n' + (++seq), ME, '麦田测试号', text, { reply_id: root, reply_to_reply_id: root === target.cid ? '0' : target.cid });
+  setTimeout(() => {
+    (d.subs[root] ||= []).push(n);
+    d.expanded[root] = true;
+    render();
+    cap.push({ url: API + 'write/aweme/v1/web/comment/reply/', t: Date.now(), body: JSON.stringify({ status_code: 0, comment: n }) });
+  }, 300);
+}
+
+window.__probe = () => ({
+  sendClicks, deleteClicks, reportClicks, pickerOpens, current, shown,
+  top: document.getElementById('top-box').innerText,
+  boxes: [...document.querySelectorAll('[class*=reply-content-] [contenteditable=true]')].map((b) => b.innerText),
+  mine: Object.values(data).flatMap((d) => Object.values(d.subs).flat()).filter((x) => x.user.uid === ME && x.cid.startsWith('n'))
+    .map((x) => ({ cid: x.cid, aweme_id: x.aweme_id, text: x.text, reply_id: x.reply_id, reply_to_reply_id: x.reply_to_reply_id })),
+});
+</script>
+</body>
+</html>

@@ -194,6 +194,72 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
     test('页面报错：sendError', async () => { const x = await reply('fail'); assertNotReadBack(x); assert.match(x.r.sendError, /回复失败/); });
   });
 
+  // 2026-11-21 真实调用：旧作品下的 8 条报「切不到作品」、1 条切过去了却「没找到评论」。只读核对真实页面后做的测试页：
+  // 抽屉作品列表打开后最慢 3.3 秒才出来、滚到底才翻页；默认作品的一楼列表晚到会盖掉已切过去的作品；一楼每页 10 条，滚到页面底部才加载下一页。
+  describe('抖音（选择作品、一楼翻页）', () => {
+    const s = space('dyp');
+    const base = { uid: '106', nickname: '麦田测试号', test: { loginFromPage: true } };
+    const TEXT = '谢谢支持！';
+    const reply = (mode, target = {}, extra = {}, q = {}) => write(s, 'douyin.mjs', { ...base, op: 'reply', text: TEXT,
+      target: { commentId: 'w05-c1', workId: 'w05', parentId: null, rootId: 'w05-c1', authorUid: '601', authorNickname: '用户1', commentText: '一楼评论1', ...target },
+      urls: { comments: pageUrl('douyin-comments-picker.html', { mode, ...q }) }, ...extra });
+    const on = (w, i) => ({ commentId: `${w}-c${i}`, workId: w, rootId: `${w}-c${i}` });
+    const sentOn = (x, w, cid) => { assertSent(x, 'n1'); assert.equal(x.probe.current, w); assert.deepEqual(x.probe.mine.map((m) => [m.aweme_id, m.reply_id]), [[w, cid]]); assert.equal(x.probe.top, ''); };
+
+    test('作品列表打开 3.5 秒后才出来：等到再切，回复发出', async () => sentOn(await reply('ok'), 'w05', 'w05-c1'));
+    test('旧作品在作品列表第 2 页：滚动抽屉翻页后切过去', async () => sentOn(await reply('ok', on('w30', 2)), 'w30', 'w30-c2'));
+    test('默认作品的一楼列表晚到（会盖掉已切过去的作品）：等它到了再切', async () => sentOn(await reply('race'), 'w05', 'w05-c1'));
+    test('目标在一楼第 2 页：滚到页面底部加载下一页后找到', async () => sentOn(await reply('ok', on('w05', 15)), 'w05', 'w05-c15'));
+    test('第 3 页的旧作品、第 2 页的评论：两边都翻页', async () => sentOn(await reply('ok', on('w44', 18)), 'w44', 'w44-c18'));
+
+    test('作品列表翻到底也没有：target-not-found，写明翻到底', async () => {
+      const x = await reply('ok', on('w99', 1), {}, { drawerDelay: 300 });
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /切不到作品 w99/);
+      assert.match(x.r.detail, /到底.*45 个作品/);
+    });
+    test('作品在第 3 页、翻页上限 2：target-not-found，写明上限', async () => {
+      const x = await reply('ok', on('w44', 1), { maxPickerPages: 2 }, { drawerDelay: 300 });
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /切不到作品 w44.*上限/);
+    });
+    test('一楼加载上限 1 页、目标在第 2 页：target-not-found，写明上限', async () => {
+      const x = await reply('ok', on('w05', 15), { maxCommentPages: 1 }, { drawerDelay: 300 });
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /没找到评论 w05-c15.*上限/);
+    });
+    test('一楼翻到底也没有目标：target-not-found，写明翻到底', async () => {
+      const x = await reply('ok', { commentId: 'w05-nope', workId: 'w05', rootId: 'w05-nope' }, {}, { drawerDelay: 300 });
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /没找到评论 w05-nope.*翻到底/);
+    });
+    test('翻页找到的评论下已有我的回复：already-replied，不发', async () => assertNoSend(await reply('replied', on('w30', 15), {}, { drawerDelay: 300 }), 'already-replied'));
+
+    // 读适配器（抓评论）用同一个 switchTo
+    const switchTo = async (work, opts = {}) => {
+      const res = await runEgoTask({ space: s, timeoutMs: 120_000, params: { adapterUrl: new URL('../src/ops/engage/adapters/douyin.mjs', import.meta.url).href,
+        libUrl: new URL('../src/ops/engage/adapters/page-lib.mjs', import.meta.url).href, url: pageUrl('douyin-comments-picker.html', { mode: 'ok' }), work, opts },
+      script: `const m = await import(params.adapterUrl); const L = await import(params.libUrl);
+const page = await L.mainPage(task); await L.open(page, params.url); await L.sleep(1500);
+const r = await m.switchTo(page, params.work, params.opts); await L.sleep(1500);
+return { r, probe: await page.evaluate(() => window.__probe()) };` });
+      assert.equal(res.ok, true, `${res.reason}: ${res.error}`);
+      return res.result;
+    };
+    test('读适配器 switchTo：等作品列表出来、翻到第 3 页切过去', async () => {
+      const x = await switchTo('w44');
+      assert.equal(x.r.ok, true, JSON.stringify(x.r));
+      assert.equal(x.probe.current, 'w44');
+      assert.equal(x.probe.sendClicks, 0);
+    });
+    test('读适配器 switchTo：没有这个作品时 ok:false 并写明原因', async () => {
+      const x = await switchTo('w99');
+      assert.equal(x.r.ok, false);
+      assert.match(x.r.detail, /到底/);
+      assert.equal(x.probe.current, 'w00');
+    });
+  });
+
   describe('视频号', () => {
     const s = space('chw');
     const base = { uid: 'v2_me', nickname: '麦田测试号', test: { loginFromPage: true } };

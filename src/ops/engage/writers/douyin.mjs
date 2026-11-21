@@ -5,7 +5,8 @@
 //          评论块 div.container-*：组件 props { id, content, uid, levelOneCid, username, replyComments: { count } }；
 //          操作区 [class*=operations-] > div.item-*（图标 + 「回复」「删除」「举报」）：按钮往上 3 层组件 props { cid, levelOneCid, uid, replyToUserName }。
 //        视图模型里没有「直接回复的是谁」（reply_to_reply_id），这个只能从接口响应拿。
-//        目标不在当前作品就点「选择作品」切过去（读适配器的 switchTo）；目标所在楼没展开完就点「查看 N 条回复」（只读）。
+//        目标不在当前作品就点「选择作品」切过去（读适配器的 switchTo，作品列表要翻页）；一楼没加载到目标就滚到页面底部翻页；
+//        目标所在楼没展开完就点「查看 N 条回复」（只读）。
 //        「已有我的回复」：同楼里有 user.uid 是我、reply_to_reply_id 指向目标（目标是一楼时 reply_id 是它、reply_to_reply_id 为 "0"）的。
 //        输入框只用 [class*=reply-content-] [contenteditable=true]（页面顶部另有一个发一级评论的框，类名一样但不在 reply-content- 里，绝不碰）。
 //        发送按钮只认这个 reply-content- 里文字是「发送」、没 disabled 的 button（框里没字时页面给它 disabled）。
@@ -22,7 +23,8 @@ export const PAGES = {
   comments: 'https://creator.douyin.com/creator-micro/interactive/comment',
   dms: 'https://creator.douyin.com/creator-micro/data/following/chat',
 };
-export const LIMITS = { maxExpand: 25 };
+// maxPickerPages：「选择作品」作品列表最多翻几页（每页 20 个）；maxCommentPages：一楼最多加载几页（每页 10 条）
+export const LIMITS = { maxExpand: 25, maxPickerPages: 10, maxCommentPages: 30 };
 
 export function runInSpace(task, params) {
   return runWrite(task, params, { hook: true, url, login, prepareReply, prepareDM });
@@ -109,6 +111,14 @@ const SEND = `const box = __marked('box'); const rc = box && box.closest('[class
   return b.disabled || b.getAttribute('aria-disabled') === 'true' ? null : b;`;
 
 const PICKER = `return !![...document.querySelectorAll('button, [class*=-button]')].find((e) => e.textContent.trim() === '选择作品');`;
+const SELECT = 'comment/list/select';
+const SCROLL_BOTTOM = `const e = document.scrollingElement || document.documentElement; e.scrollTop = e.scrollHeight; window.dispatchEvent(new Event('scroll')); return true;`;
+const hasMore = (j) => j != null && j.has_more !== 0 && j.has_more !== false && j.has_more != null;
+/** 抓到的一楼列表响应（按到达顺序）；给了作品就只要评论都属于这个作品的（空页不知道属于谁，不算）。 */
+async function selectPages(page, work) {
+  return (await capturedJson(page, SELECT)).map((c) => c.json)
+    .filter((j) => j.status_code === 0 && Array.isArray(j.comments) && (!work || (j.comments.length && j.comments.every((c) => String(c.aweme_id) === work))));
+}
 
 async function prepareReply({ page, params, t, me }) {
   const tg = params.target ?? {};
@@ -116,14 +126,31 @@ async function prepareReply({ page, params, t, me }) {
   const root = tg.rootId != null ? String(tg.rootId) : tg.parentId != null ? String(tg.parentId) : id;
   const work = tg.workId != null ? String(tg.workId) : null;
   const max = params.maxExpand ?? LIMITS.maxExpand;
-  // 评论区（或「选择作品」按钮）出来；实测页面很慢，按钮 10 到 50 秒才出来
-  await waitFor(async () => (await comments(page)).length > 0 || (await inPage(page, PICKER)), t.loadMs, 1000);
+  // 等默认作品的一楼列表到了再往下走：「选择作品」按钮比它早几秒出来，这时切走的话，它晚到的响应会把列表盖回默认作品（2026-11-21 实测）。
+  // 默认作品没有评论时页面也发 comment/list/select，所以看接口响应，不只看页面上有没有评论
+  await waitFor(async () => (await capturedJson(page, SELECT)).length > 0 || (await comments(page)).length > 0, t.loadMs, 1000);
   let list = await comments(page);
-  if (!list.some((x) => x.id === id) && work && !list.some((x) => x.aweme === work) && (await inPage(page, PICKER))) {
-    if (!(await switchTo(page, work))) return { blocked: 'target-not-found', detail: `切不到作品 ${work}（「选择作品」或作品列表里没找到）` };
+  if (!list.some((x) => x.id === id) && work && !list.some((x) => x.aweme === work) && (await waitFor(() => inPage(page, PICKER), Math.min(t.loadMs, 30000), 1000))) {
+    const sw = await switchTo(page, work, { maxPages: params.maxPickerPages ?? LIMITS.maxPickerPages });
+    if (!sw.ok) return { blocked: 'target-not-found', detail: `切不到作品 ${work}：${sw.detail}` };
     await waitFor(async () => (await comments(page)).some((x) => x.aweme === work || x.id === id), Math.min(t.loadMs, 20000), 1000);
     list = await comments(page);
   }
+  // 一楼每页 10 条，滚到页面底部才加载下一页。目标（或它所在的楼）没出现、接口说还有下一页（has_more），就往下翻，最多 maxCommentPages 页。
+  // 页面底部「没有更多评论」还有下一页时也显示，只认接口的 has_more
+  const maxPages = params.maxCommentPages ?? LIMITS.maxCommentPages;
+  let pages = (await selectPages(page, work)).length;
+  const seen = () => list.some((x) => x.id === id || x.id === root);
+  while (!seen() && pages < maxPages && hasMore((await selectPages(page, work)).at(-1))) {
+    await inPage(page, SCROLL_BOTTOM);
+    const before = pages;
+    pages = (await waitFor(async () => { const n = (await selectPages(page, work)).length; return n > before ? n : 0; }, Math.min(t.loadMs, 10000), 500)) || before;
+    list = await comments(page);
+    if (pages === before) break;
+  }
+  const paging = seen() ? '' : hasMore((await selectPages(page, work)).at(-1))
+    ? `；一楼加载了 ${pages} 页${pages >= maxPages ? '到上限' : '，再滚也没加载出下一页'}，还有更多`
+    : `；一楼已翻到底（${pages} 页）`;
   // 目标没出现、或目标所在楼的子回复没加载全（判「已回复」要看全楼），就点「查看 N 条回复」
   for (let i = 0; i < max; i++) {
     const hit = list.find((x) => x.id === id);
@@ -136,7 +163,7 @@ async function prepareReply({ page, params, t, me }) {
     list = await comments(page);
   }
   const hit = list.find((x) => x.id === id);
-  if (!hit) return { blocked: 'target-not-found', detail: `评论管理页上没找到评论 ${id}${work ? `（作品 ${work}）` : ''}` };
+  if (!hit) return { blocked: 'target-not-found', detail: `评论管理页上没找到评论 ${id}${work ? `（作品 ${work}）` : ''}${paging}` };
   if (hit.gone) return { blocked: 'comment-gone', detail: `评论 ${id} 显示已删除` };
   const mine = (x) => x.uid != null && x.uid === String(me.uid);
   const prior = list.find((x) => mine(x) && x.id !== id && directTo(x) === id);
