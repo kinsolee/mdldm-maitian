@@ -4,7 +4,7 @@ import fs from 'node:fs';
 
 export const PENDING = 'pending';
 export const DEFAULT_PROFILE = 'Profile 5';
-export const CAPABILITIES = ['readWorks', 'readComments', 'readDM', 'reply', 'sendDM', 'likeComment', 'pinComment', 'deleteComment', 'block', 'setVisibility', 'publish'];
+export const CAPABILITIES = ['readWorks', 'readComments', 'readDM', 'reply', 'sendDM', 'likeComment', 'pinComment', 'deleteComment', 'block', 'deleteConversation', 'setVisibility', 'publish'];
 export const PLATFORM_NAMES = { Douyin: '抖音', Channels: '视频号', XiaoHongShu: '小红书', Bili: 'B站', GongZhongHao: '公众号', Weibo: '微博', X: 'X', YouTube: 'YouTube', Instagram: 'Instagram', Zhishi: '知识站' };
 
 /** uid 统一写法：去首尾空白和前导 @（X 的 handle）。空的返回 null。导入、set-uid、迁移、检测比对都用它。 */

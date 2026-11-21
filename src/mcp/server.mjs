@@ -2,7 +2,7 @@
 // 麦田本地 MCP（stdio）。启动：node src/mcp/server.mjs --scope read | engage
 // 只做参数校验和转发到 src/ops/engage/*。stdout 只走 MCP 协议，日志写 stderr。
 //   read：只查库，不现抓、不起 runner。
-//   engage：只注册 reply_comment、send_dm（不带 read 组），而且只在进程环境的 MAITIAN_ENGAGE_TOKEN 和仓库 .env 里的一致时注册
+//   engage：只注册 reply_comment、send_dm，和 B站处置 delete_comment、block_user、delete_conversation（不带 read 组），而且只在进程环境的 MAITIAN_ENGAGE_TOKEN 和仓库 .env 里的一致时注册
 //          （src/ops/tokens.mjs 的 checkToken，常数时间）；对不上或缺失就一个工具都不注册，只往 stderr 写一句原因。口令值不进日志、错误、返回。
 import fs from 'node:fs';
 import { parseArgs } from 'node:util';
@@ -60,12 +60,25 @@ const idempotencyKey = z.string().describe('幂等键，建议填事件 id；同
 const eventId = z.string().optional().describe('对应的事件 id（可选）；发出后自动回执 replied。不填时回执这个目标所有没回执的同类事件');
 const WRITE_NOTE = '发前在平台上重读、发后回读；返回 status：sent（回读到了）、needs_readback（点了发送但没回读到，绝不重试，请人工看）、failed（没发，reason 说明，如 comment-gone、already-replied、last-is-me）、duplicate、rejected（能力位关、本轮已满 15 条、平台正被占用等）';
 
+// B站处置（广告评论、私信）。生效并回读确认才返回 sent；对象是我自己一律 rejected self-target
+const modEventId = z.string().optional().describe('对应的事件 id（可选）；生效后自动回执 ignored。不填时回执这个目标所有没回执的同类事件');
+const MOD_NOTE = '只做 B站。发前重读、接口只调一次、发后回读；返回 status：sent（回读确认已生效）、needs_readback（调了接口没读回，绝不重试，请人工看）、failed（没调接口，reason 如 already-gone、already-blocked、not-my-work、not-a-user）；调过接口但平台报错、回读也没确认的记 needs_readback / send-error-unconfirmed，不要重试、duplicate、rejected（self-target、capability-off、round-limit 每小时每种 10 条等）';
+const mod = (op, targetKey) => (db, a, deps) => engageWrite(db, { op, targetId: a[targetKey], idempotencyKey: a.idempotencyKey, eventId: a.eventId, caller: deps.caller() }, deps);
+const MODERATE_TOOLS = [
+  ['delete_comment', `删除自己作品下别人的一条评论（一楼、楼中楼都行）。${MOD_NOTE}`, { commentId: id('评论 id'), idempotencyKey, eventId: modEventId }, mod('delete', 'commentId')],
+  ['block_user', `拉黑一个人。target 可以是 Bili:<mid>，也可以是这个人的评论 id 或私信会话 id（从库里推出 mid）；只认库里见过的人。${MOD_NOTE}`,
+    { target: z.string().describe('Bili:<mid>、评论 id 或会话 id'), idempotencyKey, eventId: modEventId }, mod('block', 'target')],
+  ['delete_conversation', `从私信会话列表里删掉一个会话（B站 remove_session：只移除会话，聊天记录还在，对方再发消息会话会回来；配合 block_user 用）。${MOD_NOTE}`,
+    { conversationId: id('会话 id'), idempotencyKey, eventId: modEventId }, mod('deleteConversation', 'conversationId')],
+];
+
 // [工具名, 说明, 入参, (db, args, deps) => 结果]
 const ENGAGE_TOOLS = [
   ['reply_comment', `回复一条评论（含楼中楼）。${WRITE_NOTE}`, { commentId: id('评论 id'), text, idempotencyKey, eventId },
     (db, a, deps) => engageWrite(db, { op: 'reply', targetId: a.commentId, text: a.text, idempotencyKey: a.idempotencyKey, eventId: a.eventId, caller: deps.caller() }, deps)],
   ['send_dm', `回复一个私信会话。${WRITE_NOTE}`, { conversationId: id('会话 id'), text, idempotencyKey, eventId },
     (db, a, deps) => engageWrite(db, { op: 'sendDM', targetId: a.conversationId, text: a.text, idempotencyKey: a.idempotencyKey, eventId: a.eventId, caller: deps.caller() }, deps)],
+  ...MODERATE_TOOLS,
 ];
 
 const reply = (value) => ({ content: [{ type: 'text', text: JSON.stringify(value, null, 1) }] });

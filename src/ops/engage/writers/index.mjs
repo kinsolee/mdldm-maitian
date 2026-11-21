@@ -6,15 +6,22 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const WRITER_FILES = { Bili: 'bili.mjs', Douyin: 'douyin.mjs', Channels: 'channels.mjs', XiaoHongShu: 'xhs.mjs' };
+// 处置组（delete、block、deleteConversation）只做 B站，单独一个文件
+export const MODERATE_FILES = { Bili: 'bili-moderate.mjs' };
+const MODERATE_OPS = new Set(['delete', 'block', 'deleteConversation']);
 // B站走接口，几秒就完；页面平台打开后台、切作品要 10 到 60 秒（S0）
 export const WRITE_TIMEOUT_MS = { Bili: 2 * 60_000, Douyin: 6 * 60_000, Channels: 6 * 60_000, XiaoHongShu: 6 * 60_000 };
 const SCRIPT = 'const m = await import(params.moduleUrl);\nreturn m.runInSpace(task, params);';
 
-export const writerModuleUrl = (code) => pathToFileURL(path.join(import.meta.dirname, WRITER_FILES[code])).href;
+export const writerModuleUrl = (code, op) => {
+  const file = MODERATE_OPS.has(op) ? MODERATE_FILES[code] : WRITER_FILES[code];
+  if (!file) throw new Error(`${code} 没有 ${op} 的写入脚本`);
+  return pathToFileURL(path.join(import.meta.dirname, file)).href;
+};
 
 /** 在账号的 space 里跑写入脚本。返回 runner 的结果：{ ok: true, result } 或 { ok: false, reason, error }。 */
 export async function runWriterInSpace({ account, params }, { runner } = {}) {
   const run = runner ?? (await import('../../../ego-runner/index.mjs')).runEgoTask;
   return run({ space: account.spaceName, profileId: account.profileId ?? 'Profile 5', timeoutMs: WRITE_TIMEOUT_MS[account.platformCode],
-    params: { ...params, moduleUrl: writerModuleUrl(account.platformCode) }, script: SCRIPT });
+    params: { ...params, moduleUrl: writerModuleUrl(account.platformCode, params.op) }, script: SCRIPT });
 }
