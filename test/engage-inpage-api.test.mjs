@@ -222,6 +222,26 @@ describe('评审第 1 轮回归：翻页标志缺失、游标停滞、重复、�
   });
 });
 
+describe('评审第 1 轮回归（astra）：回读时楼没读全', () => {
+  test('抖音、视频号：回读到 1 条但楼还有没读的页，不算回读到', async () => {
+    const ok = (data) => ({ ok: true, data: { status_code: 0, ...data } });
+    const dyCall = async (m) => (m === 'awemeV1CommentMultiPublish' ? ok({ comments: [{ code: 0, comment: { cid: 'new1' } }] })
+      : m === 'awemeV1CommentListSelect' ? ok({ has_more: 0, comments: [dyC('r1', { total: 5 })] })
+        : ok({ has_more: 1, cursor: 0, comments: [dyC('new1', { uid: ME, text: '谢谢', reply_id: 'r1' })] }));
+    const dctx = { call: dyCall, params: { op: 'reply', text: '谢谢', target: {} }, me: { uid: ME } };
+    const rb = (await sendAndReadBack(douyinApi, dctx, { awemeId: 'w1', rootId: 'r1', target: 'r1', before: new Set() }, { sleep: noSleep, readbackMs: 0 })).readBack;
+    assert.equal(rb.found, false);
+    assert.match(rb.detail, /没读全/);
+    const cc = (id, x = {}) => ({ commentId: id, commentNickname: '我', commentContent: '收到', replyCommentId: '', levelTwoComment: [], ...x });
+    const chCall = async (m, a) => (m === 'createComment' ? { ok: true, data: { errCode: 0, data: { comment: { commentId: 'new1' } } } }
+      : a.rootCommentId ? { ok: true, data: { errCode: 0, data: { comment: [], lastBuff: 'b', downContinueFlag: 1 } } }
+      : { ok: true, data: { errCode: 0, data: { comment: [cc('r1', { commentNickname: '甲', l2: undefined, levelTwoComment: [cc('new1')], downContinueFlag: 1, lastBuff: 'b' })], lastBuff: '', downContinueFlag: 0 } } });
+    const cctx = { call: chCall, params: { op: 'reply', text: '收到', target: {} }, uuid: () => 'u' };
+    const rb2 = (await sendAndReadBack(channelsApi, cctx, { exportId: 'o', rootId: 'r1', target: 'r1', myNick: '我', comment: {}, before: new Set() }, { sleep: noSleep, readbackMs: 0 })).readBack;
+    assert.equal(rb2.found, false);
+  });
+});
+
 describe('视频号：接口读评论', () => {
   const o = { ...ch.LIMITS, now: T * 1000 };
   const cc = (id, x = {}) => ({ commentId: id, commentNickname: x.nick ?? `昵称${id}`, commentContent: x.text ?? `评论${id}`, commentCreatetime: T - 60, commentLikeCount: 0,
@@ -378,5 +398,8 @@ describe('runApiReply 和开关', () => {
     await collect({ account: acc({}), kind: 'comments', runner });
     await collect({ account: acc({ readViaApi: true }), kind: 'comments', runner });
     assert.deepEqual(seen, ['dom', 'api']);
+    // 能力位关着时调用方传 readVia: 'api' 也不生效
+    await collect({ account: acc({}), kind: 'comments', runner, options: { readVia: 'api' } });
+    assert.equal(seen.at(-1), 'dom');
   });
 });

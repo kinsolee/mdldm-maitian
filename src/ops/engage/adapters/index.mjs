@@ -38,7 +38,9 @@ export async function collect({ account, kind, runner, now = Date.now, since = n
   if (!adapter) return fail('unsupported-platform', `没有 ${account?.platformCode} 的评论/私信适配器`);
   const run = runner ?? (await import('../../../ego-runner/index.mjs')).runEgoTask;
   const params = { kind, platformCode: account.platformCode, uid: String(account.uid), nickname: account.nickname ?? null,
-    since, now: now(), moduleUrl: moduleUrl(account.platformCode), readVia: account.capabilities?.readViaApi === true ? 'api' : 'dom', ...options };
+    since, now: now(), moduleUrl: moduleUrl(account.platformCode), ...options,
+    // 放在 options 后面：只有能力位能决定走接口，调用方传的 readVia 不算
+    readVia: account.capabilities?.readViaApi === true ? 'api' : 'dom' };
   let r;
   try {
     r = await run({ space: account.spaceName, profileId: account.profileId ?? 'Profile 5', timeoutMs: TIMEOUT_MS[kind], params, script: SCRIPT });

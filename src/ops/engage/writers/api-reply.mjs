@@ -88,6 +88,8 @@ export const douyinApi = {
   async fresh({ call, params, me }, s) {
     const th = await douyinThread(call, { awemeId: s.awemeId, rootId: s.rootId });
     if (th.error || !th.root) return { items: null, detail: th.error ?? '回读时没找到这栋楼' };
+    // 楼没读全时确认不了「恰好 1 条」（后面的页里可能还有一样的），不算回读到，交给框架记 needs_readback
+    if (!th.complete) return { items: null, detail: '回读时楼没读全，确认不了只有一条' };
     const want = norm(params.text), uid = String(me.uid);
     return { items: [...new Set(th.replies.filter((c) => !s.before.has(String(c.cid)) && String(c.user?.uid) === uid && norm(c.text) === want && dyRepliesTo(c, s)).map((c) => String(c.cid)))] };
   },
@@ -166,6 +168,8 @@ export const channelsApi = {
   async fresh({ call, params }, s) {
     const th = await channelsThread(call, { exportId: s.exportId, rootId: s.rootId });
     if (th.error || !th.root) return { items: null, detail: th.error ?? '回读时没找到这栋楼' };
+    // 楼没读全时确认不了「恰好 1 条」（后面的页里可能还有一样的），不算回读到，交给框架记 needs_readback
+    if (!th.complete) return { items: null, detail: '回读时楼没读全，确认不了只有一条' };
     const want = norm(params.text);
     return { items: [...new Set(th.l2.filter((c) => !s.before.has(String(c.commentId)) && c.commentNickname === s.myNick && norm(c.commentContent) === want && chRepliesTo(c, s)).map((c) => String(c.commentId)))] };
   },
