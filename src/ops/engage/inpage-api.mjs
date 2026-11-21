@@ -36,8 +36,9 @@ export function locateService({ platform, methods, marks }) {
     }
   }
   for (const chunk of globals) {
-    // webpack runtime 还没接管时 push 是原生数组方法，往里塞空 chunk 没用，还会留在页面数组里
-    try { if (/\[native code\]/.test(Function.prototype.toString.call(chunk.push))) continue; } catch { continue; }
+    // webpack runtime 还没接管时 push 就是数组原型上的方法，往里塞空 chunk 没用，还会留在页面数组里。
+    // 不能按 toString 里有没有 [native code] 判：webpack 5 接管后的 push 是 .bind() 出来的，toString 也是 [native code]
+    try { if (typeof chunk.push !== 'function' || chunk.push === Object.getPrototypeOf(chunk)?.push) continue; } catch { continue; }
     let req = null;
     try { chunk.push([[`__eng_${Date.now()}_${Math.random()}`], {}, (r) => { req = r; }]); } catch { continue; }
     if (!req?.m) continue;
@@ -60,7 +61,9 @@ export async function callInPage({ platform, method, args }) {
   try { const d = await s[method](args); return { ok: true, data: JSON.parse(JSON.stringify(d ?? null)) }; }
   catch (e) {
     let msg = e?.message;
-    if (msg == null && e && typeof e === 'object') { try { msg = JSON.stringify({ status_code: e.status_code, status_msg: e.status_msg, errCode: e.errCode, errMsg: e.errMsg }); } catch { msg = null; } }
+    if (msg == null && e && typeof e === 'object') {
+      try { msg = JSON.stringify({ status_code: e.status_code, status_msg: e.status_msg, errCode: e.errCode, errMsg: e.errMsg }); if (msg === '{}') msg = JSON.stringify(e); } catch { msg = null; }
+    }
     return { ok: false, error: String(msg ?? e).slice(0, 300) };
   }
 }

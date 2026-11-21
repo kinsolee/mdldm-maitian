@@ -137,7 +137,8 @@ export async function worksViaApi(call, feeds, o) {
     for (let p = 0; ; p++) {
       const d = listData(await call('getCommentList', listArgs(f.objectId, buf)));
       if (!d) { error = '一楼列表接口没返回 errCode=0 的列表'; break; }
-      roots.push(...d.comment);
+      // 翻页时有新评论插进来，同一条一楼可能跨页重复：按 commentId 去重
+      for (const c of d.comment) if (!roots.some((x) => String(x.commentId) === String(c.commentId))) roots.push(c);
       if (pageEnd(d.downContinueFlag)) break;
       // 还有下一页但到上限、翻不动，或标志缺失：一楼没读全
       if (!pageMore(d.downContinueFlag) || p + 1 >= o.maxPages || !d.lastBuff || d.lastBuff === buf) { topLeft = 1; break; }
@@ -154,7 +155,7 @@ export async function worksViaApi(call, feeds, o) {
         const d = listData(await call('getCommentList', listArgs(f.objectId, root.lastBuff, root.commentId)));
         if (!d) { left++; break; }
         root.levelTwoComment.push(...d.comment);
-        if (Number(d.downContinueFlag) === 1 && (!d.lastBuff || d.lastBuff === root.lastBuff)) { left++; break; }
+        if (pageMore(d.downContinueFlag) && (!d.lastBuff || d.lastBuff === root.lastBuff)) { left++; break; }
         root.lastBuff = d.lastBuff; root.downContinueFlag = d.downContinueFlag;
       }
     }
@@ -188,6 +189,10 @@ function requireList(list, emptyState, what, note) {
 
 export function parseComments(raw, { accountUid, nickname, fetchedAt }) {
   requireList(raw.feeds, raw.emptyState, '视频号作品列表', raw.note);
+  // S9 接口读：要扫的作品一个都没读到一楼（接口全报错），整个 kind 失败，同步失败会告警；DOM 路径不变
+  if (raw.via === 'api' && raw.works.length && !raw.works.some((w) => w.opened)) {
+    adapterFail('no-data', `${raw.works.length} 个近期作品的评论接口都没读到：${[...new Set(raw.works.map((w) => w.error).filter(Boolean))].join('；') || '原因不明'}`);
+  }
   const myNick = raw.me?.nickname ?? nickname ?? null;
   const feeds = new Map(raw.feeds.map((f) => [f.objectNonce, f]));
   const works = [], comments = [], scannedWorks = [];

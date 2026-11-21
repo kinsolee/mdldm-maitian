@@ -69,6 +69,21 @@ describe('找页面服务', () => {
     assert.deepEqual(await callInPage({ platform: 'Douyin', method: 'awemeV1CommentListReply', args: {} }), { ok: false, error: 'url doesn\'t match' });
   });
 
+  test('webpack 5 接管后 push 是 bind 出来的（toString 是 [native code]）也能找到；还没接管的原生数组跳过', () => {
+    const svc = { awemeV1CommentListSelect() {}, awemeV1CommentListReply() {}, awemeV1CommentMultiPublish() {} };
+    const mods = { 2: { src: 'awemeV1CommentListSelect:e=>1, awemeV1CommentMultiPublish:e=>2', exports: { i: svc } } };
+    const arr = [];
+    function jsonpCallback(parentPush, data) { const req = (id) => mods[id].exports; req.m = { 2: mods[2].src }; data[2]?.(req); return parentPush(data); }
+    arr.push = jsonpCallback.bind(null, arr.push.bind(arr));
+    assert.match(Function.prototype.toString.call(arr.push), /\[native code\]/);
+    globalThis.window = { Garfish: { activeApps: { 0: { global: { webpackChunkcreator_interactive: arr } } } } };
+    assert.equal(locateService({ platform: 'Douyin', ...SERVICES.Douyin }), true);
+    const raw = [];
+    globalThis.window = { Garfish: { activeApps: { 0: { global: { webpackChunkcreator_interactive: raw } } } } };
+    assert.equal(locateService({ platform: 'Douyin', ...SERVICES.Douyin }), false);
+    assert.equal(raw.length, 0);
+  });
+
   test('视频号：wujie iframe 里找；没有服务就返回 false', () => {
     const svc = { getCommentList() {}, createComment() {} };
     const frame = { contentWindow: { __WUJIE: {}, webpackChunkinteraction: chunk({ 9: { src: 'class{async getCommentList(e){} async createComment(e){}}', exports: { lt: svc, x: 1 } } }) } };
@@ -276,6 +291,11 @@ describe('视频号：接口读评论', () => {
     assert.equal(works[0].expandLeft, 1);
     const w2 = await ch.worksViaApi(async () => ({ ok: true, data: { errCode: 300330 } }), feeds, o);
     assert.equal(w2[0].opened, false);
+    // 全部作品都没读到：接口路径报 no-data（同步失败会告警），不能悄悄记成功
+    const raw = { kind: 'comments', via: 'api', windowStartSec: T - 30 * 86400, feeds, emptyState: false, works: w2, me: { nickname: '我' } };
+    assert.throws(() => ch.parseComments(raw, { accountUid: 'sph', fetchedAt: new Date(o.now).toISOString() }), /都没读到/);
+    // DOM 路径的同样数据行为不变
+    assert.equal(ch.parseComments({ ...raw, via: 'dom' }, { accountUid: 'sph', fetchedAt: new Date(o.now).toISOString() }).ok, true);
   });
 });
 
