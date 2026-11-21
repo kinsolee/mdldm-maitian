@@ -115,17 +115,17 @@ const SELECT = 'comment/list/select';
 const SCROLL_BOTTOM = `const e = document.scrollingElement || document.documentElement; e.scrollTop = e.scrollHeight; window.dispatchEvent(new Event('scroll')); return true;`;
 const hasMore = (j) => j != null && j.has_more !== 0 && j.has_more !== false && j.has_more != null;
 /**
- * 第 from 条起抓到的一楼列表响应，按 URL（带 cursor）去重、同一页留最后一次，按到达顺序。
- * 给了作品时，有评论的页要全部属于这个作品；空页（最后一页可能是空的）算进去：from 取在切作品之前，这之后的空页只会是这个作品的。
- * 返回 { pages, error }：error 是第一条 status_code≠0 的响应。
+ * 第 from 条起抓到的一楼列表响应，先按作品过滤、再按 URL（带 cursor）去重（同一页留最后一次），按到达顺序。
+ * 给了作品时，有评论的页要全部属于这个作品；空页、出错页算这个作品的：from 取在切作品之前，这之后的只会是这个作品的。
+ * 只有 status_code === 0 且有 comments 数组的才算有效页；缺 status_code、非 0、没有 comments 的记成 error（第一条）。
  */
 async function selectPages(page, work, from = 0) {
-  const caps = await capturedJson(page, SELECT, from);
-  const bad = caps.find((c) => c.json.status_code != null && c.json.status_code !== 0);
+  const caps = (await capturedJson(page, SELECT, from)).filter((c) => !work || !Array.isArray(c.json.comments) || c.json.comments.every((x) => String(x.aweme_id) === work));
+  const ok = (j) => j.status_code === 0 && Array.isArray(j.comments);
+  const bad = caps.find((c) => !ok(c.json));
   const byUrl = new Map();
-  for (const c of caps) if (c.json.status_code === 0 && Array.isArray(c.json.comments)) { byUrl.delete(c.url); byUrl.set(c.url, c.json); }
-  const pages = [...byUrl.values()].filter((j) => !work || j.comments.every((c) => String(c.aweme_id) === work));
-  return { pages, error: bad ? `status_code=${bad.json.status_code}${bad.json.status_msg ? ` ${bad.json.status_msg}` : ''}` : null };
+  for (const c of caps) if (ok(c.json)) { byUrl.delete(c.url); byUrl.set(c.url, c.json); }
+  return { pages: [...byUrl.values()], error: bad ? `status_code=${bad.json.status_code ?? '缺失'}${bad.json.status_msg ? ` ${bad.json.status_msg}` : ''}${Array.isArray(bad.json.comments) ? '' : '，没有 comments'}` : null };
 }
 // 页面上（fiber）渲染出来了这条评论（接口响应比渲染早到，「回复」按钮、「已删除」都要等渲染）
 const RENDERED = FIBER + `for (const el of document.querySelectorAll('[class*=comment], [class*=reply], [class*=operations-]')) {
@@ -134,9 +134,11 @@ const RENDERED = FIBER + `for (const el of document.querySelectorAll('[class*=co
     if (c && String(c.cid) === arg) return true;
   }
   return false;`;
-// 「查看 N 条回复」：先点属于 arg 这栋楼的（按 fiber 往上找到的评论是这栋楼的一楼）；没有就退回页面上第一个（类名、结构变了时照旧能展开）
-const EXPAND_FOR = `() => { ${FIBER} const all = (${EXPAND_SRC})().filter((e) => !e.dataset.engDead);
-  return all.find((e) => __findUp(e, __pickCid) === ARG) ?? all[0] ?? null; }`;
+// 「查看 N 条回复」：先点属于 ROOT 这栋楼的（按 fiber 往上找到的评论是这栋楼的一楼）。
+// 没有时：STRICT（这栋楼已经加载出来）只退回认不出属于哪条的按钮（结构变了时照旧能展开），不点明确属于别的楼的；否则退回页面上第一个
+const EXPAND_FOR = (root, strict) => `() => { ${FIBER} const all = (${EXPAND_SRC})().filter((e) => !e.dataset.engDead);
+  const own = all.find((e) => __findUp(e, __pickCid) === ${JSON.stringify(root)}); if (own) return own;
+  return ${strict ? 'all.find((e) => __findUp(e, __pickCid) == null)' : 'all[0]'} ?? null; }`;
 
 async function prepareReply({ page, params, t, me }) {
   const tg = params.target ?? {};
@@ -170,28 +172,34 @@ async function prepareReply({ page, params, t, me }) {
   const seen = () => list.some((x) => x.id === id || x.id === root);
   while (!seen() && !sp.error && sp.pages.length < maxPages && hasMore(sp.pages.at(-1))) {
     const before = sp.pages.length;
-    const next = await waitFor(async () => { await inPage(page, SCROLL_BOTTOM); const x = await selectPages(page, work, from); return x.pages.length > before || x.error ? x : null; }, Math.min(t.loadMs, 10000), 1000);
-    list = await comments(page);
+    // 先看有没有新页，没有再滚
+    const next = await waitFor(async () => { const x = await selectPages(page, work, from); if (x.pages.length > before || x.error) return x; await inPage(page, SCROLL_BOTTOM); return null; }, Math.min(t.loadMs, 10000), 1000);
     if (!next) break;
     sp = next;
     list = await comments(page);
   }
+  // 一楼接口返回异常（缺 status_code、非 0、没有 comments）：抓到的评论不拿来当依据
+  if (sp.error) return { blocked: 'target-not-found', detail: `评论 ${id}${work ? `（作品 ${work}）` : ''}：一楼列表接口返回异常（${sp.error}），没发` };
   const n = sp.pages.length;
-  const paging = seen() ? '' : sp.error ? `；一楼列表接口报错（${sp.error}）`
-    : !n ? '；没抓到一楼列表'
+  const paging = seen() ? '' : !n ? '；没抓到一楼列表'
     : hasMore(sp.pages.at(-1)) ? `；一楼加载了 ${n} 页${n >= maxPages ? '到上限' : '，再滚也没加载出下一页'}，还有更多`
     : `；一楼已翻到底（${n} 页）`;
   // 目标或它所在的楼都没加载出来：楼中楼展开不出别的楼，不点（给了 rootId / parentId 时 root 就是它所在的一楼）
   const rootKnown = tg.rootId != null || tg.parentId != null;
+  // 目标所在的楼在接口里有了、页面可能还没渲染：等它渲染出来，它的「查看 N 条回复」才找得到
+  if (list.some((x) => x.id === root)) await waitFor(() => inPage(page, RENDERED, root), Math.min(t.loadMs, 8000), 300);
   // 目标所在楼的子回复没加载全（判「已回复」要看全楼）、或目标还没出现，就点「查看 N 条回复」，先点目标所在的楼
   for (let i = 0; i < max && (seen() || !rootKnown); i++) {
     const hit = list.find((x) => x.id === id);
     const r = list.find((x) => x.id === root);
     const loaded = list.filter((x) => x.root === root).length;
     if (hit && r && r.total != null && loaded >= r.total) break;
-    if (!(await clickMarked(page, EXPAND_FOR.replace('ARG', JSON.stringify(root)), 'expand comment replies'))) break;
-    await page.evaluate(() => document.querySelector('[data-eng-click]')?.setAttribute('data-eng-dead', '1'));
-    await sleep(1200);
+    const capBefore = await capCount(page), nBefore = list.length;
+    if (!(await clickMarked(page, EXPAND_FOR(root, !!r), 'expand comment replies'))) break;
+    // 楼中楼接口可能 1 秒以上才回：最多等 3 秒，抓到楼中楼响应或评论变多才算点开了；都没有才标记不再点
+    const grew = await waitFor(async () => (await capturedJson(page, 'comment/list/reply', capBefore)).length > 0 || (await comments(page)).length > nBefore, 3000, 300);
+    if (!grew) await page.evaluate(() => document.querySelector('[data-eng-click]')?.setAttribute('data-eng-dead', '1'));
+    await sleep(600);
     list = await comments(page);
   }
   let hit = list.find((x) => x.id === id);
@@ -208,13 +216,13 @@ async function prepareReply({ page, params, t, me }) {
   // 楼里有我的回复、但只从页面视图模型读到（没抓到楼中楼接口），不知道它回的是谁：可能就是回目标的，不发
   const unsure = list.find((x) => mine(x) && x.id !== id && x.root === root && !x.toKnown);
   if (unsure) return { blocked: 'thread-incomplete', detail: `楼 ${root} 里有我的回复 ${unsure.id}，但读不到它回的是哪条，判断不了是否已回复，没发` };
-  // 展开到上限还没加载全：看不到的那部分可能有我的旧回复，不发
+  // 展开到上限还没加载全：看不到的那部分可能有我的旧回复，不发。
+  // 楼的一楼没加载出来、或接口和页面都没给楼中楼总数：判断不了全没全，也不发
   const r = list.find((x) => x.id === root);
   const loaded = list.filter((x) => x.root === root).length;
-  const leftButtons = await inPage(page, `return (${EXPAND_SRC})().length`);
-  if ((r?.total != null && loaded < r.total) || (r?.total == null && leftButtons > 0)) {
-    return { blocked: 'thread-incomplete', detail: `楼 ${root} 的回复没加载全（已加载 ${loaded}${r?.total != null ? ` / ${r.total}` : ''}），判断不了是否已回复，没发` };
-  }
+  if (!r) return { blocked: 'thread-incomplete', detail: `评论 ${id} 所在楼的一楼 ${root} 没加载出来，判断不了是否已回复，没发` };
+  if (r.total == null) return { blocked: 'thread-incomplete', detail: `楼 ${root} 读不到楼中楼总数（已加载 ${loaded}），判断不了是否已回复，没发` };
+  if (loaded < r.total) return { blocked: 'thread-incomplete', detail: `楼 ${root} 的回复没加载全（已加载 ${loaded} / ${r.total}），判断不了是否已回复，没发` };
 
   // 「回复」：操作区的子元素，文字（去掉空白、图标没有文字）等于「回复」，并且按 fiber 属于目标评论。hover 前后都在，不用 hover
   const found = await mark(page, 'reply', FIBER + `return [...document.querySelectorAll('[class*=operations-] > *')]

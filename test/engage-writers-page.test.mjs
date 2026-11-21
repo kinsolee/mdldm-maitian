@@ -249,6 +249,25 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
       assertNoSend(x, 'target-not-found');
       assert.match(x.r.detail, /翻到底（3 页）/);
     });
+    // 第二轮评审（Gemini、GPT）
+    test('目标是楼中楼、一楼翻页后渲染晚 1.5 秒：等目标所在的楼渲染出来再展开', async () => {
+      const x = await reply('ok', { commentId: 'w05-c30r1', workId: 'w05', parentId: 'w05-c30', rootId: 'w05-c30' }, {}, { drawerDelay: 300, roots: 35, subsAll: '1', renderDelay: 1500 });
+      sentOn(x, 'w05', 'w05-c30');
+    });
+    test('点「查看 N 条回复」2 秒后才出来：等它出来，不当成点不动', async () => {
+      const x = await reply('slowexpand', { commentId: 'w05-c0r1', workId: 'w05', parentId: 'w05-c0', rootId: 'w05-c0' }, {}, { drawerDelay: 300 });
+      sentOn(x, 'w05', 'w05-c0');
+    });
+    test('切过去的作品一楼响应没有 status_code：不拿它当依据，target-not-found', async () => {
+      const x = await reply('nostatus', {}, {}, { drawerDelay: 300 });
+      assertNoSend(x, 'target-not-found');
+      assert.match(x.r.detail, /status_code=缺失/);
+    });
+    test('接口和页面都没有楼中楼总数：判断不了楼全没全，thread-incomplete，不发', async () => {
+      const x = await reply('nototal', on('w05', 2), {}, { drawerDelay: 300 });
+      assertNoSend(x, 'thread-incomplete');
+      assert.deepEqual(x.probe.boxes, []);
+    });
     test('要切作品但页面上没有「选择作品」：target-not-found，写明原因', async () => {
       const x = await reply('nopicker');
       assertNoSend(x, 'target-not-found');
@@ -261,9 +280,9 @@ describe('页面写入适配器（真实 Ego Lite + 本地测试页）', { skip:
     });
 
     // 读适配器（抓评论）用同一个 switchTo
-    const switchTo = async (work, opts = {}, then = null) => {
+    const switchTo = async (work, opts = {}, then = null, q = {}) => {
       const res = await runEgoTask({ space: s, timeoutMs: 120_000, params: { adapterUrl: new URL('../src/ops/engage/adapters/douyin.mjs', import.meta.url).href,
-        libUrl: new URL('../src/ops/engage/adapters/page-lib.mjs', import.meta.url).href, url: pageUrl('douyin-comments-picker.html', { mode: 'ok' }), work, opts, then },
+        libUrl: new URL('../src/ops/engage/adapters/page-lib.mjs', import.meta.url).href, url: pageUrl('douyin-comments-picker.html', { mode: 'ok', ...q }), work, opts, then },
       script: `const m = await import(params.adapterUrl); const L = await import(params.libUrl);
 const page = await L.mainPage(task); await L.open(page, params.url); await L.sleep(1500);
 const r = await m.switchTo(page, params.work, params.opts); await L.sleep(1500);
@@ -291,6 +310,23 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
       assert.equal(x.afterFirst.drawerOpen, false);
       assert.equal(x.r2.ok, true, JSON.stringify(x.r2));
       assert.equal(x.probe.current, 'w44');
+    });
+    test('读适配器 switchTo：作品列表一直没出来，也关掉抽屉', async () => {
+      const x = await switchTo('w05', { listMs: 2000 }, null, { drawerDelay: 600000 });
+      assert.equal(x.r.ok, false);
+      assert.match(x.r.detail, /作品列表没出来/);
+      assert.equal(x.probe.drawerOpen, false);
+    });
+    test('读适配器 switchTo：抽屉卡片认不出作品 id 时，不把页头的当前作品当成卡片点', async () => {
+      const x = await switchTo('w00', { listMs: 3000 }, null, { noCardIds: '1', drawerDelay: 300 });
+      assert.equal(x.r.ok, false, JSON.stringify(x.r));
+      assert.match(x.r.detail, /作品列表没出来/);
+      assert.equal(x.probe.drawerOpen, false);
+    });
+    test('读适配器 switchTo：点遮罩关不掉时点右上角关闭', async () => {
+      const x = await switchTo('w99', {}, 'w44', { maskClosable: '0' });
+      assert.equal(x.afterFirst.drawerOpen, false);
+      assert.equal(x.r2.ok, true, JSON.stringify(x.r2));
     });
   });
 

@@ -27,7 +27,7 @@
     「发布于」叶子的 fiber 往上 4 层 props 里有作品对象 { item_id_plain, item_id, comment_count, create_time, title, ... }。
     抽屉滚动容器是 div.douyin-creator-interactive-sidesheet-body，滚到底才请求下一页；
     底部 div.loading-W3YH0U「没有更多视频」一直显示（还有下一页时也显示），不能当到底的依据。
-    页头当前作品也有一个「发布于」叶子，不在抽屉里、fiber 上没有 item_id_plain。
+    页头当前作品也有一个「发布于」叶子，不在抽屉里；它的 fiber 往上 3 层 props.data 也是作品对象（有 item_id_plain，2026-11-21 第二次核对），不能当成抽屉里的作品。
   - 点作品卡片后抽屉关掉，页面请求这个作品的一楼列表：每页 10 条，has_more、cursor、total；滚到页面底部才请求下一页（cursor=10、20…）。
     列表底部 div.loading-NTmKHl「没有更多评论」也是一直显示的，不能当到底的依据。
   评论块、操作区、回复框的结构同 douyin-comments-real.html。
@@ -36,6 +36,9 @@
        | emptydefault（默认作品没有评论）| nopicker（没有「选择作品」按钮）| noload（点了作品后一楼列表一直不来）
        &roots= 每个作品几条一楼（默认 19）&renderDelay= 一楼响应到了之后多久才渲染（默认 0）
        &subsAll=1 每条一楼下都有 1 条楼中楼 &emptyTail=1 最后一页满 10 条时接口仍说 has_more，再翻一页才回空页
+       | nostatus（切过去的作品一楼响应没有 status_code）| nototal（一楼接口和页面都没有楼中楼总数）| slowexpand（点「查看 N 条回复」2 秒后才出来）
+       &maskClosable=0 点遮罩不关抽屉（只能点右上角关闭）
+       &noCardIds=1 抽屉里的作品卡片 fiber 上没有 item_id_plain（2026-11-21 真实页面偶尔出现的另一个版本，只有页头的当前作品带作品对象）
        &drawerDelay= 打开抽屉后多久出作品列表（默认 3500ms，race 默认 200ms）&listDelay= 默认作品的一楼列表多久到（默认 600ms，race 默认 4000ms）
   作品 w00…w44（w00 最新、默认选中），每页 20 个；每个作品 19 条一楼 <作品>-c0…c18，c0 下有 1 条楼中楼 <作品>-c0r1。
 -->
@@ -56,6 +59,8 @@ const rootsN = Number(q.get('roots') ?? 19);
 const renderDelay = Number(q.get('renderDelay') ?? 0);
 const subsAll = q.get('subsAll') === '1';
 const emptyTail = q.get('emptyTail') === '1';
+const maskClosable = q.get('maskClosable') !== '0';
+const noCardIds = q.get('noCardIds') === '1';
 const ME = '106';
 const FK = '__reactFiber$wtest';
 window.__loginUser = { uid: ME, nickname: '麦田测试号' };
@@ -74,6 +79,7 @@ function dataOf(w) {
   const roots = Array.from({ length: n }, (_, i) => C(w, `${w}-c${i}`, String(600 + i), '用户' + i, '一楼评论' + i));
   const subs = {};
   for (const r of roots) if (subsAll || r === roots[0]) { subs[r.cid] = [C(w, `${r.cid}r1`, '599', '乙', '楼中楼一条', { reply_id: r.cid })]; r.reply_comment_total = 1; }
+  if (mode === 'nototal') for (const r of roots) delete r.reply_comment_total;
   if (mode === 'replied' && roots[15]) { roots[15].reply_comment_total = 1; subs[`${w}-c15`] = [C(w, `${w}-c15me`, ME, '麦田测试号', '之前回过了', { reply_id: `${w}-c15` })]; }
   return (data[w] = { roots, subs, loaded: 0, done: false, expanded: {} });
 }
@@ -86,7 +92,8 @@ function pushSelect(w, from) {
   d.loaded = from + page.length;
   if (!page.length) d.done = true;
   const more = d.loaded < d.roots.length || (emptyTail && page.length > 0);
-  cap.push({ url: API + `read/aweme/v1/web/comment/list/select/?cursor=${from}`, t: Date.now(), body: JSON.stringify({ status_code: 0, comments: page, cursor: from + 10, has_more: more ? 1 : 0, total: d.roots.length }) });
+  const status = mode === 'nostatus' && w !== DEFAULT ? {} : { status_code: 0 };
+  cap.push({ url: API + `read/aweme/v1/web/comment/list/select/?cursor=${from}`, t: Date.now(), body: JSON.stringify({ ...status, comments: page, cursor: from + 10, has_more: more ? 1 : 0, total: d.roots.length }) });
 }
 const hasNext = (d) => d.loaded < d.roots.length || (emptyTail && d.roots.length > 0 && !d.done);
 function showWork(w) { shown = w; render(); }
@@ -113,6 +120,9 @@ function pushItems(from) {
     body: JSON.stringify({ status_code: 0, item_info_list: page, has_more: drawerLoaded < WORKS.length, cursor: 'c' + drawerLoaded, total_count: WORKS.length }) });
 }
 function fiberize(el, propsList) { let f = null; for (const p of [...propsList].reverse()) f = { memoizedProps: p, return: f }; el[FK] = f; }
+// 页头当前作品：fiber 往上 3 层 props.data 是作品对象
+const headerFiber = () => fiberize(document.getElementById('cur-time'), [{ className: 'time-a_67WG' }, {}, {}, { data: WORKS.find((x) => x.item_id_plain === current) }]);
+headerFiber();
 function renderCards(ul) {
   ul.innerHTML = '';
   for (const it of WORKS.slice(0, drawerLoaded)) {
@@ -120,7 +130,7 @@ function renderCards(ul) {
     card.className = 'card-OiVt4v' + (it.item_id_plain === current ? ' active-CiRg6S' : '');
     card.innerHTML = `<img class="cover-ohOwm0"><div class="content-vwj9AA"><div class="cardTitle-Hga6iC">${it.title}</div><div class="desc-tgwUOz"><div class="time-a_67WG">${it.create_time}</div></div></div>
       <div class="metrics-UeAUkj"><span role="img" class="dux-icon"><svg></svg></span><div>${it.comment_count}</div></div>`;
-    fiberize(card.querySelector('.time-a_67WG'), [{ className: 'time-a_67WG' }, { className: 'desc-tgwUOz' }, {}, { className: 'content-vwj9AA' }, { item: it, active: it.item_id_plain === current, onClick() {} }]);
+    fiberize(card.querySelector('.time-a_67WG'), [{ className: 'time-a_67WG' }, { className: 'desc-tgwUOz' }, {}, { className: 'content-vwj9AA' }, noCardIds ? { card: { title: it.title }, active: it.item_id_plain === current, onClick() {} } : { item: it, active: it.item_id_plain === current, onClick() {} }]);
     card.onclick = () => pick(it.item_id_plain);
     ul.appendChild(card);
   }
@@ -133,16 +143,17 @@ if (pickerBtn) pickerBtn.onclick = () => {
   closeDrawer();
   const mask = document.createElement('div');
   mask.className = 'douyin-creator-interactive-sidesheet-mask';
-  mask.onclick = closeDrawer;
+  mask.onclick = () => { if (maskClosable) closeDrawer(); };
   document.body.appendChild(mask);
   drawerLoaded = 0;
   const dlg = document.createElement('div');
   dlg.setAttribute('role', 'dialog');
   dlg.className = 'douyin-creator-interactive-sidesheet-inner douyin-creator-interactive-sidesheet-inner-wrap douyin-creator-interactive-sidesheet-size-small';
-  dlg.innerHTML = `<div class="douyin-creator-interactive-sidesheet-content"><div class="douyin-creator-interactive-sidesheet-header" role="heading"><div class="title-KMTyEo"><div>选择作品</div></div></div>
+  dlg.innerHTML = `<div class="douyin-creator-interactive-sidesheet-content"><div class="douyin-creator-interactive-sidesheet-header" role="heading"><div class="title-KMTyEo"><div>选择作品</div></div><button type="button" class="douyin-creator-interactive-sidesheet-close" aria-label="close">×</button></div>
     <div class="douyin-creator-interactive-sidesheet-body"><div><div class="douyin-creator-interactive-list"><ul class="douyin-creator-interactive-list-items"></ul></div>
     <div class="loading-W3YH0U">没有更多视频</div></div></div></div>`;
   document.body.appendChild(dlg);
+  dlg.querySelector('.douyin-creator-interactive-sidesheet-close').onclick = closeDrawer;
   const body = dlg.querySelector('.douyin-creator-interactive-sidesheet-body');
   const ul = dlg.querySelector('ul');
   setTimeout(() => { pushItems(0); renderCards(ul); }, drawerDelay);
@@ -155,6 +166,7 @@ if (pickerBtn) pickerBtn.onclick = () => {
 function pick(w) {
   closeDrawer();
   current = w;
+  headerFiber();
   Object.assign(dataOf(w), { loaded: 0, done: false });
   document.getElementById('list').innerHTML = '';
   shown = null;
@@ -208,9 +220,14 @@ function render() {
       more.textContent = d.expanded[r.cid] ? '收起' : `查看 ${s.length} 条回复`;
       more.onclick = () => {
         if (d.expanded[r.cid]) return;
-        d.expanded[r.cid] = true;
-        cap.push({ url: API + `read/aweme/v1/web/comment/list/reply/?comment_id=${r.cid}&item_id=${shown}&cursor=0`, t: Date.now(), body: JSON.stringify({ status_code: 0, comments: s, has_more: 0, cursor: 10, total: s.length }) });
-        render();
+        if (more.dataset.loading) return;
+        more.dataset.loading = '1';
+        const w = shown;
+        setTimeout(() => {
+          d.expanded[r.cid] = true;
+          cap.push({ url: API + `read/aweme/v1/web/comment/list/reply/?comment_id=${r.cid}&item_id=${w}&cursor=0`, t: Date.now(), body: JSON.stringify({ status_code: 0, comments: s, has_more: 0, cursor: 10, total: s.length }) });
+          render();
+        }, mode === 'slowexpand' ? 2000 : 0);
       };
       rl.appendChild(more);
       block.querySelector('.content-FM0UMi > div').appendChild(rl);
