@@ -87,6 +87,7 @@ export const toEvent = (r, delivery = { attempts: r.attempts ?? 0, lastAttemptAt
   payload: json(r.payload),
   delivery,
   handled: r.handledAt == null ? null : { at: r.handledAt, outcome: r.handledOutcome, actionId: r.actionId, note: r.handledNote },
+  ...(r.filteredReason ? { filteredReason: r.filteredReason } : {}),   // 推送前被过滤（见 filter.mjs）才有
 });
 
 const toWork = (r) => ({
@@ -203,6 +204,7 @@ function compactEvent(db) {
     return {
       id: r.id, type: r.type, subjectId: r.subjectId, author: p.nickname ?? null, isMe: c ? c.authorIsMe === 1 : false,
       replyTo: c?.replyToNickname ?? null, text: p.text ?? null, at: r.createdAt, depth: c?.depth ?? null,
+      ...(r.filteredReason ? { filteredReason: r.filteredReason } : {}),
     };
   };
 }

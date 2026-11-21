@@ -24,14 +24,14 @@ const cursor = z.string().optional().describe('上一页返回的 nextCursor');
 const limit = z.number().int().positive().optional().describe('每页条数，默认 50，最多 200');
 const since = z.string().optional().describe('ISO 时间');
 const compact = z.boolean().optional().describe('true 时返回扁平精简列表（JSON 不缩进），每条只有 id、author、isMe、replyTo、text、at、depth，省 token；不传返回完整版');
-const compactEvents = z.boolean().optional().describe('true 时返回扁平精简列表（JSON 不缩进），每条只有 id、type、subjectId、author、isMe、replyTo、text、at、depth；回复用 subjectId。不传返回完整版');
+const compactEvents = z.boolean().optional().describe('true 时返回扁平精简列表（JSON 不缩进），每条只有 id、type、subjectId、author、isMe、replyTo、text、at、depth（推送前被过滤的多一个 filteredReason）；回复用 subjectId。不传返回完整版');
 const id = (what) => z.string().describe(`${what}，写成 <platformCode>:<原生 id>`);
 
 // [工具名, 说明, 入参, (db, args) => 结果]
 const READ_TOOLS = [
   ['list_accounts', '列出账号：登录状态、能力位、各类数据上次抓取成功的时间（lastSync）', {}, (db) => q.listAccounts(db)],
   ['inbox', '每个平台的未处理事件数、未读会话数、未回复评论数', { platforms }, (db, a) => q.inbox(db, a)],
-  ['list_events', '列事件（旧到新）。unhandled: true 取还没回执的，用来补漏推。compact: true 返回精简条目', {
+  ['list_events', '列事件（旧到新）。unhandled: true 取还没回执的，用来补漏推。推送前被确定规则过滤的（self-author、peer-reply）已自动回执 skipped，带 filteredReason。compact: true 返回精简条目', {
     types: z.array(z.enum(EVENT_TYPES)).optional(), platforms, unhandled: z.boolean().optional(), since, cursor, limit, compact: compactEvents,
   }, (db, a) => q.listEvents(db, a)],
   ['ack_event', '回执一个事件：处理完一条就调，outcome 是 replied / skipped / pending_human / ignored', {

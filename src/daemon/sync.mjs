@@ -14,6 +14,7 @@ import { defaultNotify } from '../ops/login.mjs';
 import { ingestSnapshot, createJob, startJob, finishJob, getJob, pendingRefreshes, reclaimStaleJobs, recordSyncFailure, recordLoginLost, SYNC_KINDS } from '../ops/engage/store.mjs';
 import { redact } from '../ops/engage/redact.mjs';
 import { deliverPending } from './outbox.mjs';
+import { applyEventFilters } from '../ops/engage/filter.mjs';
 import { ENGAGE_PLATFORMS, isDue } from './schedule.mjs';
 import { acquireRoundLock, heldLock } from './round-lock.mjs';
 
@@ -69,8 +70,14 @@ async function runJob(db, account, kind, jobId, deps) {
     try {
       const s = ingestSnapshot(db, account, r, { now });
       const stats = { inserted: s.inserted, updated: s.updated, gone: s.gone, events: s.events.length };
+      // 评论一入库就过滤：一轮要抓好几分钟，不等到最后推送前，免得中间 list_events({ unhandled: true }) 补漏先捞到。推送前还会再跑一次兜底。
+      // 不看这次有没有新事件：已有事件的评论字段（例如 replyToUid）也可能在这次更新后才命中规则。放在 finishJob 之前，任务显示完成时过滤已落库
+      let filtered = [];
+      if (kind === 'comments') {
+        try { filtered = applyEventFilters(db, { now }); } catch (e) { log(`${localTime(now())} [engage] 入库后过滤出错（推送前会再试）：${redact(e.message)}`); }
+      }
       finishJob(db, jobId, { status: 'ok', stats, now });
-      return { ...out, status: 'ok', stats };
+      return { ...out, status: 'ok', stats, ...(filtered.length ? { filtered } : {}) };
     } catch (e) { r = { ok: false, reason: 'ingest', error: e.message }; }
   }
   if (r?.ok === false && r.skipped) {
@@ -167,11 +174,19 @@ export async function runRound(db, {
       }
     }
     let delivery;
+    const filtered = jobs.flatMap((j) => j.filtered ?? []);   // 入库后已过滤的；推送出错时也要记进汇总
+    const logFiltered = () => { if (filtered.length) log(`${localTime(now())} [engage] 过滤 ${filtered.length} 条（${Object.entries(Object.groupBy(filtered, (f) => f.rule)).map(([k, v]) => `${k} ${v.length}`).join('，')}），已回执 skipped`); };
     try {
       const d = await deliverPending(db, { now, fetchImpl, notify });
-      delivery = { batches: d.batches.length, failedBatches: d.batches.filter((b) => !b.ok).length, alerts: d.alerts };
+      filtered.push(...d.filtered);
+      delivery = { batches: d.batches.length, failedBatches: d.batches.filter((b) => !b.ok).length, alerts: d.alerts, filtered: filtered.length };
+      logFiltered();
       if (d.batches.length) log(`${localTime(now())} [engage] 推送 ${d.batches.length} 批，失败 ${delivery.failedBatches} 批`);
-    } catch (e) { delivery = { error: redact(e.message) }; log(`${localTime(now())} [engage] 推送出错：${delivery.error}`); }
+    } catch (e) {
+      delivery = { error: redact(e.message), filtered: filtered.length };
+      logFiltered();
+      log(`${localTime(now())} [engage] 推送出错：${delivery.error}`);
+    }
     return { ran: true, jobs, delivery };
   } finally { lock.release(); }
 }

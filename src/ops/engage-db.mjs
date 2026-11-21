@@ -84,6 +84,8 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt)
 `);
   // 本分支早期建的 actions 没有 targetLastAt
   if (!db.prepare('PRAGMA table_info(actions)').all().some((c) => c.name === 'targetLastAt')) db.exec('ALTER TABLE actions ADD COLUMN targetLastAt TEXT');
+  // 推送前过滤（filter.mjs）命中的规则名；没命中为 NULL
+  if (!db.prepare('PRAGMA table_info(events)').all().some((c) => c.name === 'filteredReason')) db.exec('ALTER TABLE events ADD COLUMN filteredReason TEXT');
   // 自动关分两组：write（回复、私信）、moderate（删评论、拉黑、删会话）。旧记录 NULL 当 write
   if (!db.prepare('PRAGMA table_info(engage_write_trips)').all().some((c) => c.name === 'family')) db.exec('ALTER TABLE engage_write_trips ADD COLUMN family TEXT');
 }

@@ -23,8 +23,9 @@ const sign = (secret, raw) => `sha256=${createHmac('sha256', secret).update(raw)
 const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'openbot-recv-'));
 const ev = (id, type = 'comment.created') => ({ id, type, platform: 'Douyin', payload: { text: `正文${id}`, nickname: `昵称${id}` } });
 
-async function start({ forward, now = Date.now, log = () => {} } = {}) {
-  const store = openStore(':memory:');
+// 这里的用例测的是攒批以外的行为，窗口设 0（来了就投）；攒批见 openbot-push.test.mjs
+async function start({ forward, now = Date.now, log = () => {}, batchWindowMs = 0 } = {}) {
+  const store = openStore(':memory:', { batchWindowMs });
   const calls = [];
   const fwd = forward ?? (async (ids, key) => { calls.push({ ids, key }); return { deliveryId: `d${calls.length}`, status: 'queued' }; });
   const r = createReceiver({ secret: SECRET, subscriberId: SUB, store, forward: fwd, log, now });
@@ -248,7 +249,7 @@ describe('整条链路：麦田发件箱 → 接收端 → OpenBot', () => {
     // 用接收端的密钥换成麦田发的这把
     t.receiver.stop();
     await t.close();
-    const store = openStore(':memory:');
+    const store = openStore(':memory:', { batchWindowMs: 0 });
     const calls = [];
     const r = createReceiver({ secret, subscriberId: SUB, store, forward: async (ids, key) => { calls.push({ ids, key }); return { deliveryId: 'd' }; }, log: () => {} });
     const server = http.createServer(r.handler);
@@ -258,16 +259,18 @@ describe('整条链路：麦田发件箱 → 接收端 → OpenBot', () => {
     ingestSnapshot(db, douyin(db), commentsSnap([comment('r1'), comment('r2'), comment('a', { parent: 'r1' })]), { now: at(T0 + 2 * MIN) });
     const sent = await deliverPending(db, { now: at(T0 + 3 * MIN), notify: async () => true });
     assert.deepEqual(sent.batches.map((b) => b.ok), [true]);
+    // a 是网友回网友的一楼（peer-reply），麦田侧过滤掉、自动回执，不推
+    assert.deepEqual(sent.filtered, [{ eventId: 'comment.created:Douyin:a', rule: 'peer-reply' }]);
     await r.drain();
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].ids, ['comment.created:Douyin:a', 'comment.created:Douyin:r2']);
+    assert.deepEqual(calls[0].ids, ['comment.created:Douyin:r2']);
 
     // 2 小时没回执，麦田重带一次：接收端认出是重复，不再投
     const again = await deliverPending(db, { now: at(T0 + 3 * MIN + 2 * 3600_000 + MIN), notify: async () => true });
     assert.deepEqual(again.batches.map((b) => b.ok), [true]);
     await r.drain();
     assert.equal(calls.length, 1);
-    assert.equal(store.stats().total, 2);
+    assert.equal(store.stats().total, 1);
 
     r.stop();
     server.closeAllConnections();

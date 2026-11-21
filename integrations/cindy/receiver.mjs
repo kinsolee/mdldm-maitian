@@ -81,7 +81,7 @@ export async function backfillOnce({ inbox, listEvents, types, now = Date.now })
     if (!page || !Array.isArray(page.items)) throw new Error('list_events 返回的不是 { items }');
     const bad = page.items.find((e) => eventProblem(e));
     if (bad) throw new Error(`list_events 返回了不合格的事件（${eventProblem(bad)}）`);
-    items.push(...page.items);
+    items.push(...page.items.filter((e) => !e.filteredReason));   // 麦田推送前过滤掉、已自动回执的不收
     if (!page.nextCursor) break;
     cursor = page.nextCursor;
   }
