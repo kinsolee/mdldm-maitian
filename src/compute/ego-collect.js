@@ -62,8 +62,11 @@ await step('kaggle', async () => {
   const sec = (v) => (v == null ? null : Number(String(v).replace(/s$/, '')));
   const quota = (q) => q && { totalHours: sec(q.totalTimeAllowed) / 3600, usedHours: sec(q.timeUsed) / 3600, reservedHours: sec(q.timeReserved) / 3600, leftHours: (sec(q.totalTimeAllowed) - sec(q.timeUsed) - sec(q.timeReserved)) / 3600 };
   // ListKernelSessions：没有会话时只回 quotaLimits；有会话时是一个数组字段，名字不确定，取所有对象数组
-  const sb = r.s.body || {};
-  const list = Object.entries(sb).filter(([k, v]) => k !== 'quotaLimits' && Array.isArray(v)).flatMap(([, v]) => v);
+  const sb = r.s.body;
+  const arrays = sb && typeof sb === 'object' && !Array.isArray(sb) ? Object.entries(sb).filter(([k, v]) => k !== 'quotaLimits' && Array.isArray(v)) : [];
+  // 实测没有会话时只回 quotaLimits；既没有 quotaLimits 也没有列表字段，就不能当「已确认没有会话」
+  if (!arrays.length && !(sb && typeof sb.quotaLimits === 'object' && sb.quotaLimits)) return { status: 'error', error: 'Kaggle 会话列表的格式看不懂（接口可能改版）' };
+  const list = arrays.flatMap(([, v]) => v);
   const sessions = list.map((s, i) => ({ id: String(s.id ?? s.kernelSessionId ?? s.sessionId ?? i), title: String(s.title ?? s.kernelTitle ?? s.name ?? '').slice(0, 80), accelerator: String(s.accelerator ?? s.machineShape ?? '') }));
   return { status: 'ok', metrics: { gpu: quota(r.q.body.gpuQuota), tpu: quota(r.q.body.tpuQuota), refreshAt: r.q.body.quotaRefreshTime || null, sessionsKnown: r.s.status === 200 }, sessions };
 });

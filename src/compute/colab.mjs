@@ -48,10 +48,15 @@ export async function readColab(opts = {}) {
   const u = await runColab(['usage'], opts);
   if (needsAuth(u)) return { status: 'auth_required', error: AUTH_HINT };
   if (u.code !== 0) return { status: 'error', error: cleanErr(u) };
+  const usage = parseUsage(u.out);
+  if (usage.balance == null || usage.assignments == null) return { status: 'error', error: 'colab usage 的输出看不懂（CLI 可能改版）' };
   const s = await runColab(['sessions'], opts);
   if (needsAuth(s)) return { status: 'auth_required', error: AUTH_HINT };
-  if (s.code !== 0) return { status: 'error', metrics: parseUsage(u.out), error: cleanErr(s) };
-  return { status: 'ok', metrics: parseUsage(u.out), sessions: parseSessions(s.out) };
+  if (s.code !== 0) return { status: 'error', metrics: usage, error: cleanErr(s) };
+  const sessions = parseSessions(s.out);
+  // 只有明确说「没有会话」才算空；解析不出行又没这句话，不能当空闲
+  if (!sessions.length && !/No active sessions/i.test(s.out)) return { status: 'error', metrics: usage, error: 'colab sessions 的输出看不懂（CLI 可能改版）' };
+  return { status: 'ok', metrics: usage, sessions };
 }
 
 export async function stopColab(id, opts = {}) {

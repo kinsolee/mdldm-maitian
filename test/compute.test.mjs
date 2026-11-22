@@ -44,6 +44,15 @@ describe('Colab CLI 解析和降级', () => {
     });
   });
 
+  test('输出看不懂（退出码 0）：算失败，不当空闲', async () => {
+    const d = tmp(), bin = path.join(d, 'colab');
+    fs.writeFileSync(bin, '#!/bin/sh\nif [ "$1" = usage ]; then printf "Current balance: 1.00 compute units\\nUsage rate: 0.00/hr\\nActive assignments: 0\\n"; else echo "something new"; fi\n', { mode: 0o755 });
+    const r = await readColab({ bin });
+    assert.equal(r.status, 'error'); assert.match(r.error, /sessions 的输出看不懂/);
+    fs.writeFileSync(bin, '#!/bin/sh\necho hello\n', { mode: 0o755 });
+    assert.match((await readColab({ bin })).error, /usage 的输出看不懂/);
+  });
+
   test('正常 / 有会话 / 失败 / 没装 CLI', async () => {
     await withEnv({ FAKE_COLAB_MODE: 'ok' }, async () => {
       const r = await readColab({ bin: COLAB });
@@ -173,24 +182,49 @@ describe('服务：单飞、防抖、ego 失败保留旧快照', () => {
     } finally { a.close(); b.close(); }
   });
 
-  test('锁文件读不懂：当作占用；10 分钟没动过才清；释放只删自己 token 的', () => {
+  test('锁文件内容坏了（半写 JSON、{}、null、[]、pid 不对）：都当占用，不删；释放只删自己 token 的', () => {
     const d = tmp(), f = path.join(d, 'x.lock');
-    fs.writeFileSync(f, '{"pid":');
-    assert.equal(tryRefreshLock(f, {}).ok, false, '半写或损坏先当在跑');
-    const old = new Date(Date.now() - 11 * 60_000); fs.utimesSync(f, old, old);
+    for (const bad of ['{"pid":', '{}', 'null', '[]', JSON.stringify({ pid: 'x', token: 't', startedAt: 1, heartbeatAt: 1, heartbeatFile: 'h' })]) {
+      fs.writeFileSync(f, bad);
+      const r = tryRefreshLock(f, {});
+      assert.equal(r.ok, false, bad); assert.equal(r.holder.corrupt, true, bad);
+      assert.equal(fs.readFileSync(f, 'utf8'), bad, '坏锁原样留着');
+    }
+    fs.rmSync(f);
     const a = tryRefreshLock(f, { scope: 'all' });
-    assert.equal(a.ok, true, '久未更新的坏锁可接管');
-    assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).token, a.token);
+    assert.equal(a.ok, true);
     assert.equal(tryRefreshLock(f, {}).ok, false, '同进程第二把也拿不到');
-    fs.writeFileSync(f, JSON.stringify({ pid: process.pid, token: 'other' }));
+    const theirs = fs.readFileSync(f, 'utf8').replace(a.token, 'other0000000000');
+    fs.writeFileSync(f, theirs);
     a.release();
     assert.equal(fs.existsSync(f), true, '不是自己的 token 不删');
-    assert.deepEqual(fs.readdirSync(d).filter((x) => x.endsWith('.tmp')), [], '不留临时文件');
+    assert.deepEqual(fs.readdirSync(d).filter((x) => x.endsWith('.tmp') || x.endsWith('.takeover')), [], '不留临时文件');
+  });
+
+  test('坏锁：status 报别处在刷，不起 Colab', async () => {
+    const d = tmp(); let n = 0;
+    fs.writeFileSync(`${dbIn(d)}.refresh.lock`, '{}');
+    const s = createComputeService({ dbFile: dbIn(d), colab: async () => { n++; return { status: 'ok', sessions: [] }; }, gemini: async () => ({ status: 'unconfigured' }), ego: OK_EGO });
+    try {
+      const st = s.status(); await s.idle();
+      assert.equal(st.refreshing.elsewhere, true); assert.equal(st.refreshing.corrupt, true); assert.equal(n, 0);
+      assert.equal(s.refresh('fast').started, false);
+    } finally { s.close(); }
+  });
+
+  test('并发接管同一把死锁：只有一个拿到', async () => {
+    const d = tmp(), f = path.join(d, 'x.lock'), dead = 2147483646;
+    fs.writeFileSync(f, JSON.stringify({ token: 'old', pid: dead, startedAt: 1, heartbeatAt: 1, heartbeatFile: `${f}.old.hb` }));
+    const worker = `import { tryRefreshLock } from ${JSON.stringify(path.join(ROOT, 'src/compute/service.mjs'))};
+const r = tryRefreshLock(${JSON.stringify(f)}, {}); console.log(r.ok ? 'ok' : 'no'); setTimeout(() => {}, 1500);`;
+    const run = () => new Promise((res) => { const p = spawn(process.execPath, ['--input-type=module', '-e', worker], { env: { ...process.env, MAITIAN_STUDIO_DB: dbIn(d) } }); let o = ''; p.stdout.on('data', (x) => { o += x; if (/ok|no/.test(o)) res(o.trim()); }); p.on('exit', () => res(o.trim())); });
+    const rs = await Promise.all(Array.from({ length: 6 }, run));
+    assert.equal(rs.filter((x) => x === 'ok').length, 1, rs.join(','));
   });
 
   test('锁文件的进程已经不在：接管', async () => {
     const d = tmp();
-    fs.writeFileSync(`${dbIn(d)}.refresh.lock`, JSON.stringify({ pid: 2147483646, scope: 'all', startedAt: new Date().toISOString() }));
+    fs.writeFileSync(`${dbIn(d)}.refresh.lock`, JSON.stringify({ token: 'old', pid: 2147483646, startedAt: Date.now(), heartbeatAt: Date.now(), heartbeatFile: `${dbIn(d)}.refresh.lock.old.hb`, scope: 'all' }));
     const s = createComputeService({ dbFile: dbIn(d), colab: async () => ({ status: 'ok', sessions: [] }), gemini: async () => ({ status: 'unconfigured' }), ego: OK_EGO });
     try { const r = s.refresh('fast'); assert.equal(r.started, true); await r.promise; } finally { s.close(); }
   });

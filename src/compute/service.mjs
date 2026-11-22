@@ -1,8 +1,7 @@
 // 谷歌算力面板的服务层：秒回最新快照、Colab 实时态 15 秒防抖、单飞刷新、一键停机后回读。
 // 不建定时器：定时巡检由 OpenBot routine 调 `node src/hub.mjs compute refresh --scope all`。
 import { spawn } from 'node:child_process';
-import fs from 'node:fs';
-import crypto from 'node:crypto';
+import { tryLock, releaseLock, readLock, pidAlive } from '../ego-runner/locks.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openStudio, PROVIDERS, studioDbPath } from './store.mjs';
@@ -64,32 +63,12 @@ export function computeLight(view) {
   return { level: 'idle', text: '未读取' };
 }
 
-const pidAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-const CORRUPT = Symbol('corrupt');
-const readLockFile = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return e.code === 'ENOENT' ? null : CORRUPT; } };
-const CORRUPT_STALE_MS = 10 * 60_000;
-/**
- * 跨进程刷新锁（网页服务和 hub compute refresh 共用一把）：先写完整临时文件，再 link 成锁文件（原子，存在就失败），读方不会读到半写内容。
- * 持有 pid 已退出 → 接管；锁文件读不懂 → 当作占用，10 分钟没动过才清掉；释放只删自己 token 的锁。
- */
-export function tryRefreshLock(file, meta) {
-  const token = crypto.randomBytes(8).toString('hex');
-  const tmp = `${file}.${token}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, token, ...meta }));
-  try {
-    for (let i = 0; i < 2; i++) {
-      try { fs.linkSync(tmp, file); return { ok: true, token, release: () => { try { if (readLockFile(file)?.token === token) fs.rmSync(file, { force: true }); } catch {} } }; }
-      catch (e) { if (e.code !== 'EEXIST') throw e; }
-      const h = readLockFile(file);
-      if (h === CORRUPT) {
-        let age = 0; try { age = Date.now() - fs.statSync(file).mtimeMs; } catch { continue; }
-        if (age < CORRUPT_STALE_MS) return { ok: false, holder: { corrupt: true } };
-      } else if (h && pidAlive(h.pid)) return { ok: false, holder: h };
-      fs.rmSync(file, { force: true });
-    }
-    const h = readLockFile(file);
-    return { ok: false, holder: h === CORRUPT ? { corrupt: true } : h };
-  } finally { fs.rmSync(tmp, { force: true }); }
+// 跨进程刷新锁：复用 ego-runner 的文件锁（临时文件 + link 原子建锁、接管保护文件内重判、结构校验、按 token 释放）。
+// 持有进程活着就不能接管（不写心跳，requireDeadPid）；锁文件内容坏了一律当占用，要人工删。
+const holderView = (h) => ({ scope: h?.corrupt ? null : h?.scope || null, startedAt: h?.startedAt ? new Date(h.startedAt).toISOString() : null, elsewhere: true, ...(h?.corrupt ? { corrupt: true } : {}) });
+export function tryRefreshLock(file, meta = {}) {
+  const r = tryLock(file, { staleMs: 0, requireDeadPid: true, meta });
+  return r.ok ? { ok: true, token: r.lock.token, release: () => releaseLock(r.lock) } : { ok: false, holder: r.holder };
 }
 
 export function createComputeService({ dbFile = studioDbPath(), lockFile = `${dbFile}.refresh.lock`, colab = readColab, stop = stopColab, gemini = readGemini, ego = runEgo, now = () => Date.now(), debounceMs = COLAB_DEBOUNCE_MS } = {}) {
@@ -124,16 +103,16 @@ export function createComputeService({ dbFile = studioDbPath(), lockFile = `${db
       if (scope !== 'fast' && scope !== 'all') throw new Error('scope 只能是 fast 或 all');
       if (flight) return { started: false, refreshing, promise: flight };
       const meta = { scope, startedAt: new Date(now()).toISOString() };
-      const lk = tryRefreshLock(lockFile, meta);
-      if (!lk.ok) return { started: false, refreshing: { scope: lk.holder?.scope || null, startedAt: lk.holder?.startedAt || null, elsewhere: true }, promise: Promise.resolve() };
+      const lk = tryRefreshLock(lockFile, { scope });
+      if (!lk.ok) return { started: false, refreshing: holderView(lk.holder), promise: Promise.resolve() };
       refreshing = meta;
       flight = Promise.resolve().then(() => (scope === 'all' ? full() : fast())).finally(() => { lk.release(); refreshing = null; flight = null; });
       return { started: true, refreshing, promise: flight };
     },
     /** 秒回：不等任何采集。poll 时 Colab 距上次读超过防抖间隔就在后台再读一次（顶栏灯用 poll:false 只看快照）。 */
     status({ local = false, poll = true } = {}) {
-      const other = !flight && readLockFile(lockFile);
-      const elsewhere = other === CORRUPT ? { scope: null, startedAt: null, elsewhere: true } : other && pidAlive(other.pid) ? { scope: other.scope || null, startedAt: other.startedAt || null, elsewhere: true } : null;
+      const other = !flight && readLock(lockFile);
+      const elsewhere = other && (other.corrupt || pidAlive(other.pid)) ? holderView(other) : null;
       if (poll && !flight && !elsewhere && now() - colabAt >= debounceMs) pollColab().catch(() => {});
       const view = store.all();
       return { providers: view, light: computeLight(view), refreshing: refreshing || elsewhere, local, now: new Date(now()).toISOString() };
