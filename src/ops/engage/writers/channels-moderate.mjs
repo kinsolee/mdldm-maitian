@@ -24,7 +24,8 @@ export const FILE = 'channels-moderate.mjs';
 export const PAGE = 'https://channels.weixin.qq.com/platform/interaction/comment';
 const MOD_ADD = 1;
 
-const errText = (e) => redact(String(e?.message ?? e)).slice(0, 300);
+// 错误消息是空的（throw ''、new Error('')、{ message: '' }）也要返回非空串：调用方拿它当「出过错」的标志
+const errText = (e) => redact(String(e?.message ?? e)).slice(0, 300) || '未知错误';
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== ''));
 const stop = (me, blocked, detail, extra = {}) => ({ uidSeen: me ?? null, blocked, detail: redact(detail), sendAttempted: false, ...extra });
 
@@ -90,7 +91,7 @@ export async function deleteComment(api, p) {
   let sendError = null, postError = null;
   try {
     const r = await api.call('deleteComment', { exportId, commentId: ids.target });
-    if (!r.ok) postError = r.error;
+    if (!r.ok) postError = r.error || '未知错误';
     else if (r.data?.errCode !== 0) sendError = `del_comment errCode=${r.data?.errCode ?? '无'} ${r.data?.errMsg ?? ''}`.trim();
   } catch (e) { postError = errText(e); }
   let readBack;
@@ -129,7 +130,7 @@ export async function block(api, p) {
   let sendError = null, postError = null;
   try {
     const r = await api.call('blockUser', { refCommentId: ids.target, refObjectId: exportId, modType: MOD_ADD });
-    if (!r.ok) postError = r.error;
+    if (!r.ok) postError = r.error || '未知错误';
     else if (r.data?.errCode !== 0) sendError = `block_user errCode=${r.data?.errCode ?? '无'} ${r.data?.errMsg ?? ''}`.trim();
   } catch (e) { postError = errText(e); }
   let readBack;

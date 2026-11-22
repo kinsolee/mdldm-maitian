@@ -216,7 +216,7 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 | 平台 | `delete_comment` | `block_user` | `delete_conversation` |
 |---|---|---|---|
 | B站 | 能 | 能 | 能 |
-| 抖音 | 在做 | 在做 | 不做：私信页删普通会话时，页面 IM SDK 先删本地、再调 `MarkConversationDelete`，服务端报错被 SDK 吞掉；页面上没有能确认服务端已删的读接口 |
+| 抖音 | 能（见下文「抖音」） | 能（见下文「抖音」） | 不做：私信页删普通会话时，页面 IM SDK 先删本地、再调 `MarkConversationDelete`，服务端报错被 SDK 吞掉；页面上没有能确认服务端已删的读接口 |
 | 视频号 | 能（见下文「视频号」） | 能，只能从评论发起（见下文「视频号」） | 做不了：视频号助手私信页没有删除会话（页面代码里 `deleteSessionById` 只打日志） |
 | 小红书 | 在评估 | 做不了：网页版没有拉黑入口，页面只提示「请前往手机端」 | 做不了：网页版私信只能删群聊（`chats/remove/group`），单聊没有删除接口 |
 
@@ -242,6 +242,30 @@ node src/hub.mjs ops accounts set-cap Channels:<uid> block true
 ```
 
 首次真发验收同 B站，每种操作第一次都要负责人当次同意。视频号另外要核对：没有要求验证手机（`baseResp.errcode=-4300`）；拉黑后这条评论的 `blacklistFlag` 确实变成真（`readBack`）；拉黑后对方的评论是否还显示在评论列表里（不显示的话回读会读不到，记 `needs_readback`，要改回读方法）。
+
+### 抖音
+
+写入脚本 `src/ops/engage/writers/douyin-moderate.mjs`。都调页面自己的接口封装函数，`msToken`、`a_bogus`、安全 SDK 的头由页面加，Node 里不拼签名。入口和参数只从页面代码里读来（2026-11-22），**没有在真实账号上调过写接口**。
+
+| 工具 | 在哪调 | 发前重读（命中就不调接口） | 发后回读（满足才算 `sent`） |
+|---|---|---|---|
+| `delete_comment` | 评论管理页（`creator.douyin.com`）的评论服务 `awemeV1CommentMultiDelete({ cids, need_block: false })` → `POST /aweme/janus/creator/comment/aweme/v1/web/comment/multi_delete/`。和页面「删除」按钮一样；`need_block: true` 是「删除并拉黑」，不用 | 核对登录账号（`user/info`）；用 `awemeV1CommentListSelect` / `awemeV1CommentListReply` 把目标所在的楼读全（同 S9 回复）。楼读全了没有这条、或一楼列表翻到底没有这栋楼 → `already-gone`；楼没读全 → `thread-incomplete`；这条不属于这个作品 → `target-not-found`；作者是我 → `self-target`；一楼下面有回复 → `rejected` / `deletes-thread` | 等 2 秒再读楼：楼读全了、这条不在了；一楼目标是一楼列表翻到底也没有它 |
+| `block_user` | 抖音网页版（`www.douyin.com`，和创作者后台同一个登录态）个人页模块里的拉黑函数 `(uid, sec_uid, 1, 0)` → `POST /aweme/v1/web/user/block/`，返回 `block_status=1` 是已拉黑。和网页版点「拉黑」一样 | 核对创作者后台登录账号；从来源评论（评论接口的 `user.sec_uid`）或来源会话（私信页会话对象的 `secUid`）重读对方的 `sec_uid`，重读出的 uid 要等于要拉黑的 uid；网页版 `profile/self` 的 uid 也要是这个账号（否则 `uid-mismatch`）；`profile/other` 的 uid 要对得上，`is_block` 已是 `true` → `already-blocked` | 等 1.5 秒再读 `profile/other`，`is_block` 是 `true` |
+
+- 拉黑的来源：`target` 是评论 id 时用这条评论，是会话 id 时用这个会话，只给 `Douyin:<uid>` 时用库里这个人最近的一条评论（没有就用最近的会话）。来源评论已不在、来源会话不在私信列表里时读不到 `sec_uid`，返回 `failed` / `target-not-found`，换一条这个人的评论或会话再试。
+- 模块 id 每次发版会变，按源码里的接口路径找函数：评论服务按方法名（同 S9），网页版按 `/aweme/v1/web/user/block/`、`/aweme/v1/web/user/profile/other/`、`/aweme/v1/web/user/profile/self/` 各找唯一一个函数。找不到返回 `failed` / `cannot-send`，不调接口。
+- 删一楼：抖音删一楼会连楼下回复一起删，规则同 B站「删一楼」：`reply_comment_total` 或读到的楼中楼大于 0 就 `deletes-thread`，读不到 `reply_comment_total` 报 `thread-incomplete`。
+- 已知限制：一楼列表最多读 30 页（同 S9），一楼目标所在作品的一楼超过 300 条时，删掉后确认不了「翻到底也没有它」，会记 `needs_readback`。
+- 删会话不做，原因见上表。
+
+能力位（默认全关）：
+
+```sh
+node src/hub.mjs ops accounts set-cap Douyin:106707338905 deleteComment true
+node src/hub.mjs ops accounts set-cap Douyin:106707338905 block true
+```
+
+首次真发验收同 B站（下文「首次真发验收」），每种操作第一次都要负责人当次同意。抖音另外要核对：页面没有弹安全验证；`multi_delete` 的 `delete_result`、`user/block` 的 `block_status` 和这里写的一致（看 `actions` 的 `detail`）；拉黑后在抖音 App「设置 → 隐私 → 黑名单」里能看到对方。
 
 ### 工具
 

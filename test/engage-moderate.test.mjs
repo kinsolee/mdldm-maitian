@@ -171,8 +171,8 @@ describe('delete_comment', () => {
     assert.deepEqual([r.status, r.reason], ['rejected', 'event-mismatch']);
   });
 
-  test('非 B站 → rejected unsupported-platform', async () => {
-    const r = await engageWrite(s.db, del({ targetId: 'Douyin:a' }), s.deps(fakeWriter(DONE)));
+  test('还没接上的平台 → rejected unsupported-platform', async () => {
+    const r = await engageWrite(s.db, del({ targetId: 'XiaoHongShu:a' }), s.deps(fakeWriter(DONE)));
     assert.deepEqual([r.status, r.reason], ['rejected', 'unsupported-platform']);
   });
 
@@ -194,6 +194,8 @@ describe('delete_comment', () => {
     assert.match(writerModuleUrl('Bili', 'delete'), /bili-moderate\.mjs$/);
     assert.match(writerModuleUrl('Bili', 'block'), /bili-moderate\.mjs$/);
     assert.match(writerModuleUrl('Bili', 'reply'), /\/bili\.mjs$/);
+    assert.match(writerModuleUrl('Douyin', 'delete'), /douyin-moderate\.mjs$/);
+    assert.match(writerModuleUrl('Douyin', 'reply'), /\/douyin\.mjs$/);
     assert.match(writerModuleUrl('Channels', 'delete'), /channels-moderate\.mjs$/);
     assert.match(writerModuleUrl('Channels', 'reply'), /\/channels\.mjs$/);
     assert.throws(() => writerModuleUrl('XiaoHongShu', 'delete'), /没有 delete/);
