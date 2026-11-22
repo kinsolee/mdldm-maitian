@@ -128,7 +128,9 @@ describe('MCP engage 组（--scope engage）', () => {
       assert.deepEqual(props('delete_conversation'), ['conversationId', 'eventId', 'idempotencyKey']);
       // 说明里的「做得到 / 做不到」按 MOD_SUPPORT、MOD_UNSUPPORTED 生成
       const desc = (n) => tools.find((t) => t.name === n).description;
-      assert.match(desc('delete_conversation'), /做得到的平台：B站/);
+      assert.match(desc('delete_conversation'), /做得到的平台：B站。/);
+      assert.match(desc('delete_comment'), /做得到的平台：B站、抖音/);
+      assert.match(desc('delete_conversation'), /抖音（[^）]*MarkConversationDelete/);
       assert.match(desc('delete_conversation'), /视频号（[^）]*deleteSessionById/);
       assert.match(desc('block_user'), /小红书（[^）]*手机/);
       assert.ok(!c.stderr().includes(TOKEN));
@@ -176,10 +178,10 @@ describe('MCP engage 组（--scope engage）', () => {
     } finally { db.close(); }
   });
 
-  test('处置工具：非 B站 → rejected unsupported-platform，不起 runner', async () => {
+  test('处置工具：做不到、还没接上的平台 → rejected unsupported-platform，不起 runner', async () => {
     const c = await connect(file, ['--scope', 'engage'], { MAITIAN_ENV_FILE: envFile, MAITIAN_ENGAGE_TOKEN: TOKEN });
     try {
-      for (const [name, args] of [['delete_comment', { commentId: 'Douyin:a' }], ['block_user', { target: 'Douyin:a' }], ['delete_conversation', { conversationId: 'Douyin:c' }]]) {
+      for (const [name, args] of [['delete_comment', { commentId: 'XiaoHongShu:a' }], ['block_user', { target: 'XiaoHongShu:a' }], ['delete_conversation', { conversationId: 'Douyin:c' }]]) {
         const r = (await call(c.client, name, { ...args, idempotencyKey: `k-${name}` })).value;
         assert.deepEqual([r.status, r.reason, r.sendAttempted], ['rejected', 'unsupported-platform', false], name);
       }

@@ -7,7 +7,7 @@ import { listAccounts } from '../accounts.mjs';
 export const MOD_CAPS = ['deleteComment', 'block', 'deleteConversation'];
 export const MOD_ROUND_LIMIT = 10;   // 每个平台每轮（整点小时）每种操作分别计
 // 每种操作做得到的平台（各平台的写入脚本在 writers/index.mjs 的 MODERATE_FILES）。不在这里的调用一律 rejected unsupported-platform
-export const MOD_SUPPORT = { delete: ['Bili', 'Channels'], block: ['Bili', 'Channels'], deleteConversation: ['Bili'] };
+export const MOD_SUPPORT = { delete: ['Bili', 'Douyin', 'Channels'], block: ['Bili', 'Douyin', 'Channels'], deleteConversation: ['Bili'] };
 // 平台不给评论者 uid（视频号）：拉黑只能从一条评论发起，actions 按这条评论 id 记，认不出「同一个人换一条评论」
 export const BLOCK_BY_COMMENT = new Set(['Channels']);
 // 做不到的原因（2026-11-22 只读核对各平台页面代码）。没写原因的就是还没接上
