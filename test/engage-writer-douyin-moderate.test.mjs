@@ -73,6 +73,23 @@ describe('抖音删评论', () => {
     assert.equal(deletes(fc).length, 0);
   });
 
+  test('评审修复：一楼 total=0 但楼中楼接口有回复 → deletes-thread；total 是负数 → thread-incomplete；都不调接口', async () => {
+    const fc = fakeComments({ roots: [root('101', '800', 0)], replies: { 101: [sub('201', '101', '900')] } });
+    const r = await deleteComment(apiOf(fc), delParams({ commentId: '101', rootId: '101', parentId: null }));
+    assert.deepEqual([r.blocked, r.rejected], ['deletes-thread', true]);
+    const neg = fakeComments({ roots: [root('101', '800', -1)] });
+    assert.equal((await deleteComment(apiOf(neg), delParams({ commentId: '101', rootId: '101', parentId: null }))).blocked, 'thread-incomplete');
+    assert.equal(deletes(fc).length + deletes(neg).length, 0);
+  });
+
+  test('评审修复：楼中楼的 reply_id 不是这栋楼、aweme_id 缺失 → target-not-found，不调接口', async () => {
+    const wrong = fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [sub('201', '999', '900')] } });
+    assert.equal((await deleteComment(apiOf(wrong), delParams())).blocked, 'target-not-found');
+    const noAweme = fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [{ ...sub('201', '101', '900'), aweme_id: undefined }] } });
+    assert.equal((await deleteComment(apiOf(noAweme), delParams())).blocked, 'target-not-found');
+    assert.equal(deletes(wrong).length + deletes(noAweme).length, 0);
+  });
+
   test('已不在：楼读全了没有这条 → already-gone，不调接口；整栋楼都不在了也是 already-gone', async () => {
     const fc = fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [sub('202', '101', '901')] } });
     assert.equal((await deleteComment(apiOf(fc), delParams())).blocked, 'already-gone');

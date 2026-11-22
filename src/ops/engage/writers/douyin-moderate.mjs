@@ -20,7 +20,8 @@
 //   删会话：不做，原因见 moderate.mjs 的 MOD_UNSUPPORTED。
 // 目标是登录账号自己一律不动手（self-target）。调了写接口之后出任何错都只回读、不重调，返回 sendAttempted: true。
 import { mainPage, open, sleep as realSleep } from '../adapters/page-lib.mjs';
-import { callInPage, countOf, locateService, SERVICES } from '../inpage-api.mjs';
+import { callInPage, locateService, SERVICES } from '../inpage-api.mjs';
+import { replyArgs } from '../adapters/douyin.mjs';
 import { redact } from '../redact.mjs';
 import { douyinThread } from './api-reply.mjs';
 
@@ -39,6 +40,8 @@ export const WEB_FNS = { block: '/aweme/v1/web/user/block/', other: '/aweme/v1/w
 const errText = (e) => redact(String(e?.message ?? e)).slice(0, 300);
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
 const isSelf = (uid, me, p) => uid === me || uid === String(p.uid) || (p.selfUids ?? []).includes(uid);
+// 条数只认非负整数（数字或纯数字字符串）：负数、小数、空串、布尔都当读不到
+const countOf = (v) => (typeof v === 'number' ? (Number.isInteger(v) && v >= 0 ? v : null) : typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : null);
 const stop = (me, blocked, detail, extra = {}) => ({ uidSeen: me ?? null, blocked, detail: redact(detail), sendAttempted: false, ...extra });
 
 // —— 删评论 ——
@@ -51,7 +54,10 @@ function locate(th, t) {
   if (target === rootId) return { node: th.root };
   if (!th.complete) return { blocked: 'thread-incomplete', detail: `楼 ${rootId} 的回复没读全（读到 ${th.replies.length} 条，楼里有 ${th.root.reply_comment_total ?? '未知'} 条），删了也确认不了，没删` };
   const node = th.replies.find((c) => String(c.cid) === target);
-  return node ? { node } : { gone: true, detail: `楼 ${rootId} 读全了，里面已没有 ${target}` };
+  if (!node) return { gone: true, detail: `楼 ${rootId} 读全了，里面已没有 ${target}` };
+  // 楼中楼接口给的这条要挂在这栋楼下，否则不认（防止返回数据挂错楼，删到别的楼里去）
+  if (String(node.reply_id ?? '') !== rootId) return { blocked: 'target-not-found', detail: `${target} 的 reply_id 是 ${node.reply_id ?? '（没给）'}，不是楼 ${rootId}` };
+  return { node };
 }
 
 export async function deleteComment(api, p) {
@@ -69,15 +75,19 @@ export async function deleteComment(api, p) {
     if (at.gone) return stop(me, 'already-gone', at.detail);
     if (at.blocked) return stop(me, at.blocked, at.detail);
     const node = at.node;
-    if (node.aweme_id != null && String(node.aweme_id) !== awemeId) return stop(me, 'target-not-found', `评论 ${target} 属于作品 ${node.aweme_id}，不是 ${awemeId}`);
+    if (String(node.aweme_id ?? '') !== awemeId) return stop(me, 'target-not-found', `评论 ${target} 属于作品 ${node.aweme_id ?? '（没给）'}，不是 ${awemeId}，没删`);
     const author = node.user?.uid == null ? '' : String(node.user.uid);
     if (!author) return stop(me, 'precheck-error', '读不到这条评论的作者');
     if (isSelf(author, me, p)) return stop(me, 'self-target', '这条是我自己的评论，不删');
     if (target === rootId) {
       // 删一楼会连楼下回复一起删：下面有回复（不管是谁的）就不删；条数读不到也不删
       const total = countOf(node.reply_comment_total);
-      if (total == null) return stop(me, 'thread-incomplete', '一楼的 reply_comment_total 读不到，判断不了下面有没有回复，没删');
-      const n = Math.max(total, th.replies?.length ?? 0);
+      if (total == null) return stop(me, 'thread-incomplete', '一楼的 reply_comment_total 读不到或不是非负整数，判断不了下面有没有回复，没删');
+      // 总数是 0 也再读一次楼中楼第一页：总数和实际对不上时宁可不删
+      const first = await api.call('awemeV1CommentListReply', replyArgs(rootId, 0));
+      const fj = first.ok ? first.data : null;
+      if (!fj || fj.status_code !== 0 || !Array.isArray(fj.comments)) return stop(me, 'thread-incomplete', `读一楼下面的回复失败（${first.ok ? `status_code=${fj?.status_code ?? '无'}` : first.error}），判断不了有没有回复，没删`);
+      const n = Math.max(total, th.replies?.length ?? 0, fj.comments.length);
       if (n > 0) return stop(me, 'deletes-thread', `${target} 是一楼，下面有 ${n} 条回复；抖音删一楼会把楼下回复一起删掉，不删`, { rejected: true });
     }
   } catch (e) {
@@ -252,7 +262,7 @@ export async function runInSpace(task, params) {
       const r = await page.fetch('/web/api/media/user/info/', { timeout: 15000 }).catch(() => null);
       let info = null; try { info = JSON.parse(String(r?.body ?? '')); } catch {}
       if (info?.status_code === 8) return { done: { uidSeen: null, loginLost: true, evidence: 'GET /web/api/media/user/info/ status_code=8', sendAttempted: false } };
-      const uid = info?.user?.uid == null ? null : String(info.user.uid);
+      const uid = info?.status_code === 0 && info?.user?.uid != null ? String(info.user.uid) : null;
       if (!uid) return { done: { uidSeen: null, blocked: 'no-uid', detail: `GET /web/api/media/user/info/ ${info ? `status_code=${info.status_code}` : '请求失败或不是 JSON'}`, sendAttempted: false } };
       if (uid !== String(params.uid)) return { done: { uidSeen: uid, blocked: 'uid-mismatch', detail: `登记的是 ${params.uid}，页面上登录的是 ${uid}`, sendAttempted: false } };
       return { uid };
