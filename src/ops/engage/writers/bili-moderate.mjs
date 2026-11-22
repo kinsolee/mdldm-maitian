@@ -3,6 +3,9 @@
 //        （楼已不在 → already-gone；定位不到 → target-not-found；定位不了 → thread-incomplete；作者是我 → self-target；
 //        一楼下面有回复 → deletes-thread，rejected，因为 B站删一楼会连整楼回复一起删）
 //        → x/v2/reply/del 只调一次 → 等 2 秒再定位这一条：楼没了，或这条不在、它原来前后的两条现在挨着，才算 found。
+//        reply/reply 定位不到（或第 1 页空、count>0）：B站把广告类楼中楼对外隐藏了，它还在 x/v2/reply/up/fulllist 里。
+//        改按作品把 fulllist 读全、找这一条（rpid、作品、楼、作者都对上），删后用同一套读法确认它不在了才算 found；
+//        fulllist 里也没有才报 target-not-found，读不全就不删（thread-incomplete）。
 //   拉黑 block：x/relation?fid= 重读（attribute 128 已拉黑 → already-blocked）→ x/relation/modify act=5 只调一次 → 再读 x/relation，attribute 128 才算 found。
 //   删会话 deleteConversation：session_svr/get_sessions 把用户与系统、未关注人、被拦截、陌生人四组都翻完重读
 //        （都不在 → already-gone；哪组翻不完 → list-incomplete）→ session_svr/remove_session 只调一次 → 四组再翻一遍，都翻完且都不在才算 found。
@@ -138,7 +141,7 @@ async function seek(page, rpid) {
   if (!first.ids) return first;
   if (!Number.isFinite(first.count)) return { error: 'reply/reply 的 page.count 不是非负整数', unsure: true };
   // X3-B1：第 1 页是空的、count 却说有回复，不能当空楼
-  if (!first.ids.length && first.count > 0) return { error: `reply/reply 第 1 页是空的，但 page.count=${first.count}`, unsure: true };
+  if (!first.ids.length && first.count > 0) return { error: `reply/reply 第 1 页是空的，但 page.count=${first.count}`, unsure: true, hidden: true };
   let last = Math.max(1, Math.ceil(first.count / PS));
   let lo = 1, hi = last;
   for (;;) {
@@ -162,6 +165,48 @@ async function seek(page, rpid) {
     lo = last + 1; last *= 2; hi = last;
   }
   return { slot: { pn: lo, i: 0 } };
+}
+
+// —— 被隐藏的楼中楼：按作品读 UP 主评论管理 ——
+// 2026-11-22 登录态只读核过（B站 478358005，两条被隐藏的广告楼中楼）：
+//   x/v2/reply/up/fulllist?bvid=&order=1&filter=-1&type=1&pn=&ps=20 只给这个作品的评论（含楼中楼，新到旧），page.total 是这个作品的条数
+//   （BV1iBsg6sEjz total=21：第 1 页 20 条、第 2 页 1 条；BV1aasw6xEiB total=4）；翻过末尾、或 bvid 不存在时 data.list 是 null。
+//   不认 rpid 参数（带了照样给全部作品）。条目有 rpid、oid、root、parent、bvid、mid / member.mid。
+//   被隐藏的那两条 state=0、attr=0、invisible=false、folder.is_folded=false、reply_control.is_garbage=false、pass_type=0，
+//   和看得见的评论没有区别：没有字段标「隐藏 / 折叠 / 待审」，所以不靠字段判断，只靠「reply/reply 没有、fulllist 有」。
+// 「读全」的证据：每页 page.total 一样、条目都是这个作品的、没有重复，读到的条数等于 page.total。
+// 这个接口没有游标或快照，翻页中间有增删时列表会挪位，可能刚好漏掉一条而上面几条照样成立（R1 Codex-1）。
+// 所以发后回读不只看「这条不在」：读到的整个集合要正好等于发前那一次减去这一条，作品下有任何别的变化都判确认不了；
+// 一页的内容和 page.total 也可能不是同一时刻的（R2 Codex-1：旧页面配新 total，前面删了一条、目标挪进读过的页），
+// 所以这样的结果要隔一会儿再完整读一遍、两次集合一样才算。
+const MAX_FULLLIST_PAGES = 20;             // 一个作品最多读 400 条：发前一遍、发后两遍最多 60 页；写入 runner 的脚本时限约 108 秒，慢接口下回读没读完只会记 needs_readback，不重试
+
+/** 按作品读全 fulllist：{ items: Map(rpid → 条目), total } / { error, unsure? }。 */
+async function scanWork(api, bvid, oid) {
+  const items = new Map();
+  let total = null;
+  for (let pn = 1; ; pn++) {
+    if (pn > MAX_FULLLIST_PAGES) return { error: `作品 ${bvid} 读了 ${MAX_FULLLIST_PAGES} 页还没读完`, unsure: true };
+    if (pn > 1) await api.sleep(300);
+    const j = await api.get(`${API}/x/v2/reply/up/fulllist?bvid=${encodeURIComponent(bvid)}&order=1&filter=-1&type=1&pn=${pn}&ps=${PS}`);
+    if (j.code !== 0) return { error: `第 ${pn} 页 code=${j.code} ${j.message ?? ''}`.trim() };
+    const list = j.data?.list;
+    if (!Array.isArray(list) && list !== null) return { error: `第 ${pn} 页缺 data.list` };
+    const n = countOf(j.data?.page?.total);
+    if (!Number.isFinite(n)) return { error: `第 ${pn} 页的 page.total 不是非负整数`, unsure: true };
+    if (total != null && n !== total) return { error: `翻页时 page.total 从 ${total} 变成了 ${n}`, unsure: true };
+    total = n;
+    for (const x of list ?? []) {
+      const id = bigOf(rpidOf(x));
+      if (id == null) return { error: `第 ${pn} 页有条目缺 rpid`, unsure: true };
+      if (String(x?.oid ?? '') !== String(oid)) return { error: `按 bvid=${bvid} 读，第 ${pn} 页却给了评论区 ${x?.oid ?? '（没给）'} 的评论`, unsure: true };
+      if (items.has(String(id))) return { error: `翻页时 ${id} 出现了两次（列表在变）`, unsure: true };
+      items.set(String(id), x);
+    }
+    if ((list?.length ?? 0) < PS || pn * PS >= total) break;
+  }
+  if (items.size !== total) return { error: `作品 ${bvid} 读到 ${items.size} 条，page.total=${total}，对不上`, unsure: true };
+  return { items, total };
 }
 
 const isSelf = (mid, me, p) => mid === me || mid === String(p.uid) || (p.selfUids ?? []).includes(mid);
@@ -194,8 +239,9 @@ async function precheckComment(api, p, me, oid) {
 
   const s = await seek(page, rpid);
   if (s.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${s.code}）`);
+  if (s.hidden) return precheckHidden(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), s.error);
   if (s.error) return stop(s.unsure ? 'thread-incomplete' : 'precheck-error', s.error);
-  if (!s.at) return stop('target-not-found', `按 rpid 定位到楼 ${t.rootId} 第 ${s.slot.pn} 页，没有 ${t.commentId}`);
+  if (!s.at) return precheckHidden(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), `按 rpid 定位到楼 ${t.rootId} 第 ${s.slot.pn} 页，没有 ${t.commentId}`);
   const node = s.at.node;
   const nodeRoot = String(node.root_str ?? node.root ?? '');
   if (nodeRoot !== String(t.rootId)) return stop('target-not-found', `对上 rpid 的这条属于楼 ${nodeRoot || '（没给）'}，不是楼 ${t.rootId}`);
@@ -212,6 +258,21 @@ async function precheckComment(api, p, me, oid) {
   return { check: { isRoot: false, rpid, prev, next } };
 }
 
+/** reply/reply 定位不到时，在 fulllist 里找这一条（w 是 scanWork 的结果，why 是 reply/reply 那边的情况）。 */
+function precheckHidden(p, me, oid, rpid, stop, w, why) {
+  const t = p.target;
+  if (w.error) return stop(w.unsure ? 'thread-incomplete' : 'precheck-error', `${why}；改查 up/fulllist：${w.error}，没删`);
+  const node = w.items.get(String(rpid));
+  if (!node) return stop('target-not-found', `${why}；up/fulllist 作品 ${t.workId} 的 ${w.total} 条评论里也没有 ${t.commentId}`);
+  const nodeRoot = String(node.root_str ?? node.root ?? '');
+  if (nodeRoot !== String(t.rootId)) return stop('target-not-found', `up/fulllist 里的 ${t.commentId} 属于楼 ${nodeRoot || '（没给）'}，不是楼 ${t.rootId}`);
+  const author = midOf(node);
+  if (!author) return stop('precheck-error', '读不到这条评论的作者');
+  if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
+  if (t.authorUid != null && String(t.authorUid) !== '' && String(t.authorUid) !== author) return stop('target-not-found', `up/fulllist 里 ${t.commentId} 的作者是 ${author}，不是 ${t.authorUid}`);
+  return { check: { isRoot: false, hidden: true, rpid, before: new Set(w.items.keys()) } };
+}
+
 /** 发后：只回读这一条在不在。{ gone, detail }，gone 只在拿到证据时为 true。 */
 async function readBackComment(api, p, oid, check) {
   const t = p.target;
@@ -222,6 +283,20 @@ async function readBackComment(api, p, oid, check) {
     if (!first.ids) return { gone: false, detail: first.error };
     if (first.root && rpidOf(first.root) === String(t.commentId)) return { gone: false, detail: '回读时这条还在' };
     return { gone: false, detail: `回读时 reply/reply 给的一楼是 ${first.root ? rpidOf(first.root) : '（没给）'}，确认不了` };
+  }
+  if (check.hidden) {
+    // 发前就是在 fulllist 里找到的，reply/reply 本来就看不到它：用同一套读法确认它不在了
+    const w = await scanWork(api, t.workId, oid);
+    if (w.error) return { gone: false, detail: `回读 up/fulllist：${w.error}，确认不了` };
+    if (w.items.has(String(check.rpid))) return { gone: false, detail: '回读时 up/fulllist 里这条还在' };
+    const added = [...w.items.keys()].filter((id) => !check.before.has(id));
+    const lost = [...check.before].filter((id) => id !== String(check.rpid) && !w.items.has(id));
+    if (added.length || lost.length) return { gone: false, detail: `回读时 up/fulllist 里这条不在了，但作品 ${t.workId} 的评论还有别的变化（多了 ${added.length} 条、少了 ${lost.length} 条），翻页可能挪了位，确认不了` };
+    await api.sleep(1500);
+    const again = await scanWork(api, t.workId, oid);
+    if (again.error) return { gone: false, detail: `第二遍回读 up/fulllist：${again.error}，确认不了` };
+    if (again.items.size !== w.items.size || [...again.items.keys()].some((id) => !w.items.has(id))) return { gone: false, detail: `两遍回读 up/fulllist 读到的不一样（${w.items.size} 条、${again.items.size} 条），确认不了` };
+    return { gone: true, detail: `up/fulllist 作品 ${t.workId} 的 ${w.total} 条评论里已没有 ${t.commentId}` };
   }
   const s = await seek(page, check.rpid);
   if (s.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${s.code}）` };

@@ -7,7 +7,7 @@ const ME = '478358005';
 const rp = (rpid, o = {}) => ({ rpid, rpid_str: String(rpid), root: o.root ?? 0, parent: o.parent ?? 0, parent_str: String(o.parent ?? 0),
   member: { mid: o.mid ?? '9001', uname: o.uname ?? '甲' }, content: { message: o.text ?? `评论${rpid}` } });
 
-/** 假 B站：nav、view、reply/reply、reply/del、x/relation、relation/modify、get_sessions、remove_session。posts 记下所有写请求。 */
+/** 假 B站：nav、view、reply/reply、up/fulllist、reply/del、x/relation、relation/modify、get_sessions、remove_session。posts 记下所有写请求。 */
 function fakeBili(o = {}) {
   const st = {
     login: o.login ?? true, mid: o.mid ?? ME, owner: o.owner ?? ME,
@@ -17,7 +17,12 @@ function fakeBili(o = {}) {
     // 会话按 get_sessions 的 session_type 分组：1 用户与系统、2 未关注人、5 被拦截、8 陌生人。只给 sessions 的放在 1 组
     groups: o.groups ?? { 1: o.sessions ?? [{ talker_id: 777, session_type: 1, session_ts: 3 }, { talker_id: 888, session_type: 1, session_ts: 2 }] },
     pageSize: o.pageSize ?? 20, removeCode: o.removeCode ?? 0, removeEffective: o.removeEffective ?? true,
+    // hidden：B站对外隐藏的楼中楼，reply/reply 不给、page.count 照算；UP 主评论管理 up/fulllist 里有
+    hidden: o.hidden ?? [],
   };
+  /** up/fulllist 按作品给：楼（一楼 + 看得见的回复）加上被隐藏的，新到旧（rpid 从大到小） */
+  const fulllist = () => [...Object.values(st.threads).flatMap((t) => [t.root, ...t.replies]), ...st.hidden]
+    .map((x) => ({ ...x, oid: x.oid ?? 555, bvid: 'BV1xx' })).sort((a, b) => b.rpid - a.rpid);
   const posts = [], gets = [], sessionTypes = [];
   const api = {
     sleep: async () => {},
@@ -32,7 +37,15 @@ function fakeBili(o = {}) {
         const t = st.threads[q('root')];
         if (!t) return o.missingCode ? { code: o.missingCode, message: '没有该评论', data: null } : { code: 12022, message: '已经被删除了' };
         const pn = Number(q('pn'));
-        return { code: 0, data: { page: { count: t.replies.length, num: pn, size: 20 }, root: t.root, replies: t.replies.slice((pn - 1) * 20, pn * 20) } };
+        const count = t.replies.length + st.hidden.filter((x) => String(x.root) === q('root')).length;
+        return { code: 0, data: { page: { count, num: pn, size: 20 }, root: t.root, replies: t.replies.slice((pn - 1) * 20, pn * 20) } };
+      }
+      if (u.pathname === '/x/v2/reply/up/fulllist') {
+        if (o.fulllist) return o.fulllist(u, fulllist());
+        const all = q('bvid') === 'BV1xx' ? fulllist() : [];
+        const pn = Number(q('pn')), ps = Number(q('ps'));
+        const list = all.slice((pn - 1) * ps, pn * ps);
+        return { code: 0, data: { page: { num: pn, size: ps, total: all.length }, list: list.length ? list : null } };
       }
       if (u.pathname === '/x/relation') {
         const a = st.relations[q('fid')];
@@ -59,6 +72,7 @@ function fakeBili(o = {}) {
             if (String(t.root.rpid) === form.rpid) delete st.threads[root];
             else t.replies = t.replies.filter((x) => String(x.rpid) !== form.rpid);
           }
+          st.hidden = st.hidden.filter((x) => String(x.rpid) !== form.rpid);
         }
         return { code: 0, data: null };
       }
@@ -231,11 +245,12 @@ describe('B站 delete（假接口）', () => {
     }
   });
 
-  test('大楼：目标 rpid 不在楼里 → target-not-found（不是 already-gone），不调接口', async () => {
+  test('大楼：目标 rpid 不在楼里 → 不是 already-gone，不调接口；改查 up/fulllist，作品 1001 条超过 400 条读不全 → thread-incomplete', async () => {
     const f = fakeBili({ threads: bigThread() });
     for (const id of ['1001', '999', '99999']) {
       const r = await deleteComment(f.api, P('delete', { ...sub, commentId: id }));
-      assert.deepEqual([r.blocked, r.sendAttempted], ['target-not-found', false], id);
+      assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false], id);
+      assert.match(r.detail, /up\/fulllist.*20 页/);
     }
     assert.equal(f.posts.length, 0);
   });
@@ -470,6 +485,140 @@ describe('B站 delete（假接口）', () => {
     f.api.post = async () => ({ code: -111, message: '页面里没有 bili_jct，没调接口', noCsrf: true });
     const r = await deleteComment(f.api, P('delete', sub));
     assert.deepEqual([r.blocked, r.sendAttempted], ['send-error', false]);
+  });
+
+  // KIN-326 真实现象：B站把广告类楼中楼对外隐藏，reply/reply 不给它、page.count 照算；UP 主评论管理 up/fulllist 里还在
+  describe('被隐藏的楼中楼（reply/reply 看不到，up/fulllist 里有）', () => {
+    const vis = (ids) => ids.map((id) => rp(id, { root: 100, parent: 100, mid: '9100' }));
+    // 形态 1：第 1 页 5 条、page.count=6，第 2 页空，目标不在 reply/reply 里
+    const shape1 = (extra = {}) => fakeBili({ threads: { 100: { root: rp(100), replies: vis([101, 102, 103, 105, 106]) } },
+      hidden: [rp(104, { root: 100, parent: 102, mid: '9666' })], ...extra });
+    // 形态 2：第 1 页 0 条、page.count=1
+    const shape2 = (extra = {}) => fakeBili({ threads: { 100: { root: rp(100), replies: [] } }, hidden: [rp(104, { root: 100, parent: 100, mid: '9666' })], ...extra });
+    const hid = { commentId: '104', workId: 'BV1xx', parentId: '102', rootId: '100', authorUid: '9666' };
+    const fullGets = (f) => f.gets.filter((x) => x === '/x/v2/reply/up/fulllist').length;
+
+    for (const [name, make] of [['第 1 页 5 条、count=6', shape1], ['第 1 页空、count=1', shape2]]) {
+      test(`${name}：在 up/fulllist 里找到 → reply/del 只调一次，回读 fulllist 不见了 → found`, async () => {
+        const f = make();
+        const r = await deleteComment(f.api, P('delete', hid));
+        assert.equal(r.sendAttempted, true, r.detail);
+        assert.equal(r.readBack.found, true, r.readBack.detail);
+        assert.match(r.readBack.detail, /up\/fulllist.*已没有 104/);
+        assert.equal(f.posts.length, 1);
+        assert.deepEqual({ ...f.posts[0].form }, { oid: '555', type: '1', rpid: '104' });
+        assert.ok(fullGets(f) >= 2);
+      });
+
+      test(`${name}：up/fulllist 里也没有 → target-not-found，不调接口`, async () => {
+        const f = make({ hidden: [] });
+        // 第 1 页空、count=1 但 fulllist 没有：reply/reply 的 count 由 hidden 算，这里单独改成 1
+        if (make === shape2) { const get = f.api.get; f.api.get = async (url) => { const j = await get(url); if (url.includes('reply/reply') && j.data) j.data.page.count = 1; return j; }; }
+        const r = await deleteComment(f.api, P('delete', hid));
+        assert.deepEqual([r.blocked, r.sendAttempted], ['target-not-found', false], r.detail);
+        assert.match(r.detail, /up\/fulllist/);
+        assert.equal(f.posts.length, 0);
+      });
+    }
+
+    test('up/fulllist 读不全 → 不删：total 和条数对不上、缺 page.total、翻页时 total 变了、有别的作品的评论、有重复、超过 20 页', async () => {
+      const cases = {
+        'total 偏大': (u, all) => ({ code: 0, data: { page: { total: all.length + 1 }, list: all } }),
+        '缺 page.total': (u, all) => ({ code: 0, data: { page: {}, list: all } }),
+        '缺 data.list': () => ({ code: 0, data: { page: { total: 3 } } }),
+        'total 变了': (u, all) => { const pn = Number(u.searchParams.get('pn')); return { code: 0, data: { page: { total: pn === 1 ? 25 : 24 }, list: pn === 1 ? Array.from({ length: 20 }, (_, i) => ({ ...rp(5000 + i), oid: 555 })) : all.slice(0, 4) } }; },
+        '别的作品': (u, all) => ({ code: 0, data: { page: { total: all.length }, list: all.map((x, i) => (i ? x : { ...x, oid: 777 })) } }),
+        '重复': (u, all) => { const pn = Number(u.searchParams.get('pn')); const page = Array.from({ length: 20 }, (_, i) => ({ ...rp(5000 + i), oid: 555 })); return { code: 0, data: { page: { total: 40 }, list: pn === 1 ? page : page } }; },
+        '超过 20 页': (u) => ({ code: 0, data: { page: { total: 1000 }, list: Array.from({ length: 20 }, (_, i) => ({ ...rp(Number(u.searchParams.get('pn')) * 100 + i), oid: 555 })) } }),
+      };
+      for (const [name, fulllist] of Object.entries(cases)) {
+        const f = shape1({ fulllist });
+        const r = await deleteComment(f.api, P('delete', hid));
+        assert.equal(r.sendAttempted, false, name);
+        assert.equal(r.blocked, name === '缺 data.list' ? 'precheck-error' : 'thread-incomplete', `${name}：${r.detail}`);
+        assert.equal(f.posts.length, 0, name);
+        if (name === '超过 20 页') assert.equal(fullGets(f), 20);
+      }
+      // fulllist 报错（限流）→ precheck-error，可重试
+      const g = shape2({ fulllist: () => ({ code: -412, message: '请求被拦截' }) });
+      assert.deepEqual([(await deleteComment(g.api, P('delete', hid))).blocked, g.posts.length], ['precheck-error', 0]);
+    });
+
+    test('在 up/fulllist 里找到，但作者是我 → self-target；作者 mid 和目标对不上、楼不是这栋 → target-not-found；都不调接口', async () => {
+      const a = shape1({ hidden: [rp(104, { root: 100, parent: 102, mid: ME })] });
+      assert.equal((await deleteComment(a.api, P('delete', { ...hid, authorUid: ME }))).blocked, 'self-target');
+      const b = shape1();
+      const rb = await deleteComment(b.api, P('delete', { ...hid, authorUid: '9001' }));
+      assert.equal(rb.blocked, 'target-not-found');
+      assert.match(rb.detail, /作者是 9666/);
+      const c = shape1({ hidden: [rp(104, { root: 300, parent: 300, mid: '9666' })] });
+      assert.equal((await deleteComment(c.api, P('delete', hid))).blocked, 'target-not-found');
+      assert.equal(a.posts.length + b.posts.length + c.posts.length, 0);
+    });
+
+    test('回读：接口说成功但 fulllist 里还在 → found:false；回读时 fulllist 读不全 → found:false；都只调一次', async () => {
+      const f = shape1({ delEffective: false });
+      const r = await deleteComment(f.api, P('delete', hid));
+      assert.deepEqual([r.sendAttempted, r.readBack.found, f.posts.length], [true, false, 1]);
+      assert.match(r.readBack.detail, /还在/);
+      let after = false;
+      const g = shape2({ fulllist: (u, all) => ({ code: 0, data: { page: { total: after ? all.length + 1 : all.length }, list: all.length ? all : null } }) });
+      const post = g.api.post;
+      g.api.post = async (...a) => { after = true; return post(...a); };
+      const r2 = await deleteComment(g.api, P('delete', hid));
+      assert.deepEqual([r2.sendAttempted, r2.readBack.found, g.posts.length], [true, false, 1]);
+      assert.match(r2.readBack.detail, /确认不了/);
+    });
+
+    test('R1 Codex-1：回读时翻页挪了位（total 不变、无重复，但刚好漏掉还在的目标）→ found:false；作品下来了新评论也 found:false', async () => {
+      // 作品 40 条（rpid 60..21，新到旧），目标 40 是第 2 页第 1 条，被隐藏、一直没删掉（delEffective:false）
+      const others = Array.from({ length: 39 }, (_, i) => ({ ...rp(60 - i - (60 - i <= 40 ? 1 : 0), { root: 300, parent: 300 }), oid: 555 }));
+      const target = { ...rp(40, { root: 100, parent: 100, mid: '9666' }), oid: 555 };
+      const before = [...others.slice(0, 20), target, ...others.slice(20)];
+      const tgt = { ...hid, commentId: '40' };
+      // 回读：第 1 页照旧；第 2 页时列表挪了一位：目标被挤到第 1 页（已读过），第 2 页末尾多了一条新的 20
+      const drift = [...others.slice(0, 20), ...others.slice(20), { ...rp(20, { root: 300, parent: 300 }), oid: 555 }];
+      let sent = false;
+      const page = (list, pn) => list.slice((pn - 1) * 20, pn * 20);
+      const f = shape2({ hidden: [target], delEffective: false,
+        fulllist: (u) => { const pn = Number(u.searchParams.get('pn')); return { code: 0, data: { page: { total: 40 }, list: page(sent && pn === 2 ? drift : before, pn) } }; } });
+      const post = f.api.post;
+      f.api.post = async (...a) => { sent = true; return post(...a); };
+      const r = await deleteComment(f.api, P('delete', tgt));
+      assert.deepEqual([r.sendAttempted, r.readBack.found, f.posts.length], [true, false, 1], r.readBack.detail);
+      assert.match(r.readBack.detail, /别的变化/);
+      // 真删掉了，但同时作品下来了一条新评论 → 也确认不了，不猜
+      const g = shape1({ fulllist: (u, all) => { const list = g.posts.length ? [{ ...rp(999, { root: 300, parent: 300 }), oid: 555 }, ...all] : all; return { code: 0, data: { page: { total: list.length }, list } }; } });
+      const r2 = await deleteComment(g.api, P('delete', hid));
+      assert.deepEqual([r2.sendAttempted, r2.readBack.found], [true, false]);
+      assert.match(r2.readBack.detail, /多了 1 条/);
+    });
+
+    test('R2 Codex-1（fulllist）：回读第 1 页是旧内容配新 total、前面删了一条让目标挪进读过的页 → 这一遍集合正好等于发前减去目标，第二遍对不上 → found:false', async () => {
+      // 作品 40 条，A=60 在第 1 页，目标 40 在第 2 页第 1 条；reply/del 没生效。回读第一遍读第 1 页时 A 刚被别人删掉：
+      // 第 1 页给的还是旧内容（含 A），total 已经是 39；第 2 页按删后的列表给，目标挪到了第 1 页，被漏掉
+      const ids = Array.from({ length: 40 }, (_, i) => 60 - i);
+      const item = (id) => (id === 40 ? { ...rp(40, { root: 100, parent: 100, mid: '9666' }), oid: 555 } : { ...rp(id, { root: 300, parent: 300 }), oid: 555 });
+      const before = ids.map(item), afterDel = ids.filter((id) => id !== 60).map(item);
+      let reads = 0;
+      const page = (list, pn) => list.slice((pn - 1) * 20, pn * 20);
+      const f = shape2({ hidden: [item(40)], delEffective: false, fulllist: (u) => {
+        const pn = Number(u.searchParams.get('pn'));
+        if (!f.posts.length) return { code: 0, data: { page: { total: 40 }, list: page(before, pn) } };
+        reads++;
+        return { code: 0, data: { page: { total: 39 }, list: reads === 1 ? page(before, pn) : page(afterDel, pn) } };
+      } });
+      const r = await deleteComment(f.api, P('delete', { ...hid, commentId: '40' }));
+      assert.deepEqual([r.sendAttempted, r.readBack.found, f.posts.length], [true, false, 1], r.readBack.detail);
+      assert.match(r.readBack.detail, /还在|不一样/);
+    });
+
+    test('reply/reply 定位得到的楼中楼照旧走邻居回读，不读 up/fulllist', async () => {
+      const f = fakeBili();
+      const r = await deleteComment(f.api, P('delete', sub));
+      assert.equal(r.readBack.found, true);
+      assert.equal(fullGets(f), 0);
+    });
   });
 });
 
