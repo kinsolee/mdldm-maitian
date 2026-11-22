@@ -148,8 +148,14 @@ async function secUidOf(api, p, mid) {
   return { blocked: 'target-not-found', detail: `库里没有 ${mid} 的评论或会话，读不到对方的 sec_uid，没拉黑` };
 }
 
-/** 网页版函数的返回字段：下划线写法优先，没有就读驼峰写法（见文件头）。 */
-const fieldOf = (o, snake) => o?.[snake] ?? o?.[snake.replace(/_([a-z])/g, (_, c) => c.toUpperCase())];
+/** 网页版函数的返回字段，下划线、驼峰两种写法都认（见文件头）。两种键都在、值不一样（包括一边是 null）就当读不到，交给调用方拒绝。 */
+function fieldOf(o, snake) {
+  if (!o || typeof o !== 'object') return undefined;
+  const camel = snake.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  const hs = Object.hasOwn(o, snake), hc = Object.hasOwn(o, camel);
+  if (hs && hc) return Object.is(o[snake], o[camel]) ? o[snake] : undefined;
+  return hs ? o[snake] : o[camel];
+}
 
 /** profile/other 的 is_block：{ isBlock, uid } 或 { error }。 */
 async function relation(web, secUid) {

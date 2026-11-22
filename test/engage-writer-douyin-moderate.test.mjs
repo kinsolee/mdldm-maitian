@@ -272,6 +272,43 @@ describe('抖音拉黑', () => {
     }
   });
 
+  test('评审第 1 轮：两种写法同时出现且值冲突（含一边是 null）、状态码是字符串 "0" → 发前 precheck-error，不调拉黑', async () => {
+    const others = [
+      { status_code: null, statusCode: 0, user: { uid: '900', isBlock: false } },
+      { status_code: 0, user: { uid: '900', is_block: null, isBlock: false } },
+      { status_code: 0, user: { uid: '900', is_block: true, isBlock: false } },
+      { status_code: '0', user: { uid: '900', is_block: false } },
+    ];
+    for (const o of others) {
+      const w = fakeWeb();
+      w.other = async () => o;
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], JSON.stringify(o));
+      assert.equal(w.calls.length, 0);
+    }
+    const w = fakeWeb();
+    w.self = async () => ({ status_code: 8, statusCode: 0, user: { uid: ME } });
+    assert.equal((await block(apiOf(thread(), { web: w }), blkParams())).blocked, 'precheck-error');
+    assert.equal(w.calls.length, 0);
+  });
+
+  test('评审第 1 轮：拉黑返回两种写法冲突（status_code: null + statusCode: 0、block_status: null + blockStatus: 1）、状态码是 "0" → sendError，回读已拉黑也不算 found', async () => {
+    const resps = [
+      { status_code: null, statusCode: 0, block_status: null, blockStatus: 1 },
+      { status_code: 0, block_status: null, blockStatus: 1 },
+      { status_code: 0, block_status: 0, blockStatus: 1 },
+      { status_code: '0', block_status: 1 },
+    ];
+    for (const resp of resps) {
+      const w = fakeWeb();
+      w.block = async (uid, sec) => { w.calls.push([uid, sec]); w.other = async () => ({ statusCode: 0, user: { uid: '900', isBlock: true } }); return resp; };
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], JSON.stringify(resp));
+      assert.ok(r.sendError, JSON.stringify(resp));
+      assert.equal(w.calls.length, 1);
+    }
+  });
+
   test('拉黑返回里读不到 status_code / block_status → sendError，回读已拉黑也不算 found', async () => {
     for (const resp of [{}, { status_code: 0 }, { statusCode: 0 }, null]) {
       const w = fakeWeb();
