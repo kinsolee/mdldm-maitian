@@ -170,7 +170,7 @@ function render() {
   const f0 = O.feed[0];
   $('#screen').innerHTML = `
   <div class="top"><div class="logo">麦<i>田</i></div><div class="tag">内容与粉丝监控</div>
-    <div class="nav"><a class="on" href="/">大屏</a><a href="/p#/traffic">流量</a><a href="/p#/calendar">日历</a>${O.siteOn ? '<a href="/p#/convert">转化</a>' : ''}<a href="/p#/archive">档案</a><a href="/works">作品</a><a href="/p#/system">系统</a></div>
+    <div class="nav"><a class="on" href="/">大屏</a><a href="/p#/traffic">流量</a><a href="/p#/calendar">日历</a>${O.siteOn ? '<a href="/p#/convert">转化</a>' : ''}<a href="/p#/archive">档案</a><a href="/works">作品</a><a href="/compute">算力</a><a href="/cindy">Cindy</a><a href="/p#/system">系统</a></div>
     <div class="lights"><span class="light ok">守护进程 运行中</span><span class="light ${h.nas ? 'ok' : 'bad'}">NAS ${h.nas ? '已挂载' : '读不到'}</span><span class="light ${h.chrome ? 'ok' : 'bad'}">专用浏览器 ${h.chrome ? '在线' : '没开'}</span>
       <span class="light ${!loginOk ? 'bad' : checked ? 'ok' : 'warn'}">平台登录 ${!loginOk ? '有掉线' : checked ? '今日已检' : '今天还没检'}</span></div>
     <div class="clock" id="clock"></div></div>
@@ -231,6 +231,30 @@ if (matchMedia('(hover:hover)').matches) {
   });
 }
 load(); setInterval(tick, 1000); setInterval(() => { if (!document.hidden) load(); }, 60000);
+</script>
+<script>
+// 顶栏「谷歌算力」灯（大屏不加载 mt.js，这里单独一份，逻辑同 mt.js 的 gcSet / gcPlace）：只看快照，不触发采集
+(() => {
+  let k = '', html = '';
+  const e = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const place = () => {
+    const L = document.querySelector('.top .lights'); if (!L || !html) return;
+    const old = L.querySelector('#gclight');
+    if (old) { if (old.dataset.k !== k) old.outerHTML = html; return; }
+    L.insertAdjacentHTML('beforeend', html);
+  };
+  const tick = async () => {
+    try {
+      const r = await fetch('/api/compute/status?peek=1'); if (!r.ok) return;
+      const l = (await r.json()).light || { level: 'idle', text: '未读取' };
+      k = l.level + '|' + l.text;
+      html = `<a class="light ${l.level === 'warn' ? 'warn' : l.level === 'ok' ? 'ok' : ''}" id="gclight" data-k="${e(k)}" href="/compute" title="${e(l.text)}" style="color:inherit;text-decoration:none">谷歌算力 ${l.level === 'warn' ? '在跑 · 去停机' : l.level === 'ok' ? '空闲' : '未读取'}</a>`;
+      place();
+    } catch {}
+  };
+  new MutationObserver(place).observe(document.body, { childList: true, subtree: true });
+  tick(); setInterval(tick, 60000);
+})();
 </script>
 </body>
 </html>

@@ -11,7 +11,9 @@
 //   hub metrics [id]                            采集流量并发日报
 //   hub daemon                                  常驻：到点自动取链接、提醒还没点发布的平台
 //   hub ops ...                                 运营侧账号表、登录检测、写入口令（见 hub ops help）
+//   hub compute refresh [--scope fast|all]      谷歌算力面板采一次（定时由 OpenBot routine 调）；hub compute status 看快照
 import './ops/dispatch.mjs';   // 必须是第一个 import：hub ops 在加载 feishu/db/driver 之前就转走，没有 config.json 也能跑
+import './compute/dispatch.mjs';   // hub compute refresh|status：同样在加载 feishu/db 之前转走（谷歌算力面板，data/studio.db）
 import fs from 'node:fs'; import path from 'node:path'; import os from 'node:os'; import crypto from 'node:crypto'; import { execFileSync, spawn } from 'node:child_process';
 import { db, NAMES, LOCKED, STATE_CN, upsertEpisode, getTask, getTasks, setTask, log, episodes, getEpisode, recentLogs, getMeta, setMeta, saveMetric, prevMetric, saveSnapshot } from './db.mjs';
 import { collectors } from './metrics.mjs';

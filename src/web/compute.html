@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>麦田 · 谷歌算力</title>
+<link rel="icon" href="/static/icon-180.png">
+<link rel="stylesheet" href="/static/mt.css">
+<style>
+.notice{background:var(--warn-bg);color:var(--warn);border-radius:var(--r);padding:12px 16px;font-size:13.5px;line-height:1.7;margin-bottom:var(--gap)}.notice b{font-weight:600}
+.cc .ph .note a{color:var(--accent)}
+.cc .kv{display:flex;align-items:baseline;gap:8px;padding:5px 0;font-size:13.5px;border-top:1px solid var(--line)}.cc .kv:first-of-type{border-top:0}
+.cc .kv .k{width:84px;flex:none;color:var(--t3);font-size:12.5px}.cc .kv b{font-weight:600}
+.cc .big{font-size:28px;font-weight:600;letter-spacing:-.01em;margin:2px 0 8px}.cc .big small{font-size:13px;font-weight:500;color:var(--t2);margin-left:4px}
+.cc .msg{font-size:12.5px;color:var(--t2);line-height:1.55;margin:4px 0 6px}.cc .msg.bad{color:var(--crit)}.cc .msg.warn{color:var(--warn)}
+.cc .red{margin-top:auto;padding-top:10px;font-size:12px;color:var(--warn);line-height:1.55}
+.cc .foot{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--t3);margin-top:8px}.cc .foot a{color:var(--accent);margin-left:auto}
+.cdown{font-size:12px;padding:2px 9px;border-radius:999px;background:var(--warn-bg);color:var(--warn);white-space:nowrap}.cdown.crit{background:var(--crit-bg);color:var(--crit)}
+.btn.sm{padding:4px 12px;font-size:12px}.btn.danger{background:var(--crit);color:#fff}.btn.danger:hover{background:#b80012}
+</style>
+</head>
+<body>
+<div class="page" id="app"><div class="empty" style="height:60vh">加载中…</div></div>
+<script src="/static/mt.js"></script>
+<script>
+// 谷歌算力面板：卡片读 /api/compute/status（秒回快照）。数字取「最近一次成功」，这次失败的原因另外标出来，不抹历史。
+const NAV = [['/', '大屏'], ['/p#/traffic', '流量'], ['/p#/calendar', '日历'], ['/p#/archive', '档案'], ['/works', '作品'], ['/compute', '算力'], ['/cindy', 'Cindy'], ['/p#/system', '系统']];
+const TZ8 = (s) => new Date(s + '+08:00');
+const DEADLINES = { flowOld: TZ8('2026-12-05T00:00:00'), flowReset: TZ8('2026-12-09T15:22:00'), geminiEnd: TZ8('2027-11-14T23:59:59') };
+const CARDS = [
+  { id: 'colab', name: 'Google Colab', sub: '云端 GPU · colab CLI', url: 'https://colab.research.google.com/', red: '红线：严禁常驻；跑完立刻停机（下方「一键停机」或 Runtime → Disconnect and delete runtime）。计算单元 90 天过期。' },
+  { id: 'gemini', name: 'GCP / Gemini API', sub: '赠金 $100 · 2026-11-18 至 2027-11-14', url: 'https://aistudio.google.com/', red: '红线：密钥只放 1Password 和本机 .env，不进代码、日志、截图。' },
+  { id: 'flow', name: 'Google Flow', sub: '视频生成 · ULTRA', url: 'https://flow.google.com/', red: '红线：旧模型（Veo 3.1 Quality / Fast、Omni 1.1）12-05 停用，改用 Veo 3.1 Lite + Omni 1.2 Flash；点数 12-09 15:22 重置，不结转。' },
+  { id: 'flowmusic', name: 'Google Flow Music', sub: '配乐 · Member', url: 'https://www.flowmusic.app/', red: '红线：不上传机密音频；产出的第三方权利责任自负。' },
+  { id: 'kaggle', name: 'Kaggle GPU / TPU', sub: '已关联 Colab Pro+ · 周配额', url: 'https://www.kaggle.com/code', red: '红线：严禁常驻；跑完立刻点 Stop session 关机。' },
+  { id: 'pics', name: 'Google Pics', sub: '改图 · 巴西详情图葡语化', url: 'https://pics.new/', red: '红线：封面一律用 gpt-image-2；出图须经火眼金睛质检。' },
+  { id: 'vids', name: 'Google Vids', sub: 'AI 视频 · 幻灯片转视频', url: 'https://docs.google.com/videos/', red: '红线：对外发布前先问 Kinso。' },
+];
+const ST = { ok: ['published', '正常'], auth_required: ['awaiting_user', '待授权'], unconfigured: ['planned', '未配置'], logged_out: ['not_logged_in', '登录失效'], busy: ['failed', '采集被占用'], user_controlled: ['failed', '你在操作，没采'], timeout: ['failed', '采集超时'], error: ['failed', '本次失败'] };
+let S = null, poll = null;
+
+const days = (d) => Math.ceil((d - Date.now()) / 864e5);
+const cdown = (d, label) => { const n = days(d); return `<span class="cdown ${n <= 3 ? 'crit' : ''}">${esc(label)} ${n > 0 ? `还剩 ${n} 天` : n === 0 ? '就是今天' : '已过'}</span>`; };
+const hrs = (h) => h == null || isNaN(h) ? '–' : (Math.round(h * 10) / 10).toLocaleString('en-US');
+const chipOf = (st) => { const [c, t] = ST[st] || ['planned', st ? esc(st) : '未采集']; return chip({ state: c, stateCn: t }); };
+const kv = (k, v) => `<div class="kv"><span class="k">${esc(k)}</span><span>${v}</span></div>`;
+function flowReset(m) {
+  if (!m?.reset) return DEADLINES.flowReset;
+  const now = new Date(), y = now.getFullYear();
+  let d = TZ8(`${y}-${pad(m.reset.month)}-${pad(m.reset.day)}T${pad(m.reset.hour)}:${pad(m.reset.minute)}:00`);
+  if (d < now - 864e5 * 31) d = TZ8(`${y + 1}-${pad(m.reset.month)}-${pad(m.reset.day)}T${pad(m.reset.hour)}:${pad(m.reset.minute)}:00`);
+  return d;
+}
+
+function body(id, ok) {
+  const m = ok?.metrics || {};
+  if (!ok) return '';
+  if (id === 'colab') return `<div class="big">${m.balance == null ? '–' : m.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}<small>计算单元</small></div>${kv('消耗速率', m.ratePerHour == null ? '–' : `${m.ratePerHour}/小时`)}${kv('活跃会话', `<b>${(ok.sessions || []).length}</b>`)}`;
+  if (id === 'gemini') return `<div class="big">可用<small>${fmt(m.models)} 个模型</small></div>${m.sample?.length ? kv('示例', esc(m.sample.slice(0, 3).join('、'))) : ''}`;
+  if (id === 'flow') return `<div class="big">${fmt(m.credits)}<small>点</small></div>${kv('重置时间', esc(m.resetText || '12月9日 15:22'))}${kv('套餐', esc(m.plan || '–'))}`;
+  if (id === 'flowmusic') return `<div class="big">${fmt(m.credits)}<small>点</small></div>${kv('会员', esc([m.tier, m.plan].filter(Boolean).join(' · ') || '–'))}${m.recent?.[0] ? kv('最近入账', `${esc(m.recent[0].type)} +${fmt(m.recent[0].credits)}（${when(m.recent[0].at)}）`) : ''}`;
+  if (id === 'kaggle') return `<div class="big">${hrs(m.gpu?.leftHours)}<small>/ ${hrs(m.gpu?.totalHours)} 小时 GPU</small></div>${kv('TPU', `${hrs(m.tpu?.leftHours)} / ${hrs(m.tpu?.totalHours)} 小时`)}${kv('配额刷新', m.refreshAt ? when(m.refreshAt) : '–')}${kv('活跃会话', m.sessionsKnown === false ? '读不到' : `<b>${(ok.sessions || []).length}</b>`)}`;
+  return `<div class="big">已登录</div>${kv('页面', esc(m.title || ''))}`;
+}
+
+function card(c) {
+  const v = S.providers[c.id] || {}, last = v.last, ok = v.ok;
+  const failed = last && last.status !== 'ok';
+  let msg = '';
+  if (!last) msg = `<div class="msg">还没采过：点上面「${['colab', 'gemini'].includes(c.id) ? '快速刷新' : '全量刷新'}」。</div>`;
+  else if (last.status === 'auth_required' || last.status === 'unconfigured') msg = `<div class="msg warn">${esc(last.error)}</div>`;
+  else if (failed) msg = `<div class="msg bad">本次失败（${ago(last.fetchedAt)}）：${esc(last.error || last.status)}${ok ? `<br>下面是上次成功（${ago(ok.fetchedAt)}）的数据` : ''}</div>`;
+  const extra = c.id === 'flow' ? `<div class="foot" style="margin-top:6px">${cdown(DEADLINES.flowOld, '旧模型停用')}${cdown(flowReset(ok?.metrics), '点数重置')}</div>`
+    : c.id === 'gemini' ? `<div class="foot" style="margin-top:6px">${cdown(DEADLINES.geminiEnd, '赠金到期')}</div>` : '';
+  return `<div class="panel cc"><div class="ph"><h3>${esc(c.name)}</h3>${chipOf(last?.status)}<span class="note">${esc(c.sub)}</span></div>
+    ${msg}${body(c.id, ok)}${extra}
+    <div class="red">${esc(c.red)}</div>
+    <div class="foot"><span>${last ? `更新于 ${ago(last.fetchedAt)}` : '未采集'}</span><a href="${safeUrl(c.url)}" target="_blank" rel="noopener">打开 ↗</a></div></div>`;
+}
+
+function sessions() {
+  const rows = [];
+  for (const s of S.providers.colab?.ok?.sessions || []) rows.push(`<div class="prow"><span class="st-chip awaiting_user"><i>!</i>计费中</span><b>Colab · ${esc(s.id)}</b><span class="d">${esc([s.hardware, s.shape, s.variant].filter(Boolean).join(' · '))}</span>
+    ${S.local && s.stoppable ? `<button class="btn sm danger" data-stop="${esc(s.id)}">一键停机</button>` : !s.stoppable ? '<span class="d" style="flex:none">本机没有记录，去 Colab 网页停</span>' : '<span class="d" style="flex:none">本机打开才能停机</span>'}</div>`);
+  for (const s of S.providers.kaggle?.ok?.sessions || []) rows.push(`<div class="prow"><span class="st-chip awaiting_user"><i>!</i>计费中</span><b>Kaggle · ${esc(s.title || s.id)}</b><span class="d">${esc(s.accelerator)}</span><a class="btn sm" href="https://www.kaggle.com/code" target="_blank" rel="noopener">去 Kaggle 停机 ↗</a></div>`);
+  if (!rows.length) rows.push(`<div class="prow"><span class="st-chip published"><i>✓</i>空闲</span><b>${S.light.level === 'idle' ? '还没读到 Colab / Kaggle 会话' : '没有在跑的 Colab / Kaggle 会话'}</b><span class="d">Colab 读最近一次 CLI 结果，Kaggle 读最近一次全量刷新</span></div>`);
+  return rows.join('');
+}
+
+function render() {
+  const busy = !!S.refreshing, fl = S.providers.flow?.ok?.metrics;
+  $('#app').innerHTML = `
+  <div class="top"><a class="logo" href="/">麦<i>田</i></a><div class="tag">内容与粉丝监控</div><div class="nav">${NAV.map(([u, t]) => `<a class="${u === '/compute' ? 'on' : ''}" href="${u}">${t}</a>`).join('')}</div></div>
+  <div class="h1">谷歌算力</div>
+  <p class="lead">Google AI Ultra 7 项资源的额度、会话和红线。快速刷新读 Colab CLI 和 Gemini API；全量刷新再用专用浏览器只读采集 Flow、Flow Music、Kaggle、Pics、Vids（约 1 分钟）。</p>
+  <div class="btns" style="margin:0 2px 16px">
+    <button class="btn pri" id="rf-fast" ${busy ? 'disabled' : ''}>快速刷新</button>
+    <button class="btn" id="rf-all" ${busy ? 'disabled' : ''}>全量刷新</button>
+    <span class="note" style="font-size:12.5px;color:var(--t3);align-self:center">${busy ? `${S.refreshing.scope === 'all' ? '全量' : '快速'}刷新中（${ago(S.refreshing.startedAt)}开始）…` : ''}</span>
+  </div>
+  <div class="notice"><b>时间红线：</b>① Flow 旧模型 <b>2026-12-05</b> 停用（${days(DEADLINES.flowOld)} 天后）；② Flow 点数${fl ? ` <b>${fmt(fl.credits)}</b>` : ''} 将于 <b>${esc(fl?.resetText || '12月9日 15:22')}</b> 重置、不结转（${days(flowReset(fl))} 天后）；③ Colab / Kaggle 用完立刻关机。</div>
+  <div class="sec"><h2>在跑的会话</h2><span class="note">有会话时顶栏「谷歌算力」灯变橙</span></div>
+  <div class="panel">${sessions()}</div>
+  <div class="sec"><h2>7 项资源</h2><span class="note">数字取最近一次成功的采集</span></div>
+  <div class="grid g3">${CARDS.map(card).join('')}</div>`;
+  if (typeof gcSet === 'function') gcSet(S);
+}
+
+async function load() {
+  try { S = await api('/api/compute/status'); render(); }
+  catch (e) { $('#app').innerHTML = `<div class="empty" style="height:60vh">读不到状态：${esc(e.message)}</div>`; }
+  clearTimeout(poll); poll = setTimeout(load, S?.refreshing ? 3000 : 30000);
+}
+
+async function post(url, data) {
+  const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: data ? JSON.stringify(data) : '' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+document.addEventListener('click', async (e) => {
+  const t = e.target;
+  try {
+    if (t.id === 'rf-fast' || t.id === 'rf-all') {
+      document.querySelectorAll('#rf-fast,#rf-all').forEach((b) => { b.disabled = true; });
+      await post(`/api/compute/refresh?scope=${t.id === 'rf-all' ? 'all' : 'fast'}`);
+      toast(t.id === 'rf-all' ? '全量刷新已开始，约 1 分钟' : '快速刷新已开始');
+      await load(); return;
+    }
+    if (t.dataset.stop) {
+      if (!confirm(`停掉 Colab 会话 ${t.dataset.stop}？运行中的任务会中断。`)) return;
+      t.disabled = true;
+      await post('/api/compute/colab/stop', { id: t.dataset.stop });
+      toast('已停机'); await load();
+    }
+  } catch (err) { toast(`没成功：${err.message}`); await load(); }
+});
+
+load();
+</script>
+</body>
+</html>

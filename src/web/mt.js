@@ -20,7 +20,7 @@ async function api(p) { const r = await fetch(p); if (!r.ok) throw new Error((aw
 function toast(t) { const d = document.createElement('div'); d.className = 'toast'; d.textContent = t; document.body.append(d); setTimeout(() => d.remove(), 2600); }
 function topbar(O, on) {
   const h = O.health, today = new Date().toLocaleDateString('zh-CN'), loginOk = Object.values(h.login).every(v => v === 'ok'), checked = h.doctorDay === today, n = new Date();
-  const nav = [['/', '大屏', 'board'], ['/p#/traffic', '流量', 'traffic'], ['/p#/calendar', '日历', 'calendar'], ['/p#/convert', '转化', 'convert'], ['/p#/archive', '档案', 'archive'], ['/cindy', 'Cindy', 'cindy'], ['/p#/system', '系统', 'system']].filter(x => x[2] !== 'convert' || O.siteOn);
+  const nav = [['/', '大屏', 'board'], ['/p#/traffic', '流量', 'traffic'], ['/p#/calendar', '日历', 'calendar'], ['/p#/convert', '转化', 'convert'], ['/p#/archive', '档案', 'archive'], ['/works', '作品', 'works'], ['/compute', '算力', 'compute'], ['/cindy', 'Cindy', 'cindy'], ['/p#/system', '系统', 'system']].filter(x => x[2] !== 'convert' || O.siteOn);
   return `<div class="top"><a class="logo" href="/">麦<i>田</i></a><div class="tag">内容与粉丝监控</div><div class="nav">${nav.map(([u, t, k]) => `<a class="${k === on ? 'on' : ''}" href="${u}">${t}</a>`).join('')}</div>
     <div class="lights"><span class="light ok">守护进程 运行中</span><span class="light ${h.nas ? 'ok' : 'bad'}">NAS ${h.nas ? '已挂载' : '读不到'}</span><span class="light ${h.chrome ? 'ok' : 'bad'}">专用浏览器 ${h.chrome ? '在线' : '没开'}</span><span class="light ${!loginOk ? 'bad' : checked ? 'ok' : 'warn'}">平台登录 ${!loginOk ? '有掉线' : checked ? '今日已检' : '今天还没检'}</span></div>
     <div class="clock"><small>${n.getMonth() + 1}/${n.getDate()} 周${'日一二三四五六'[n.getDay()]}</small>${pad(n.getHours())}:${pad(n.getMinutes())}</div></div>`;
@@ -63,3 +63,22 @@ function drawLines(el, series) {
   const tip = document.createElement('div'); tip.id = 'tip'; document.addEventListener('DOMContentLoaded', () => document.body.append(tip));
   document.addEventListener('mousemove', (e) => { const t = e.target.closest && e.target.closest('[data-tip]'); if (!t) { tip.style.display = 'none'; return; } tip.textContent = t.dataset.tip; tip.style.display = 'block'; tip.style.left = Math.min(innerWidth - tip.offsetWidth - 8, e.clientX + 14) + 'px'; tip.style.top = Math.max(8, e.clientY - 34) + 'px'; });
 })();
+// 顶栏「谷歌算力」灯（所有用 mt.js 的页面共用）：Colab / Kaggle 有活跃会话变橙、提示去停机；读到且空闲绿；没读过灰。
+// 只看快照（peek=1，不触发 Colab CLI）；页面重画顶栏后由 MutationObserver 补回。
+const GC = { k: '', html: '' };
+function gcSet(s) {
+  const l = (s && s.light) || { level: 'idle', text: '未读取' }, cls = l.level === 'warn' ? 'warn' : l.level === 'ok' ? 'ok' : '';
+  GC.k = l.level + '|' + l.text;
+  GC.html = `<a class="light ${cls}" id="gclight" data-k="${esc(GC.k)}" href="/compute" title="${esc(l.text)}" style="color:inherit;text-decoration:none">谷歌算力 ${l.level === 'warn' ? '在跑 · 去停机' : l.level === 'ok' ? '空闲' : '未读取'}</a>`;
+  gcPlace();
+}
+function gcPlace() {
+  const top = document.querySelector('.top'); if (!top || !GC.html) return;
+  const old = top.querySelector('#gclight');
+  if (old) { if (old.dataset.k !== GC.k) old.outerHTML = GC.html; return; }
+  let L = top.querySelector('.lights');
+  if (!L) { L = document.createElement('div'); L.className = 'lights'; const c = top.querySelector('.clock'); c ? top.insertBefore(L, c) : top.append(L); }
+  L.insertAdjacentHTML('beforeend', GC.html);
+}
+async function gcTick() { try { const r = await fetch('/api/compute/status?peek=1'); if (r.ok) gcSet(await r.json()); } catch {} }
+document.addEventListener('DOMContentLoaded', () => { new MutationObserver(gcPlace).observe(document.body, { childList: true, subtree: true }); gcTick(); setInterval(gcTick, 60000); });

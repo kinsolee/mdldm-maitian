@@ -26,7 +26,7 @@ ol.todo{margin:0;padding-left:20px;font-size:13.5px;line-height:1.9}
 <script>
 // KIN-325：Cindy 接麦田事件。看整条链路是否通、生成或更换 Cindy 挂 MCP 用的 token。
 // token 不在状态接口里；只有本机打开（http://localhost:8787/cindy）时才能取和换，取到的只放在这一页的内存里。
-const NAV = [['/', '大屏'], ['/p#/traffic', '流量'], ['/p#/calendar', '日历'], ['/p#/archive', '档案'], ['/works', '作品'], ['/cindy', 'Cindy'], ['/p#/system', '系统']];
+const NAV = [['/', '大屏'], ['/p#/traffic', '流量'], ['/p#/calendar', '日历'], ['/p#/archive', '档案'], ['/works', '作品'], ['/compute', '算力'], ['/cindy', 'Cindy'], ['/p#/system', '系统']];
 let S = null, token = null, shown = false;
 
 function step(title, ok, lines) {
