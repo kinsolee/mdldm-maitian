@@ -30,7 +30,7 @@ function fakeBili(o = {}) {
       if (u.pathname === '/x/v2/reply/reply') {
         assert.equal(q('oid'), '555');
         const t = st.threads[q('root')];
-        if (!t) return { code: 12022, message: '已经被删除了' };
+        if (!t) return o.missingCode ? { code: o.missingCode, message: '没有该评论', data: null } : { code: 12022, message: '已经被删除了' };
         const pn = Number(q('pn'));
         return { code: 0, data: { page: { count: t.replies.length, num: pn, size: 20 }, root: t.root, replies: t.replies.slice((pn - 1) * 20, pn * 20) } };
       }
@@ -147,6 +147,50 @@ describe('B站 delete（假接口）', () => {
     const missing = fakeBili({ threads: { 100: { root: rp(100), replies: [] } } });
     assert.equal((await deleteComment(missing.api, P('delete', sub))).blocked, 'target-not-found');
     assert.equal(gone.posts.length + missing.posts.length, 0);
+  });
+
+  // 12006「没有该评论」：root 楼不存在（root 填错也是它）。发后回读认作楼已不在，发前不认
+  test('12006：删一楼（下面没有回复）后回读 reply/reply 返回 12006 → found，detail 写明 code=12006', async () => {
+    const f = fakeBili({ missingCode: 12006, threads: { 100: { root: rp(100, { mid: '9001' }), replies: [] } } });
+    const r = await deleteComment(f.api, P('delete', root));
+    assert.equal(r.sendAttempted, true);
+    assert.deepEqual(r.readBack, { found: true, count: 1, nativeId: '100', detail: '楼 100 已不在（code=12006）' });
+    assert.equal(f.posts.length, 1);
+  });
+
+  test('12006：删楼中楼后整栋楼都没了，回读返回 12006 → found；只调一次', async () => {
+    const f = fakeBili({ missingCode: 12006 });
+    const post = f.api.post;
+    // 删的同时一楼也被删了：发后整栋楼 12006
+    f.api.post = async (url, form, c) => { const r = await post(url, form, c); delete f.st.threads[100]; return r; };
+    const r = await deleteComment(f.api, P('delete', sub));
+    assert.deepEqual(r.readBack, { found: true, count: 1, nativeId: '101', detail: '楼 100 已不在（code=12006）' });
+    assert.equal(f.posts.length, 1);
+  });
+
+  test('12006：大楼里删一页的第一条（跨页重读）后整栋楼 12006 → found', async () => {
+    const replies = Array.from({ length: 45 }, (_, i) => rp(1000 + i * 3, { root: 100, parent: 100, mid: '9100' }));
+    const f = fakeBili({ missingCode: 12006, threads: { 100: { root: rp(100), replies } } });
+    const post = f.api.post, get = f.api.get;
+    // 回读定位（第 1、2 页）时楼还在，跨页重读第 2 页时楼已被删 → 走的是 fresh 这条路
+    let after = null;
+    f.api.post = async (url, form, c) => { const r = await post(url, form, c); after = 0; return r; };
+    f.api.get = async (url) => { if (after != null && url.includes('reply/reply') && ++after === 3) delete f.st.threads[100]; return get(url); };
+    const r = await deleteComment(f.api, P('delete', { ...sub, commentId: String(1000 + 20 * 3), authorUid: '9100' }));
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.match(r.readBack.detail, /code=12006/);
+  });
+
+  test('12006：发前 reply/reply 就返回 12006（root 可能填错）→ 不调 reply/del，blocked 不是 already-gone', async () => {
+    for (const target of [root, sub]) {
+      const f = fakeBili({ missingCode: 12006, threads: {} });
+      const r = await deleteComment(f.api, P('delete', target));
+      assert.equal(r.sendAttempted, false);
+      assert.notEqual(r.blocked, 'already-gone');
+      assert.equal(r.blocked, 'precheck-error');
+      assert.match(r.detail, /code=12006/);
+      assert.equal(f.posts.length, 0);
+    }
   });
 
   test('楼中楼对上了 rpid、但它的 root 不是这栋楼 → target-not-found，不调接口', async () => {
