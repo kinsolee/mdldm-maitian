@@ -199,26 +199,131 @@ describe('抖音删评论', () => {
   });
 });
 
-/** 假网页版：blocked 集合；block 调用记下来。 */
-function fakeWeb({ selfUid = ME, blocked = [], blockResp = { status_code: 0, block_status: 1 }, apply = true, users = {} } = {}) {
+// 网页版函数返回的字段写法（2026-11-22 只读核对，见 douyin-moderate.mjs 文件头）：
+//   real：self、other 转过驼峰（statusCode、user.isBlock），block 是接口原样（status_code、block_status）。
+//   snake / camel：三个都是下划线 / 都是驼峰（找到的函数换成不转换的那个，或页面改版）。
+const camel = (o) => (Array.isArray(o) || o === null || typeof o !== 'object' ? o
+  : Object.fromEntries(Object.entries(o).map(([k, v]) => [k.replace(/_([a-z])/g, (_, c) => c.toUpperCase()), camel(v)])));
+const STYLES = { real: { self: camel, other: camel, block: (o) => o }, snake: { self: (o) => o, other: (o) => o, block: (o) => o }, camel: { self: camel, other: camel, block: camel } };
+
+/** 假网页版：blocked 集合；block 调用记下来。接口按下划线写，style 决定交出去的写法。 */
+function fakeWeb({ selfUid = ME, blocked = [], blockResp = { status_code: 0, block_status: 1 }, apply = true, users = {}, style = 'real' } = {}) {
   const set = new Set(blocked);
   const calls = [];
+  const as = STYLES[style];
   return {
     calls,
-    self: async () => ({ statusCode: 0, user: { uid: selfUid } }),
-    other: async (sec) => { const uid = users[sec] ?? sec.replace(/^SEC-/, ''); return { status_code: 0, user: { uid, is_block: set.has(uid) } }; },
-    block: async (uid, sec) => { calls.push([uid, sec]); if (apply && blockResp.status_code === 0) set.add(uid); return blockResp; },
+    self: async () => as.self({ status_code: 0, status_msg: null, log_pb: {}, user: { uid: selfUid, sec_uid: `SEC-${selfUid}` } }),
+    other: async (sec) => { const uid = users[sec] ?? sec.replace(/^SEC-/, ''); return as.other({ status_code: 0, status_msg: null, log_pb: {}, user: { uid, sec_uid: sec, is_block: set.has(uid), is_blocked: false } }); },
+    block: async (uid, sec) => { calls.push([uid, sec]); if (apply && blockResp.status_code === 0) set.add(uid); return as.block(blockResp); },
   };
 }
 const blkParams = (o = {}) => ({ op: 'block', uid: ME, selfUids: [ME], target: { mid: '900', via: 'comment', source: { kind: 'comment', commentId: '201', workId: AWEME, parentId: '101', rootId: '101', authorUid: '900' }, ...o } });
 const thread = () => fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [sub('201', '101', '900')] } });
 
 describe('抖音拉黑', () => {
-  test('从来源评论读出 sec_uid → 网页版核对账号 → 拉黑一次 → 回读 is_block=true → found', async () => {
+  test('从来源评论读出 sec_uid → 网页版核对账号 → 拉黑一次 → 回读 is_block=true → found（实测写法、全下划线、全驼峰都认）', async () => {
+    for (const style of Object.keys(STYLES)) {
+      const w = fakeWeb({ style });
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.sendAttempted, r.sendError, r.readBack.found, r.readBack.nativeId], [true, undefined, true, '900'], style);
+      assert.deepEqual(w.calls, [['900', 'SEC-900']], style);
+    }
+  });
+
+  test('已拉黑、接口报错、block_status 不是 1：每种写法都认得出来', async () => {
+    for (const style of Object.keys(STYLES)) {
+      const already = await block(apiOf(thread(), { web: fakeWeb({ style, blocked: ['900'] }) }), blkParams());
+      assert.equal(already.blocked, 'already-blocked', style);
+      const err = await block(apiOf(thread(), { web: fakeWeb({ style, blockResp: { status_code: 2096, status_msg: '操作太频繁' } }) }), blkParams());
+      assert.match(err.sendError, /status_code=2096 操作太频繁/, style);
+      const half = await block(apiOf(thread(), { web: fakeWeb({ style, blockResp: { status_code: 0, block_status: 0 } }) }), blkParams());
+      assert.match(half.sendError, /block_status=0/, style);
+      assert.equal(half.readBack.found, false, style);
+    }
+  });
+
+  test('profile/other 读不到 is_block（两种写法都没有、或不是布尔值）→ precheck-error，不调拉黑', async () => {
+    for (const user of [{ uid: '900' }, { uid: '900', is_block: 1 }, { uid: '900', isBlock: 'false' }, { uid: '900', is_block: null }]) {
+      for (const top of [{ status_code: 0 }, { statusCode: 0 }]) {
+        const w = fakeWeb();
+        w.other = async () => ({ ...top, user });
+        const r = await block(apiOf(thread(), { web: w }), blkParams());
+        assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], JSON.stringify({ top, user }));
+        assert.match(r.detail, /is_block/);
+        assert.equal(w.calls.length, 0);
+      }
+    }
+  });
+
+  test('profile/self、profile/other 的 status_code 两种写法都没有 / 不是 0 → precheck-error，不调拉黑', async () => {
+    const cases = [
+      ['self 没有状态码', (w) => { w.self = async () => ({ user: { uid: ME } }); }],
+      ['self statusCode=8', (w) => { w.self = async () => ({ statusCode: 8, user: { uid: ME } }); }],
+      ['other 没有状态码', (w) => { w.other = async () => ({ user: { uid: '900', isBlock: false } }); }],
+      ['other status_code=2', (w) => { w.other = async () => ({ status_code: 2, user: { uid: '900', is_block: false } }); }],
+    ];
+    for (const [name, patch] of cases) {
+      const w = fakeWeb();
+      patch(w);
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], name);
+      assert.equal(w.calls.length, 0, name);
+    }
+  });
+
+  test('评审第 1 轮：两种写法同时出现且值冲突（含一边是 null）、状态码是字符串 "0" → 发前 precheck-error，不调拉黑', async () => {
+    const others = [
+      { status_code: null, statusCode: 0, user: { uid: '900', isBlock: false } },
+      { status_code: 0, user: { uid: '900', is_block: null, isBlock: false } },
+      { status_code: 0, user: { uid: '900', is_block: true, isBlock: false } },
+      { status_code: '0', user: { uid: '900', is_block: false } },
+    ];
+    for (const o of others) {
+      const w = fakeWeb();
+      w.other = async () => o;
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], JSON.stringify(o));
+      assert.equal(w.calls.length, 0);
+    }
+    // 评审第 2 轮：返回是数组（哪怕带了 status_code、user 属性）也不认
+    const arr = Object.assign([], { status_code: 0, user: { uid: '900', is_block: false } });
+    const wa = fakeWeb();
+    wa.other = async () => arr;
+    assert.equal((await block(apiOf(thread(), { web: wa }), blkParams())).blocked, 'precheck-error');
+    assert.equal(wa.calls.length, 0);
     const w = fakeWeb();
-    const r = await block(apiOf(thread(), { web: w }), blkParams());
-    assert.deepEqual([r.sendAttempted, r.readBack.found, r.readBack.nativeId], [true, true, '900']);
-    assert.deepEqual(w.calls, [['900', 'SEC-900']]);
+    w.self = async () => ({ status_code: 8, statusCode: 0, user: { uid: ME } });
+    assert.equal((await block(apiOf(thread(), { web: w }), blkParams())).blocked, 'precheck-error');
+    assert.equal(w.calls.length, 0);
+  });
+
+  test('评审第 1 轮：拉黑返回两种写法冲突（status_code: null + statusCode: 0、block_status: null + blockStatus: 1）、状态码是 "0" → sendError，回读已拉黑也不算 found', async () => {
+    const resps = [
+      { status_code: null, statusCode: 0, block_status: null, blockStatus: 1 },
+      { status_code: 0, block_status: null, blockStatus: 1 },
+      { status_code: 0, block_status: 0, blockStatus: 1 },
+      { status_code: '0', block_status: 1 },
+    ];
+    for (const resp of resps) {
+      const w = fakeWeb();
+      w.block = async (uid, sec) => { w.calls.push([uid, sec]); w.other = async () => ({ statusCode: 0, user: { uid: '900', isBlock: true } }); return resp; };
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], JSON.stringify(resp));
+      assert.ok(r.sendError, JSON.stringify(resp));
+      assert.equal(w.calls.length, 1);
+    }
+  });
+
+  test('拉黑返回里读不到 status_code / block_status → sendError，回读已拉黑也不算 found', async () => {
+    for (const resp of [{}, { status_code: 0 }, { statusCode: 0 }, null]) {
+      const w = fakeWeb();
+      w.block = async (uid, sec) => { w.calls.push([uid, sec]); w.other = async () => ({ statusCode: 0, user: { uid: '900', isBlock: true } }); return resp; };
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], JSON.stringify(resp));
+      assert.match(r.sendError, /status_code=无|block_status=无/, JSON.stringify(resp));
+      assert.equal(w.calls.length, 1);
+    }
   });
 
   test('从来源会话读出 sec_uid；会话对方不是这个人 → target-not-found；群聊 → not-a-user', async () => {
