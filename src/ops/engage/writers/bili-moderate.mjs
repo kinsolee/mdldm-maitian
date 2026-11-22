@@ -176,8 +176,10 @@ async function seek(page, rpid) {
 //   和看得见的评论没有区别：没有字段标「隐藏 / 折叠 / 待审」，所以不靠字段判断，只靠「reply/reply 没有、fulllist 有」。
 // 「读全」的证据：每页 page.total 一样、条目都是这个作品的、没有重复，读到的条数等于 page.total。
 // 这个接口没有游标或快照，翻页中间有增删时列表会挪位，可能刚好漏掉一条而上面几条照样成立（R1 Codex-1）。
-// 所以发后回读不只看「这条不在」：读到的整个集合要正好等于发前那一次减去这一条，作品下有任何别的变化都判确认不了。
-const MAX_FULLLIST_PAGES = 30;             // 一个作品最多读 600 条
+// 所以发后回读不只看「这条不在」：读到的整个集合要正好等于发前那一次减去这一条，作品下有任何别的变化都判确认不了；
+// 一页的内容和 page.total 也可能不是同一时刻的（R2 Codex-1：旧页面配新 total，前面删了一条、目标挪进读过的页），
+// 所以这样的结果要隔一会儿再完整读一遍、两次集合一样才算。
+const MAX_FULLLIST_PAGES = 20;             // 一个作品最多读 400 条：发前一遍、发后两遍，留在 120 秒写入超时里
 
 /** 按作品读全 fulllist：{ items: Map(rpid → 条目), total } / { error, unsure? }。 */
 async function scanWork(api, bvid, oid) {
@@ -290,6 +292,10 @@ async function readBackComment(api, p, oid, check) {
     const added = [...w.items.keys()].filter((id) => !check.before.has(id));
     const lost = [...check.before].filter((id) => id !== String(check.rpid) && !w.items.has(id));
     if (added.length || lost.length) return { gone: false, detail: `回读时 up/fulllist 里这条不在了，但作品 ${t.workId} 的评论还有别的变化（多了 ${added.length} 条、少了 ${lost.length} 条），翻页可能挪了位，确认不了` };
+    await api.sleep(1500);
+    const again = await scanWork(api, t.workId, oid);
+    if (again.error) return { gone: false, detail: `第二遍回读 up/fulllist：${again.error}，确认不了` };
+    if (again.items.size !== w.items.size || [...again.items.keys()].some((id) => !w.items.has(id))) return { gone: false, detail: `两遍回读 up/fulllist 读到的不一样（${w.items.size} 条、${again.items.size} 条），确认不了` };
     return { gone: true, detail: `up/fulllist 作品 ${t.workId} 的 ${w.total} 条评论里已没有 ${t.commentId}` };
   }
   const s = await seek(page, check.rpid);

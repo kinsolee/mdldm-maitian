@@ -245,12 +245,12 @@ describe('B站 delete（假接口）', () => {
     }
   });
 
-  test('大楼：目标 rpid 不在楼里 → 不是 already-gone，不调接口；改查 up/fulllist，作品 1001 条超过 600 条读不全 → thread-incomplete', async () => {
+  test('大楼：目标 rpid 不在楼里 → 不是 already-gone，不调接口；改查 up/fulllist，作品 1001 条超过 400 条读不全 → thread-incomplete', async () => {
     const f = fakeBili({ threads: bigThread() });
     for (const id of ['1001', '999', '99999']) {
       const r = await deleteComment(f.api, P('delete', { ...sub, commentId: id }));
       assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false], id);
-      assert.match(r.detail, /up\/fulllist.*30 页/);
+      assert.match(r.detail, /up\/fulllist.*20 页/);
     }
     assert.equal(f.posts.length, 0);
   });
@@ -521,7 +521,7 @@ describe('B站 delete（假接口）', () => {
       });
     }
 
-    test('up/fulllist 读不全 → 不删：total 和条数对不上、缺 page.total、翻页时 total 变了、有别的作品的评论、有重复、超过 30 页', async () => {
+    test('up/fulllist 读不全 → 不删：total 和条数对不上、缺 page.total、翻页时 total 变了、有别的作品的评论、有重复、超过 20 页', async () => {
       const cases = {
         'total 偏大': (u, all) => ({ code: 0, data: { page: { total: all.length + 1 }, list: all } }),
         '缺 page.total': (u, all) => ({ code: 0, data: { page: {}, list: all } }),
@@ -529,7 +529,7 @@ describe('B站 delete（假接口）', () => {
         'total 变了': (u, all) => { const pn = Number(u.searchParams.get('pn')); return { code: 0, data: { page: { total: pn === 1 ? 25 : 24 }, list: pn === 1 ? Array.from({ length: 20 }, (_, i) => ({ ...rp(5000 + i), oid: 555 })) : all.slice(0, 4) } }; },
         '别的作品': (u, all) => ({ code: 0, data: { page: { total: all.length }, list: all.map((x, i) => (i ? x : { ...x, oid: 777 })) } }),
         '重复': (u, all) => { const pn = Number(u.searchParams.get('pn')); const page = Array.from({ length: 20 }, (_, i) => ({ ...rp(5000 + i), oid: 555 })); return { code: 0, data: { page: { total: 40 }, list: pn === 1 ? page : page } }; },
-        '超过 30 页': (u) => ({ code: 0, data: { page: { total: 1000 }, list: Array.from({ length: 20 }, (_, i) => ({ ...rp(Number(u.searchParams.get('pn')) * 100 + i), oid: 555 })) } }),
+        '超过 20 页': (u) => ({ code: 0, data: { page: { total: 1000 }, list: Array.from({ length: 20 }, (_, i) => ({ ...rp(Number(u.searchParams.get('pn')) * 100 + i), oid: 555 })) } }),
       };
       for (const [name, fulllist] of Object.entries(cases)) {
         const f = shape1({ fulllist });
@@ -537,7 +537,7 @@ describe('B站 delete（假接口）', () => {
         assert.equal(r.sendAttempted, false, name);
         assert.equal(r.blocked, name === '缺 data.list' ? 'precheck-error' : 'thread-incomplete', `${name}：${r.detail}`);
         assert.equal(f.posts.length, 0, name);
-        if (name === '超过 30 页') assert.equal(fullGets(f), 30);
+        if (name === '超过 20 页') assert.equal(fullGets(f), 20);
       }
       // fulllist 报错（限流）→ precheck-error，可重试
       const g = shape2({ fulllist: () => ({ code: -412, message: '请求被拦截' }) });
@@ -592,6 +592,25 @@ describe('B站 delete（假接口）', () => {
       const r2 = await deleteComment(g.api, P('delete', hid));
       assert.deepEqual([r2.sendAttempted, r2.readBack.found], [true, false]);
       assert.match(r2.readBack.detail, /多了 1 条/);
+    });
+
+    test('R2 Codex-1（fulllist）：回读第 1 页是旧内容配新 total、前面删了一条让目标挪进读过的页 → 这一遍集合正好等于发前减去目标，第二遍对不上 → found:false', async () => {
+      // 作品 40 条，A=60 在第 1 页，目标 40 在第 2 页第 1 条；reply/del 没生效。回读第一遍读第 1 页时 A 刚被别人删掉：
+      // 第 1 页给的还是旧内容（含 A），total 已经是 39；第 2 页按删后的列表给，目标挪到了第 1 页，被漏掉
+      const ids = Array.from({ length: 40 }, (_, i) => 60 - i);
+      const item = (id) => (id === 40 ? { ...rp(40, { root: 100, parent: 100, mid: '9666' }), oid: 555 } : { ...rp(id, { root: 300, parent: 300 }), oid: 555 });
+      const before = ids.map(item), afterDel = ids.filter((id) => id !== 60).map(item);
+      let reads = 0;
+      const page = (list, pn) => list.slice((pn - 1) * 20, pn * 20);
+      const f = shape2({ hidden: [item(40)], delEffective: false, fulllist: (u) => {
+        const pn = Number(u.searchParams.get('pn'));
+        if (!f.posts.length) return { code: 0, data: { page: { total: 40 }, list: page(before, pn) } };
+        reads++;
+        return { code: 0, data: { page: { total: 39 }, list: reads === 1 ? page(before, pn) : page(afterDel, pn) } };
+      } });
+      const r = await deleteComment(f.api, P('delete', { ...hid, commentId: '40' }));
+      assert.deepEqual([r.sendAttempted, r.readBack.found, f.posts.length], [true, false, 1], r.readBack.detail);
+      assert.match(r.readBack.detail, /还在|不一样/);
     });
 
     test('reply/reply 定位得到的楼中楼照旧走邻居回读，不读 up/fulllist', async () => {
