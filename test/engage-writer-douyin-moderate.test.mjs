@@ -286,6 +286,12 @@ describe('抖音拉黑', () => {
       assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], JSON.stringify(o));
       assert.equal(w.calls.length, 0);
     }
+    // 评审第 2 轮：返回是数组（哪怕带了 status_code、user 属性）也不认
+    const arr = Object.assign([], { status_code: 0, user: { uid: '900', is_block: false } });
+    const wa = fakeWeb();
+    wa.other = async () => arr;
+    assert.equal((await block(apiOf(thread(), { web: wa }), blkParams())).blocked, 'precheck-error');
+    assert.equal(wa.calls.length, 0);
     const w = fakeWeb();
     w.self = async () => ({ status_code: 8, statusCode: 0, user: { uid: ME } });
     assert.equal((await block(apiOf(thread(), { web: w }), blkParams())).blocked, 'precheck-error');

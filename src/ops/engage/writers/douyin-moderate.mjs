@@ -150,7 +150,7 @@ async function secUidOf(api, p, mid) {
 
 /** 网页版函数的返回字段，下划线、驼峰两种写法都认（见文件头）。两种键都在、值不一样（包括一边是 null）就当读不到，交给调用方拒绝。 */
 function fieldOf(o, snake) {
-  if (!o || typeof o !== 'object') return undefined;
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return undefined;
   const camel = snake.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
   const hs = Object.hasOwn(o, snake), hc = Object.hasOwn(o, camel);
   if (hs && hc) return Object.is(o[snake], o[camel]) ? o[snake] : undefined;
