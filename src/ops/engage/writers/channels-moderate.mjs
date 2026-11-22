@@ -35,8 +35,20 @@ function locate(th, target, rootId) {
   if (target === rootId) return { node: th.root };
   if (!th.complete) return { blocked: 'thread-incomplete', detail: `楼 ${rootId} 的回复没读全（读到 ${th.l2.length} 条），删了也确认不了，没动` };
   const node = th.l2.find((c) => String(c.commentId) === target);
-  return node ? { node } : { gone: true, detail: `楼 ${rootId} 读全了，里面已没有 ${target}` };
+  if (!node) return { gone: true, detail: `楼 ${rootId} 读全了，里面已没有 ${target}` };
+  // 沿 replyCommentId 往上走，要落到这栋楼（直接回一楼的 replyCommentId 为空或是一楼 id）；指到楼外、断链、成环都不认
+  const byId = new Map(th.l2.map((c) => [String(c.commentId), c]));
+  for (let cur = node, seen = new Set(); ;) {
+    const up = cur.replyCommentId == null || cur.replyCommentId === '' || String(cur.replyCommentId) === '0' ? rootId : String(cur.replyCommentId);
+    if (up === rootId) break;
+    if (seen.has(up) || !byId.has(up)) return { blocked: 'target-not-found', detail: `${target} 的回复链指到 ${up}，不在楼 ${rootId} 里，没动` };
+    seen.add(up); cur = byId.get(up);
+  }
+  return { node };
 }
+
+/** 作者是不是我：昵称缺失、不是非空字符串时判断不了，返回 null（调用方不动手）。 */
+const authorIsMe = (node, myNick) => (typeof node?.commentNickname === 'string' && node.commentNickname.trim() ? node.commentNickname === myNick : null);
 
 /** 发前共用：核对账号、找到作品 exportId、读到目标评论。返回 { done } 或 { me, myNick, exportId, node, th }。 */
 async function prepare(api, p, ids) {
@@ -63,7 +75,9 @@ export async function deleteComment(api, p) {
     const { at } = pre;
     if (at.gone) return stop(me, 'already-gone', at.detail);
     if (at.blocked) return stop(me, at.blocked, at.detail);
-    if (at.node.commentNickname === pre.myNick) return stop(me, 'self-target', '这条是我自己的评论，不删');
+    const mine = authorIsMe(at.node, pre.myNick);
+    if (mine == null) return stop(me, 'precheck-error', '读不到这条评论的作者昵称，判断不了是不是我自己的，没删');
+    if (mine) return stop(me, 'self-target', '这条是我自己的评论，不删');
     if (ids.target === ids.rootId) {
       // 删一楼会连楼下回复一起拿掉：楼读不全、或下面有回复（不管是谁的）都不删
       if (!pre.th.complete) return stop(me, 'thread-incomplete', '一楼下面的回复没读全，判断不了有没有回复，没删');
@@ -103,7 +117,9 @@ export async function block(api, p) {
     const { at } = pre;
     if (at.gone) return stop(me, 'target-not-found', `来源评论 ${ids.target} 已不在，视频号拉黑要从评论发起，没拉黑（${at.detail}）`);
     if (at.blocked) return stop(me, at.blocked, at.detail);
-    if (at.node.commentNickname === pre.myNick) return stop(me, 'self-target', '这条评论是我自己发的，不拉黑');
+    const mine = authorIsMe(at.node, pre.myNick);
+    if (mine == null) return stop(me, 'precheck-error', '读不到这条评论的作者昵称，判断不了是不是我自己，没拉黑');
+    if (mine) return stop(me, 'self-target', '这条评论是我自己发的，不拉黑');
     if (at.node.blacklistFlag) return stop(me, 'already-blocked', `评论 ${ids.target} 的作者已在黑名单里`);
   } catch (e) {
     return stop(me, 'precheck-error', errText(e));

@@ -75,6 +75,18 @@ describe('视频号删评论', () => {
     assert.equal(gone.writes().length + mine.writes().length + part.writes().length, 0);
   });
 
+  test('评审修复：作者昵称缺失 → precheck-error；回复链指到别的楼 → target-not-found；删和拉黑都不调接口', async () => {
+    const noNick = fakeChannels({ roots: [root('c1', '甲', [{ ...l2('c2', '乙'), commentNickname: undefined }])] });
+    assert.equal((await deleteComment(noNick.api(), delP())).blocked, 'precheck-error');
+    assert.equal((await block(noNick.api(), blkP())).blocked, 'precheck-error');
+    const cross = fakeChannels({ roots: [root('c1', '甲', [l2('c2', '乙', { reply: 'other-root' })])] });
+    assert.equal((await deleteComment(cross.api(), delP())).blocked, 'target-not-found');
+    assert.equal((await block(cross.api(), blkP())).blocked, 'target-not-found');
+    const chain = fakeChannels({ roots: [root('c1', '甲', [l2('c3', '丙', { reply: 'c1' }), l2('c2', '乙', { reply: 'c3' })])] });
+    assert.equal((await deleteComment(chain.api(), delP())).readBack.found, true);
+    assert.equal(noNick.writes().length + cross.writes().length, 0);
+  });
+
   test('回读还在 → found=false；接口 errCode≠0 → sendError；接口抛错 → sendAttempted=true；都只调一次', async () => {
     const stay = fakeChannels({ roots: [root('c1', '甲', [l2('c2', '乙')])], del: { errCode: 0, apply: false } });
     const a = await deleteComment(stay.api(), delP());
