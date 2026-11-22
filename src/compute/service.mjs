@@ -2,6 +2,7 @@
 // 不建定时器：定时巡检由 OpenBot routine 调 `node src/hub.mjs compute refresh --scope all`。
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openStudio, PROVIDERS, studioDbPath } from './store.mjs';
@@ -43,30 +44,52 @@ export function runEgo({ cli = process.env.MAITIAN_COMPUTE_EGO_CLI || path.join(
   });
 }
 
-/** 状态灯：Colab 或 Kaggle 有活跃会话 → warn（橙，提示去停机）；读到了且都空闲 → ok（绿）；都读不到 → idle（灰）。 */
+/**
+ * 状态灯：任一成功快照里 Colab / Kaggle 有会话 → warn（橙，提示去停机；本次没读到时注明「上次读到」）；
+ * 读到过的那几项这次都成功且都空闲 → ok（绿）；读到过、但这次失败 → idle（灰，「本次没读到」，不沿用旧的空闲）；都没读到过 → idle。
+ */
 export function computeLight(view) {
-  const colab = view.colab?.ok, kaggle = view.kaggle?.ok;
-  const colabActive = !!colab && ((colab.sessions || []).length > 0 || (colab.metrics?.assignments || 0) > 0);
-  const kaggleKnown = !!kaggle && kaggle.metrics?.sessionsKnown !== false;   // 会话没读到的快照不能当「空闲」
-  const kaggleActive = kaggleKnown && (kaggle.sessions || []).length > 0;
-  if (colabActive || kaggleActive) return { level: 'warn', text: `${[colabActive && 'Colab', kaggleActive && 'Kaggle'].filter(Boolean).join('、')} 在跑，用完去停机` };
-  if (colab || kaggleKnown) return { level: 'ok', text: '空闲' };
+  const one = (p, active) => {
+    const last = view[p]?.last, ok = view[p]?.ok;
+    const fresh = last?.status === 'ok' && !!ok && ok.metrics?.sessionsKnown !== false;
+    return { seen: !!ok, fresh, active: !!ok && ok.metrics?.sessionsKnown !== false && active(ok), stale: !!ok && !fresh };
+  };
+  const c = one('colab', (o) => (o.sessions || []).length > 0 || (o.metrics?.assignments || 0) > 0);
+  const k = one('kaggle', (o) => (o.sessions || []).length > 0);
+  const act = [['Colab', c], ['Kaggle', k]].filter(([, x]) => x.active);
+  if (act.length) return { level: 'warn', text: `${act.map(([n]) => n).join('、')} 在跑，用完去停机${act.some(([, x]) => x.stale) ? '（上次读到，本次没读到）' : ''}` };
+  const stale = [['Colab', c], ['Kaggle', k]].filter(([, x]) => x.stale).map(([n]) => n);
+  if (stale.length) return { level: 'idle', text: `${stale.join('、')} 本次没读到，不能确认空闲` };
+  if (c.fresh || k.fresh) return { level: 'ok', text: '空闲' };
   return { level: 'idle', text: '未读取' };
 }
 
 const pidAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-const readLockFile = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return e.code === 'ENOENT' ? null : {}; } };
-/** 跨进程刷新锁（网页服务和 hub compute refresh 共用一把）：原子 wx 建文件；持有进程已退出的锁自动接管。 */
+const CORRUPT = Symbol('corrupt');
+const readLockFile = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return e.code === 'ENOENT' ? null : CORRUPT; } };
+const CORRUPT_STALE_MS = 10 * 60_000;
+/**
+ * 跨进程刷新锁（网页服务和 hub compute refresh 共用一把）：先写完整临时文件，再 link 成锁文件（原子，存在就失败），读方不会读到半写内容。
+ * 持有 pid 已退出 → 接管；锁文件读不懂 → 当作占用，10 分钟没动过才清掉；释放只删自己 token 的锁。
+ */
 export function tryRefreshLock(file, meta) {
-  for (let i = 0; i < 2; i++) {
-    try { fs.writeFileSync(file, JSON.stringify({ pid: process.pid, ...meta }), { flag: 'wx' }); return { ok: true, release: () => { try { if (readLockFile(file)?.pid === process.pid) fs.rmSync(file, { force: true }); } catch {} } }; }
-    catch (e) { if (e.code !== 'EEXIST') throw e; }
+  const token = crypto.randomBytes(8).toString('hex');
+  const tmp = `${file}.${token}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, token, ...meta }));
+  try {
+    for (let i = 0; i < 2; i++) {
+      try { fs.linkSync(tmp, file); return { ok: true, token, release: () => { try { if (readLockFile(file)?.token === token) fs.rmSync(file, { force: true }); } catch {} } }; }
+      catch (e) { if (e.code !== 'EEXIST') throw e; }
+      const h = readLockFile(file);
+      if (h === CORRUPT) {
+        let age = 0; try { age = Date.now() - fs.statSync(file).mtimeMs; } catch { continue; }
+        if (age < CORRUPT_STALE_MS) return { ok: false, holder: { corrupt: true } };
+      } else if (h && pidAlive(h.pid)) return { ok: false, holder: h };
+      fs.rmSync(file, { force: true });
+    }
     const h = readLockFile(file);
-    if (h && pidAlive(h.pid)) return { ok: false, holder: h };
-    if (h && !h.pid && h.startedAt && Date.now() - Date.parse(h.startedAt) < 10 * 60_000) return { ok: false, holder: h };   // 读到半写的文件：先当在跑
-    fs.rmSync(file, { force: true });
-  }
-  return { ok: false, holder: readLockFile(file) };
+    return { ok: false, holder: h === CORRUPT ? { corrupt: true } : h };
+  } finally { fs.rmSync(tmp, { force: true }); }
 }
 
 export function createComputeService({ dbFile = studioDbPath(), lockFile = `${dbFile}.refresh.lock`, colab = readColab, stop = stopColab, gemini = readGemini, ego = runEgo, now = () => Date.now(), debounceMs = COLAB_DEBOUNCE_MS } = {}) {
@@ -110,7 +133,7 @@ export function createComputeService({ dbFile = studioDbPath(), lockFile = `${db
     /** 秒回：不等任何采集。poll 时 Colab 距上次读超过防抖间隔就在后台再读一次（顶栏灯用 poll:false 只看快照）。 */
     status({ local = false, poll = true } = {}) {
       const other = !flight && readLockFile(lockFile);
-      const elsewhere = other && pidAlive(other.pid) ? { scope: other.scope || null, startedAt: other.startedAt || null, elsewhere: true } : null;
+      const elsewhere = other === CORRUPT ? { scope: null, startedAt: null, elsewhere: true } : other && pidAlive(other.pid) ? { scope: other.scope || null, startedAt: other.startedAt || null, elsewhere: true } : null;
       if (poll && !flight && !elsewhere && now() - colabAt >= debounceMs) pollColab().catch(() => {});
       const view = store.all();
       return { providers: view, light: computeLight(view), refreshing: refreshing || elsewhere, local, now: new Date(now()).toISOString() };

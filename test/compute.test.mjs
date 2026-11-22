@@ -9,7 +9,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { readColab, stopColab, parseUsage, parseSessions, AUTH_HINT } from '../src/compute/colab.mjs';
 import { readGemini, geminiKey, GEMINI_HINT } from '../src/compute/gemini.mjs';
-import { createComputeService, computeLight, runEgo, EGO_PROVIDERS } from '../src/compute/service.mjs';
+import { createComputeService, computeLight, runEgo, tryRefreshLock, EGO_PROVIDERS } from '../src/compute/service.mjs';
 import { openStudio } from '../src/compute/store.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -100,7 +100,7 @@ describe('Gemini 探活', () => {
 });
 
 describe('状态灯', () => {
-  const v = (colab, kaggle) => ({ colab: { ok: colab }, kaggle: { ok: kaggle } });
+  const v = (colab, kaggle) => ({ colab: { ok: colab, last: colab && { status: 'ok' } }, kaggle: { ok: kaggle, last: kaggle && { status: 'ok' } } });
   test('Colab 或 Kaggle 有会话 → warn；读到且空闲 → ok；都没读过 → idle', () => {
     assert.equal(computeLight(v(null, null)).level, 'idle');
     assert.equal(computeLight(v({ sessions: [], metrics: { assignments: 0 } }, null)).level, 'ok');
@@ -108,6 +108,14 @@ describe('状态灯', () => {
     assert.equal(computeLight(v({ sessions: [{ id: 'a' }] }, null)).level, 'warn');
     assert.equal(computeLight(v({ sessions: [], metrics: { assignments: 1 } }, null)).level, 'warn', 'sessions 空但有 assignment 也算');
     assert.equal(computeLight(v(null, { sessions: [], metrics: { sessionsKnown: false } })).level, 'idle', 'Kaggle 会话没读到不算空闲');
+    // 这次读失败：不沿用旧的空闲（灰）；旧快照里有会话仍提醒（橙，注明上次读到）
+    const failedNow = (ok) => ({ colab: { ok: null, last: null }, kaggle: { ok, last: { status: 'error' } } });
+    const g = computeLight(failedNow({ sessions: [], metrics: { sessionsKnown: true } }));
+    assert.equal(g.level, 'idle'); assert.match(g.text, /Kaggle 本次没读到/);
+    const w = computeLight(failedNow({ sessions: [{ id: 'k' }], metrics: { sessionsKnown: true } }));
+    assert.equal(w.level, 'warn'); assert.match(w.text, /上次读到/);
+    const mixed = computeLight({ colab: { ok: { sessions: [] }, last: { status: 'ok' } }, kaggle: { ok: { sessions: [] }, last: { status: 'logged_out' } } });
+    assert.equal(mixed.level, 'idle', 'Colab 空闲但 Kaggle 本次没读到：不给绿');
     const both = computeLight(v({ sessions: [{ id: 'a' }] }, { sessions: [{ id: 'k' }] }));
     assert.equal(both.level, 'warn'); assert.match(both.text, /Colab、Kaggle/);
   });
@@ -163,6 +171,21 @@ describe('服务：单飞、防抖、ego 失败保留旧快照', () => {
       assert.equal(fs.existsSync(`${dbIn(d)}.refresh.lock`), false, '跑完释放锁');
       const rb2 = b.refresh('fast'); assert.equal(rb2.started, true); await rb2.promise;
     } finally { a.close(); b.close(); }
+  });
+
+  test('锁文件读不懂：当作占用；10 分钟没动过才清；释放只删自己 token 的', () => {
+    const d = tmp(), f = path.join(d, 'x.lock');
+    fs.writeFileSync(f, '{"pid":');
+    assert.equal(tryRefreshLock(f, {}).ok, false, '半写或损坏先当在跑');
+    const old = new Date(Date.now() - 11 * 60_000); fs.utimesSync(f, old, old);
+    const a = tryRefreshLock(f, { scope: 'all' });
+    assert.equal(a.ok, true, '久未更新的坏锁可接管');
+    assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).token, a.token);
+    assert.equal(tryRefreshLock(f, {}).ok, false, '同进程第二把也拿不到');
+    fs.writeFileSync(f, JSON.stringify({ pid: process.pid, token: 'other' }));
+    a.release();
+    assert.equal(fs.existsSync(f), true, '不是自己的 token 不删');
+    assert.deepEqual(fs.readdirSync(d).filter((x) => x.endsWith('.tmp')), [], '不留临时文件');
   });
 
   test('锁文件的进程已经不在：接管', async () => {

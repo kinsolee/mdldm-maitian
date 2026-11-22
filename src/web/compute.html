@@ -80,11 +80,13 @@ function card(c) {
 }
 
 function sessions() {
-  const rows = [];
-  for (const s of S.providers.colab?.ok?.sessions || []) rows.push(`<div class="prow"><span class="st-chip awaiting_user"><i>!</i>计费中</span><b>Colab · ${esc(s.id)}</b><span class="d">${esc([s.hardware, s.shape, s.variant].filter(Boolean).join(' · '))}</span>
+  const rows = [], stale = (p) => S.providers[p]?.last?.status !== 'ok' ? `<span class="d" style="flex:none">上次读到（${ago(S.providers[p].ok.fetchedAt)}），本次没读到</span>` : '';
+  for (const s of S.providers.colab?.ok?.sessions || []) rows.push(`<div class="prow"><span class="st-chip awaiting_user"><i>!</i>计费中</span><b>Colab · ${esc(s.id)}</b>${stale('colab')}<span class="d">${esc([s.hardware, s.shape, s.variant].filter(Boolean).join(' · '))}</span>
     ${S.local && s.stoppable ? `<button class="btn sm danger" data-stop="${esc(s.id)}">一键停机</button>` : !s.stoppable ? '<span class="d" style="flex:none">本机没有记录，去 Colab 网页停</span>' : '<span class="d" style="flex:none">本机打开才能停机</span>'}</div>`);
-  for (const s of S.providers.kaggle?.ok?.sessions || []) rows.push(`<div class="prow"><span class="st-chip awaiting_user"><i>!</i>计费中</span><b>Kaggle · ${esc(s.title || s.id)}</b><span class="d">${esc(s.accelerator)}</span><a class="btn sm" href="https://www.kaggle.com/code" target="_blank" rel="noopener">去 Kaggle 停机 ↗</a></div>`);
-  if (!rows.length) rows.push(`<div class="prow"><span class="st-chip published"><i>✓</i>空闲</span><b>${S.light.level === 'idle' ? '还没读到 Colab / Kaggle 会话' : '没有在跑的 Colab / Kaggle 会话'}</b><span class="d">Colab 读最近一次 CLI 结果，Kaggle 读最近一次全量刷新</span></div>`);
+  for (const s of S.providers.kaggle?.ok?.sessions || []) rows.push(`<div class="prow"><span class="st-chip awaiting_user"><i>!</i>计费中</span><b>Kaggle · ${esc(s.title || s.id)}</b>${stale('kaggle')}<span class="d">${esc(s.accelerator)}</span><a class="btn sm" href="https://www.kaggle.com/code" target="_blank" rel="noopener">去 Kaggle 停机 ↗</a></div>`);
+  if (!rows.length) rows.push(S.light.level === 'ok'
+    ? '<div class="prow"><span class="st-chip published"><i>✓</i>空闲</span><b>没有在跑的 Colab / Kaggle 会话</b><span class="d">Colab 读最近一次 CLI 结果，Kaggle 读最近一次全量刷新</span></div>'
+    : `<div class="prow">${chip({ state: 'planned', stateCn: '未确认' })}<b>${esc(S.light.text)}</b><span class="d">刷新一次再看；确认不了时去 Colab / Kaggle 网页看一眼</span></div>`);
   return rows.join('');
 }
 
