@@ -175,6 +175,8 @@ async function seek(page, rpid) {
 //   被隐藏的那两条 state=0、attr=0、invisible=false、folder.is_folded=false、reply_control.is_garbage=false、pass_type=0，
 //   和看得见的评论没有区别：没有字段标「隐藏 / 折叠 / 待审」，所以不靠字段判断，只靠「reply/reply 没有、fulllist 有」。
 // 「读全」的证据：每页 page.total 一样、条目都是这个作品的、没有重复，读到的条数等于 page.total。
+// 这个接口没有游标或快照，翻页中间有增删时列表会挪位，可能刚好漏掉一条而上面几条照样成立（R1 Codex-1）。
+// 所以发后回读不只看「这条不在」：读到的整个集合要正好等于发前那一次减去这一条，作品下有任何别的变化都判确认不了。
 const MAX_FULLLIST_PAGES = 30;             // 一个作品最多读 600 条
 
 /** 按作品读全 fulllist：{ items: Map(rpid → 条目), total } / { error, unsure? }。 */
@@ -266,7 +268,7 @@ function precheckHidden(p, me, oid, rpid, stop, w, why) {
   if (!author) return stop('precheck-error', '读不到这条评论的作者');
   if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
   if (t.authorUid != null && String(t.authorUid) !== '' && String(t.authorUid) !== author) return stop('target-not-found', `up/fulllist 里 ${t.commentId} 的作者是 ${author}，不是 ${t.authorUid}`);
-  return { check: { isRoot: false, hidden: true, rpid } };
+  return { check: { isRoot: false, hidden: true, rpid, before: new Set(w.items.keys()) } };
 }
 
 /** 发后：只回读这一条在不在。{ gone, detail }，gone 只在拿到证据时为 true。 */
@@ -285,6 +287,9 @@ async function readBackComment(api, p, oid, check) {
     const w = await scanWork(api, t.workId, oid);
     if (w.error) return { gone: false, detail: `回读 up/fulllist：${w.error}，确认不了` };
     if (w.items.has(String(check.rpid))) return { gone: false, detail: '回读时 up/fulllist 里这条还在' };
+    const added = [...w.items.keys()].filter((id) => !check.before.has(id));
+    const lost = [...check.before].filter((id) => id !== String(check.rpid) && !w.items.has(id));
+    if (added.length || lost.length) return { gone: false, detail: `回读时 up/fulllist 里这条不在了，但作品 ${t.workId} 的评论还有别的变化（多了 ${added.length} 条、少了 ${lost.length} 条），翻页可能挪了位，确认不了` };
     return { gone: true, detail: `up/fulllist 作品 ${t.workId} 的 ${w.total} 条评论里已没有 ${t.commentId}` };
   }
   const s = await seek(page, check.rpid);

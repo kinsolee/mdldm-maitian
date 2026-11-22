@@ -570,6 +570,30 @@ describe('B站 delete（假接口）', () => {
       assert.match(r2.readBack.detail, /确认不了/);
     });
 
+    test('R1 Codex-1：回读时翻页挪了位（total 不变、无重复，但刚好漏掉还在的目标）→ found:false；作品下来了新评论也 found:false', async () => {
+      // 作品 40 条（rpid 60..21，新到旧），目标 40 是第 2 页第 1 条，被隐藏、一直没删掉（delEffective:false）
+      const others = Array.from({ length: 39 }, (_, i) => ({ ...rp(60 - i - (60 - i <= 40 ? 1 : 0), { root: 300, parent: 300 }), oid: 555 }));
+      const target = { ...rp(40, { root: 100, parent: 100, mid: '9666' }), oid: 555 };
+      const before = [...others.slice(0, 20), target, ...others.slice(20)];
+      const tgt = { ...hid, commentId: '40' };
+      // 回读：第 1 页照旧；第 2 页时列表挪了一位：目标被挤到第 1 页（已读过），第 2 页末尾多了一条新的 20
+      const drift = [...others.slice(0, 20), ...others.slice(20), { ...rp(20, { root: 300, parent: 300 }), oid: 555 }];
+      let sent = false;
+      const page = (list, pn) => list.slice((pn - 1) * 20, pn * 20);
+      const f = shape2({ hidden: [target], delEffective: false,
+        fulllist: (u) => { const pn = Number(u.searchParams.get('pn')); return { code: 0, data: { page: { total: 40 }, list: page(sent && pn === 2 ? drift : before, pn) } }; } });
+      const post = f.api.post;
+      f.api.post = async (...a) => { sent = true; return post(...a); };
+      const r = await deleteComment(f.api, P('delete', tgt));
+      assert.deepEqual([r.sendAttempted, r.readBack.found, f.posts.length], [true, false, 1], r.readBack.detail);
+      assert.match(r.readBack.detail, /别的变化/);
+      // 真删掉了，但同时作品下来了一条新评论 → 也确认不了，不猜
+      const g = shape1({ fulllist: (u, all) => { const list = g.posts.length ? [{ ...rp(999, { root: 300, parent: 300 }), oid: 555 }, ...all] : all; return { code: 0, data: { page: { total: list.length }, list } }; } });
+      const r2 = await deleteComment(g.api, P('delete', hid));
+      assert.deepEqual([r2.sendAttempted, r2.readBack.found], [true, false]);
+      assert.match(r2.readBack.detail, /多了 1 条/);
+    });
+
     test('reply/reply 定位得到的楼中楼照旧走邻居回读，不读 up/fulllist', async () => {
       const f = fakeBili();
       const r = await deleteComment(f.api, P('delete', sub));
