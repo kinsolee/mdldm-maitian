@@ -8,6 +8,7 @@ import { accessEmail } from './access.mjs';
 import { initLogin, sessionOk, handleLogin } from './login.mjs';
 import { cindyStatus, readToken, rotateToken } from '../integrations/cindy/admin.mjs';
 import { readWorksView } from './ops/works-view.mjs'; import { opsDbPath } from './ops/paths.mjs';
+import { createComputeService } from './compute/service.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url)), ROOT = path.resolve(DIR, '..');
 const W = config.web || { port: 8787, key: '' };
@@ -121,6 +122,38 @@ function sameOrigin(req) {
   return !!o && o === `http://${String(req.headers.host || '').toLowerCase()}`;
 }
 
+// 刷新可以从 https 隧道点：Origin 等于「隧道协议 + Host」也算同源（浏览器改不了这些头，跨站页面发不出来）。停机仍走 localOnly + sameOrigin
+function sameSiteOrigin(req) {
+  const o = String(req.headers.origin || '').toLowerCase(), host = String(req.headers.host || '').toLowerCase();
+  return !!o && !!host && (o === `http://${host}` || (isHttps(req) && o === `https://${host}`));
+}
+// 谷歌算力面板（data/studio.db，第一次访问才打开）：状态秒回；刷新要同源；停机要本机直连且同源
+let compute = null;
+const computeSvc = () => compute || (compute = createComputeService());
+async function computeApi(req, res, u) {
+  if (u.pathname === '/api/compute/status') return req.method === 'GET' ? send(res, 200, computeSvc().status({ local: localOnly(req), poll: u.searchParams.get('peek') !== '1' })) : send(res, 405, { error: '只支持 GET' });
+  if (req.method !== 'POST') return send(res, u.pathname === '/api/compute/refresh' || u.pathname === '/api/compute/colab/stop' ? 405 : 404, { error: '只支持 POST' });
+  if (u.pathname === '/api/compute/refresh') {
+    if (!sameSiteOrigin(req)) return send(res, 403, { error: '来源不对' });
+    const scope = u.searchParams.get('scope') || 'fast';
+    if (scope !== 'fast' && scope !== 'all') return send(res, 400, { error: 'scope 只能是 fast 或 all' });
+    const r = computeSvc().refresh(scope);
+    r.promise.catch(() => {});
+    return send(res, r.started ? 202 : 409, { started: r.started, refreshing: r.refreshing, ...(r.started ? {} : { error: '上一次刷新还在跑' }) });
+  }
+  if (u.pathname === '/api/compute/colab/stop') {
+    if (!localOnly(req)) return send(res, 403, { error: '只能在麦田这台电脑上用 http://localhost 打开时操作' });
+    if (!sameOrigin(req)) return send(res, 403, { error: '来源不对' });
+    let body = '';
+    for await (const d of req) { body += d; if (body.length > 4096) return send(res, 413, { error: '请求太大' }); }
+    let id; try { id = JSON.parse(body || '{}').id; } catch { return send(res, 400, { error: '请求格式不对' }); }
+    if (typeof id !== 'string' || !id) return send(res, 400, { error: '缺会话名' });
+    const r = await computeSvc().stopColab(id);
+    return r.ok ? send(res, 200, { ok: true }) : send(res, r.code || 500, { error: r.error });
+  }
+  return send(res, 404, { error: 'not found' });
+}
+
 async function handle(req, res) {
   const u = new URL(req.url, 'http://x');
   // 访问控制：前面挂了 Cloudflare Access（邮箱验证码）就认它的登录凭证；否则用口令（第一次带 ?key= 进来，之后用 cookie）
@@ -154,6 +187,8 @@ async function handle(req, res) {
   if (u.pathname === '/works') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'works.html')), 'text/html; charset=utf-8');   // KIN-330：ops.db 的作品
   if (u.pathname === '/api/ops/works') return send(res, 200, readWorksView(opsDbPath(), { platform: u.searchParams.get('platform') || undefined }));
   if (u.pathname === '/cindy') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'cindy.html')), 'text/html; charset=utf-8');   // KIN-325：Cindy 接入
+  if (u.pathname === '/compute') return send(res, 200, fs.readFileSync(path.join(DIR, 'web', 'compute.html')), 'text/html; charset=utf-8');   // 谷歌算力面板
+  if (u.pathname.startsWith('/api/compute/')) return computeApi(req, res, u);
   if (u.pathname === '/api/cindy/status' && req.method !== 'GET') return send(res, 405, { error: '只支持 GET' });
   if (u.pathname === '/api/cindy/status') return send(res, 200, { ...(await cindyStatus()), local: localOnly(req) });
   if (u.pathname === '/api/cindy/token' && req.method === 'POST') {

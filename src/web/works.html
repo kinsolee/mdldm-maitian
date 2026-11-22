@@ -14,7 +14,7 @@
 <script src="/static/mt.js"></script>
 <script>
 // KIN-330：hub ops collect 采进 ops.db 的四个平台近 30 天作品（GET /api/ops/works）。只读。
-const NAV = [['/', '大屏'], ['/p#/traffic', '流量'], ['/p#/calendar', '日历'], ['/p#/archive', '档案'], ['/works', '作品'], ['/cindy', 'Cindy'], ['/p#/system', '系统']];
+const NAV = [['/', '大屏'], ['/p#/traffic', '流量'], ['/p#/calendar', '日历'], ['/p#/archive', '档案'], ['/works', '作品'], ['/compute', '算力'], ['/cindy', 'Cindy'], ['/p#/system', '系统']];
 const RESULT = { ok: ['published', '成功'], skipped: ['awaiting_user', '跳过'], out: ['not_logged_in', '掉线'], failed: ['failed', '失败'], 'uid-mismatch': ['failed', 'UID 不符'] };
 const n = (v) => v == null ? '—' : fmt(v);
 let D = null, on = new URLSearchParams(location.search).get('platform') || '';
