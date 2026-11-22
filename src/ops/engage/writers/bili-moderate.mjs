@@ -16,6 +16,9 @@ export const PAGE = 'https://member.bilibili.com/platform/comment/article';
 const API = 'https://api.bilibili.com';
 const VC = 'https://api.vc.bilibili.com';
 const GONE_CODES = new Set([12022, -404]);   // 12022：评论已经被删除了
+// reply/reply 的 12006「没有该评论」：root 这栋楼不存在。root 填错也是 12006，所以发前不认（不能把填错的 id 当已删）；
+// 发后回读才认：发前已经用同一接口读到过这栋楼，发后变成 12006 就是楼被删了，楼里的每一条自然也不在了。
+const READBACK_GONE_CODES = new Set([...GONE_CODES, 12006]);
 const BLOCKED_ATTR = 128;                    // x/relation 的 attribute：128 = 已拉黑
 const MAX_SESSION_PAGES = 50;              // 一次扫描（四组加起来）最多读这么多页：发前、发后各一次，留在 120 秒写入超时里
 
@@ -84,8 +87,8 @@ const bigOf = (x) => (/^\d+$/.test(String(x ?? '')) ? BigInt(String(x)) : null);
 const countOf = (x) => (typeof x === 'number' ? (Number.isInteger(x) && x >= 0 ? x : NaN) : typeof x === 'string' && /^\d+$/.test(x) ? Number(x) : NaN);
 const showId = (x) => (x === START ? '楼的开头' : x === END ? '楼的末尾' : x == null ? '（读不到）' : String(x));
 
-/** 按页读楼，带缓存和页数上限。page(pn) → { replies, ids, count, root } / { gone, code } / { error, unsure? }。 */
-function threadReader(api, oid, root) {
+/** 按页读楼，带缓存和页数上限。page(pn) → { replies, ids, count, root } / { gone, code } / { error, unsure? }。goneCodes：哪些 code 算楼已不在。 */
+function threadReader(api, oid, root, goneCodes = GONE_CODES) {
   const cache = new Map();
   return async function page(pn) {
     if (cache.has(pn)) return cache.get(pn);
@@ -93,7 +96,7 @@ function threadReader(api, oid, root) {
     if (cache.size) await api.sleep(200);
     const j = await api.get(`${API}/x/v2/reply/reply?oid=${oid}&type=1&root=${root}&ps=${PS}&pn=${pn}`);
     let r;
-    if (GONE_CODES.has(j.code)) r = { gone: true, code: j.code };
+    if (goneCodes.has(j.code)) r = { gone: true, code: j.code };
     else if (j.code !== 0) r = { error: `reply/reply 第 ${pn} 页 code=${j.code} ${j.message ?? ''}`.trim() };
     else if (!Array.isArray(j.data?.replies) && j.data?.replies !== null) r = { error: `reply/reply 第 ${pn} 页缺 data.replies` };
     else {
@@ -212,7 +215,7 @@ async function precheckComment(api, p, me, oid) {
 /** 发后：只回读这一条在不在。{ gone, detail }，gone 只在拿到证据时为 true。 */
 async function readBackComment(api, p, oid, check) {
   const t = p.target;
-  const page = threadReader(api, oid, t.rootId);
+  const page = threadReader(api, oid, t.rootId, READBACK_GONE_CODES);
   if (check.isRoot) {
     const first = await page(1);
     if (first.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${first.code}）` };
@@ -232,7 +235,7 @@ async function readBackComment(api, p, oid, check) {
     else [pred, succ] = [null, null];
   } else {
     // 跨页：不用定位时的缓存，先重读后一页、再重读前一页
-    const fresh = threadReader(api, oid, t.rootId);
+    const fresh = threadReader(api, oid, t.rootId, READBACK_GONE_CODES);
     const pn = s.slot.pn;
     const back = await fresh(pn);
     if (back.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${back.code}）` };
