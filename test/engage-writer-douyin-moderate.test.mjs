@@ -90,6 +90,30 @@ describe('抖音删评论', () => {
     assert.equal(deletes(wrong).length + deletes(noAweme).length, 0);
   });
 
+  test('评审第 2 轮：楼中楼目标所在楼 total 是负数 → thread-incomplete；一楼 total=0 但楼中楼第一页空且 has_more=1 → thread-incomplete；不调接口', async () => {
+    const neg = fakeComments({ roots: [root('101', '800', -1)], replies: { 101: [sub('201', '101', '900')] } });
+    assert.equal((await deleteComment(apiOf(neg), delParams())).blocked, 'thread-incomplete');
+    const more = fakeComments({ roots: [root('101', '800', 0)] });
+    const call = more.call;
+    const api = apiOf(more);
+    api.call = async (m, a) => (m === 'awemeV1CommentListReply' ? { ok: true, data: { status_code: 0, comments: [], has_more: 1, cursor: 10 } } : call(m, a));
+    assert.equal((await deleteComment(api, delParams({ commentId: '101', rootId: '101', parentId: null }))).blocked, 'thread-incomplete');
+    assert.equal(deletes(neg).length + deletes(more).length, 0);
+  });
+
+  test('评审第 2 轮：multi_delete 返回 status_code=0 但 delete_result 没有这条 / result 不明确 → 回读看到不在也不算 found', async () => {
+    for (const delete_result of [[], [{ cid: '201', result: '0' }], [{ cid: '999', result: true }]]) {
+      const fc = fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [sub('201', '101', '900')] } });
+      const call = fc.call;
+      const api = apiOf(fc);
+      api.call = async (m, a) => { const r = await call(m, a); return m === 'awemeV1CommentMultiDelete' ? { ok: true, data: { status_code: 0, delete_result } } : r; };
+      const r = await deleteComment(api, delParams());
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], JSON.stringify(delete_result));
+      assert.match(r.readBack.detail, /没有明确说/);
+      assert.equal(deletes(fc).length, 1);
+    }
+  });
+
   test('已不在：楼读全了没有这条 → already-gone，不调接口；整栋楼都不在了也是 already-gone', async () => {
     const fc = fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [sub('202', '101', '901')] } });
     assert.equal((await deleteComment(apiOf(fc), delParams())).blocked, 'already-gone');

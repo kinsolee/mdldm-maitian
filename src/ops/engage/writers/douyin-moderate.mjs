@@ -20,7 +20,7 @@
 //   删会话：不做，原因见 moderate.mjs 的 MOD_UNSUPPORTED。
 // 目标是登录账号自己一律不动手（self-target）。调了写接口之后出任何错都只回读、不重调，返回 sendAttempted: true。
 import { mainPage, open, sleep as realSleep } from '../adapters/page-lib.mjs';
-import { callInPage, locateService, SERVICES } from '../inpage-api.mjs';
+import { callInPage, countOf, locateService, pageEnd, SERVICES } from '../inpage-api.mjs';
 import { replyArgs } from '../adapters/douyin.mjs';
 import { redact } from '../redact.mjs';
 import { douyinThread } from './api-reply.mjs';
@@ -40,8 +40,6 @@ export const WEB_FNS = { block: '/aweme/v1/web/user/block/', other: '/aweme/v1/w
 const errText = (e) => redact(String(e?.message ?? e)).slice(0, 300);
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
 const isSelf = (uid, me, p) => uid === me || uid === String(p.uid) || (p.selfUids ?? []).includes(uid);
-// 条数只认非负整数（数字或纯数字字符串）：负数、小数、空串、布尔都当读不到
-const countOf = (v) => (typeof v === 'number' ? (Number.isInteger(v) && v >= 0 ? v : null) : typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : null);
 const stop = (me, blocked, detail, extra = {}) => ({ uidSeen: me ?? null, blocked, detail: redact(detail), sendAttempted: false, ...extra });
 
 // —— 删评论 ——
@@ -52,7 +50,7 @@ function locate(th, t) {
   if (th.error) return { blocked: 'precheck-error', detail: th.error };
   if (!th.root) return th.end ? { gone: true, detail: `一楼列表翻到底了也没有楼 ${rootId}` } : { blocked: 'target-not-found', detail: `一楼翻到上限还没找到楼 ${rootId}` };
   if (target === rootId) return { node: th.root };
-  if (!th.complete) return { blocked: 'thread-incomplete', detail: `楼 ${rootId} 的回复没读全（读到 ${th.replies.length} 条，楼里有 ${th.root.reply_comment_total ?? '未知'} 条），删了也确认不了，没删` };
+  if (!th.complete || countOf(th.root.reply_comment_total) == null) return { blocked: 'thread-incomplete', detail: `楼 ${rootId} 的回复没读全（读到 ${th.replies.length} 条，楼里有 ${th.root.reply_comment_total ?? '未知'} 条），删了也确认不了，没删` };
   const node = th.replies.find((c) => String(c.cid) === target);
   if (!node) return { gone: true, detail: `楼 ${rootId} 读全了，里面已没有 ${target}` };
   // 楼中楼接口给的这条要挂在这栋楼下，否则不认（防止返回数据挂错楼，删到别的楼里去）
@@ -87,6 +85,7 @@ export async function deleteComment(api, p) {
       const first = await api.call('awemeV1CommentListReply', replyArgs(rootId, 0));
       const fj = first.ok ? first.data : null;
       if (!fj || fj.status_code !== 0 || !Array.isArray(fj.comments)) return stop(me, 'thread-incomplete', `读一楼下面的回复失败（${first.ok ? `status_code=${fj?.status_code ?? '无'}` : first.error}），判断不了有没有回复，没删`);
+      if (!fj.comments.length && !pageEnd(fj.has_more)) return stop(me, 'thread-incomplete', `一楼下面的回复第一页是空的，但 has_more=${fj.has_more ?? '缺失'}，判断不了有没有回复，没删`);
       const n = Math.max(total, th.replies?.length ?? 0, fj.comments.length);
       if (n > 0) return stop(me, 'deletes-thread', `${target} 是一楼，下面有 ${n} 条回复；抖音删一楼会把楼下回复一起删掉，不删`, { rejected: true });
     }
@@ -95,24 +94,27 @@ export async function deleteComment(api, p) {
   }
 
   // 从这里起算调过接口：之后出任何错都只回读，不重调
-  let sendError = null, postError = null;
+  // acked：接口明确说这一条删掉了（status_code=0，delete_result 里恰好有这条且 result 是 true / 1）。没这个证据，回读看到不在也不算 found
+  //（可能是别人或平台同时删的），交给框架记 needs_readback
+  let sendError = null, postError = null, unacked = null;
   try {
     const r = await api.call('awemeV1CommentMultiDelete', { cids: target, need_block: false });
     const d = r.ok ? r.data : null;
     if (!r.ok) postError = r.error;
     else if (d?.status_code !== 0) sendError = `multi_delete status_code=${d?.status_code ?? '无'} ${d?.status_msg ?? ''}`.trim();
     else {
-      const hit = Array.isArray(d.delete_result) ? d.delete_result.find((x) => String(x?.cid) === target) : null;
-      if (hit && !hit.result) sendError = `multi_delete 说 ${target} 没删掉`;
+      const hits = Array.isArray(d.delete_result) ? d.delete_result.filter((x) => String(x?.cid) === target) : [];
+      if (hits.length === 1 && (hits[0].result === false || hits[0].result === 0)) sendError = `multi_delete 说 ${target} 没删掉`;
+      else if (hits.length !== 1 || !(hits[0].result === true || hits[0].result === 1)) unacked = `multi_delete 返回 status_code=0，但 delete_result 里没有明确说 ${target} 删掉了（${hits.length} 条，result=${hits[0]?.result ?? '无'}）`;
     }
   } catch (e) { postError = errText(e); }
   let readBack;
   try {
     await api.sleep(2000);
     const at = locate(await douyinThread(api.call, { awemeId, rootId }), t);
-    const gone = !!at.gone && !sendError;
+    const gone = !!at.gone && !sendError && !postError && !unacked;
     readBack = { found: gone, count: gone ? 1 : 0, nativeId: target,
-      detail: [at.gone ? (sendError ? null : at.detail) : at.node ? '回读时这条还在' : at.detail, postError ? `multi_delete 出错：${postError}` : null].filter(Boolean).join('；') || undefined };
+      detail: [at.gone ? (sendError ? null : at.detail) : at.node ? '回读时这条还在' : at.detail, unacked, postError ? `multi_delete 出错：${postError}` : null].filter(Boolean).join('；') || undefined };
   } catch (e) { readBack = { found: false, count: 0, nativeId: target, detail: `回读出错：${errText(e)}` }; }
   return { uidSeen: me, sendAttempted: true, ...(sendError ? { sendError: redact(sendError) } : {}), readBack: clean({ ...readBack, detail: readBack.detail && redact(readBack.detail) }) };
 }

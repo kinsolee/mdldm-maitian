@@ -16,8 +16,8 @@ export const SERVICES = {
 // 翻页标志：只有明确是 0 / false 才算翻到底；明确是 1 / true 才算还有下一页；缺失、别的值一律当「不知道」，按没读全处理
 export const pageEnd = (v) => v === 0 || v === false || v === '0';
 export const pageMore = (v) => v === 1 || v === true || v === '1';
-/** 条数：有限数字或非空数字字符串才算，其余（null、''、布尔）返回 null。 */
-export const countOf = (v) => ((typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) ? Number(v) : null);
+/** 条数：非负整数（数字，或纯数字字符串）才算，其余（null、''、布尔、负数、小数）返回 null，按读不到处理。 */
+export const countOf = (v) => (typeof v === 'number' ? (Number.isInteger(v) && v >= 0 ? v : null) : typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : null);
 /** 发送接口给的新 id：空串、"0" 不算。 */
 export const idOf = (v) => (v == null || v === '' || String(v) === '0' ? null : String(v));
 
