@@ -1,11 +1,24 @@
 // S7 engage 处置组（delete_comment / block_user / delete_conversation）在库里的那一半：找目标、认自己、核对事件、库里预检。
 // 写入流程（幂等、能力位、每轮上限、租约、发后回读、回执、连续失败自动关）和 reply_comment 共用 write.mjs 的 engageWrite。
-// 只做 B站。绝不对登记过的本平台账号（账号自身 mid）动手：库里看得出就 rejected self-target，写入脚本在页面上再核一次。
+// 每种操作做得到的平台见 MOD_SUPPORT；平台本身没有入口、或拿不到回读证据的，写进 MOD_UNSUPPORTED，调用时原样告诉调用方。
+// 绝不对登记过的本平台账号（账号自身 mid）动手：库里看得出就 rejected self-target，写入脚本在页面上再核一次。
 import { listAccounts } from '../accounts.mjs';
 
 export const MOD_CAPS = ['deleteComment', 'block', 'deleteConversation'];
 export const MOD_ROUND_LIMIT = 10;   // 每个平台每轮（整点小时）每种操作分别计
-export const MOD_PLATFORMS = ['Bili'];
+// 每种操作做得到的平台（各平台的写入脚本在 writers/index.mjs 的 MODERATE_FILES）。不在这里的调用一律 rejected unsupported-platform
+export const MOD_SUPPORT = { delete: ['Bili'], block: ['Bili'], deleteConversation: ['Bili'] };
+// 做不到的原因（2026-11-22 只读核对各平台页面代码）。没写原因的就是还没接上
+export const MOD_UNSUPPORTED = {
+  'Douyin:deleteConversation': '抖音私信页删普通会话时，页面 IM SDK 先删本地、再调 MarkConversationDelete，服务端报错被 SDK 吞掉；页面上没有能确认服务端已删的读接口，删了也回读不了，暂不做',
+  'Channels:deleteConversation': '视频号助手私信页没有删除会话的入口（页面代码里 deleteSessionById 只打日志，不调接口），做不了',
+  'XiaoHongShu:block': '小红书网页版没有拉黑入口（页面只提示「请前往手机端」），只能在手机 App 上拉黑',
+  'XiaoHongShu:deleteConversation': '小红书网页版私信只能删群聊（chats/remove/group），单聊没有删除接口，页面上的删除只删本地列表',
+};
+export const modSupported = (op, platformCode) => MOD_SUPPORT[op]?.includes(platformCode) === true;
+/** 不支持时给调用方的说明。 */
+export const modUnsupportedDetail = (op, platformCode) => MOD_UNSUPPORTED[`${platformCode}:${op}`]
+  ?? `${op} 目前只做 ${(MOD_SUPPORT[op] ?? []).join('、') || '（无）'}，${platformCode} 还没接上`;
 
 // what：入参名；ackOutcome：生效后回执事件用的 outcome；sentReason：同一目标之前已生效时的 reason
 export const MOD_OPS = {
@@ -44,8 +57,29 @@ export function resolveBlockTarget(db, req) {
   const pick = cands[0];
   if (!pick.mid) return { reject: ['unknown-target', `库里 ${req.inputId} 没有作者 mid`] };
   if (pick.accountId == null) return { reject: ['ambiguous-target', `${req.inputId} 在多个本平台账号下都出现过，判断不了用哪个账号拉黑`] };
+  const subjectId = pick.via === 'mid' ? null : req.inputId;
   return { targetId: `${req.platformCode}:${pick.mid}`, mid: pick.mid, accountId: pick.accountId, via: pick.via, ackType: pick.ackType,
-    subjectId: pick.via === 'mid' ? null : req.inputId, isMe: !!pick.isMe };
+    subjectId, sourceId: subjectId ?? latestSource(db, req.platformCode, pick.accountId, pick.mid), isMe: !!pick.isMe };
+}
+
+/** 只给了 mid 时，这个人在这个账号下最近的一条评论或会话（两边一起按时间比）：有的平台要从评论或会话里重读出对方的其他 id（如抖音 sec_uid）。 */
+function latestSource(db, platformCode, accountId, mid) {
+  // 评论和会话放在一起按时间比，取最新的一条；时间缺失的排在最后，同一时间评论优先
+  return db.prepare(`SELECT id FROM (
+      SELECT id, createdAt t, 0 k, rowid r FROM comments WHERE platformCode = ? AND accountId = ? AND authorUid = ? AND goneAt IS NULL
+      UNION ALL
+      SELECT id, lastAt t, 1 k, rowid r FROM conversations WHERE platformCode = ? AND accountId = ? AND peerUid = ? AND peerKind = 'user')
+    ORDER BY t IS NULL, t DESC, k, r DESC LIMIT 1`).get(platformCode, accountId, mid, platformCode, accountId, mid)?.id ?? null;
+}
+
+/** 拉黑的来源（评论或会话）换成写入脚本用的原生 id；没有来源返回 null。 */
+function blockSource(db, id) {
+  if (id == null) return null;
+  const c = db.prepare('SELECT * FROM comments WHERE id = ?').get(id);
+  if (c) return { kind: 'comment', commentId: nativeOf(c.id), workId: nativeOf(c.workId), parentId: nativeOf(c.parentId), rootId: nativeOf(c.rootId), authorUid: c.authorUid };
+  const k = db.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
+  if (k) return { kind: 'conversation', conversationId: nativeOf(k.id), peerUid: k.peerUid };
+  return null;
 }
 
 /** 库里的目标：{ accountId, row, target } 或 null。block 的目标在 resolveBlockTarget 里已经找好（req.block）。 */
@@ -61,7 +95,8 @@ export function loadModTarget(db, req) {
     return { accountId: k.accountId, row: k, target: { conversationId: nativeOf(k.id), peerUid: k.peerUid } };
   }
   const b = req.block;
-  return { accountId: b.accountId, row: {}, target: { mid: b.mid, via: b.via } };
+  // source：从哪条评论、哪个会话认出这个人（B站用不上；抖音要靠它重读出对方的 sec_uid）
+  return { accountId: b.accountId, row: {}, target: { mid: b.mid, via: b.via, source: blockSource(db, b.sourceId) } };
 }
 
 /** 对象是本平台登记过的账号（我自己）：返回原因，否则 null。 */

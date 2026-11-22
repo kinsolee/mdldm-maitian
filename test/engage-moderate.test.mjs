@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { getAccount, setCapability } from '../src/ops/accounts.mjs';
 import { ingestSnapshot } from '../src/ops/engage/store.mjs';
 import { engageWrite } from '../src/ops/engage/write.mjs';
-import { MOD_ROUND_LIMIT } from '../src/ops/engage/moderate.mjs';
+import { MOD_ROUND_LIMIT, MOD_SUPPORT } from '../src/ops/engage/moderate.mjs';
 import { writerModuleUrl } from '../src/ops/engage/writers/index.mjs';
 import { openOpsDb } from '../src/ops/db.mjs';
 import { freshDb, tmpDbFile, comment, conv, T0, MIN } from './helpers/engage-fixtures.mjs';
@@ -176,6 +176,20 @@ describe('delete_comment', () => {
     assert.deepEqual([r.status, r.reason], ['rejected', 'unsupported-platform']);
   });
 
+  test('平台本身做不到的（MOD_UNSUPPORTED）：rejected unsupported-platform，detail 写原因；不起 writer', async () => {
+    const w = fakeWriter(DONE);
+    for (const [op, targetId, re] of [['deleteConversation', 'Channels:s1', /deleteSessionById/], ['block', 'XiaoHongShu:u1', /手机/], ['deleteConversation', 'XiaoHongShu:c1', /群聊/], ['deleteConversation', 'Douyin:c1', /MarkConversationDelete/]]) {
+      const r = await engageWrite(s.db, { op, targetId, idempotencyKey: `k-${targetId}`, caller: 'test-bot' }, s.deps(w));
+      assert.deepEqual([r.status, r.reason], ['rejected', 'unsupported-platform'], targetId);
+      assert.match(r.detail, re, targetId);
+    }
+    assert.equal(w.calls.length, 0);
+  });
+
+  test('MOD_SUPPORT 里每个平台都有处置写入脚本', () => {
+    for (const [op, codes] of Object.entries(MOD_SUPPORT)) for (const c of codes) assert.match(writerModuleUrl(c, op), /-moderate\.mjs$/, `${c} ${op}`);
+  });
+
   test('writer 路由：处置组走 bili-moderate.mjs，回复照旧走 bili.mjs', () => {
     assert.match(writerModuleUrl('Bili', 'delete'), /bili-moderate\.mjs$/);
     assert.match(writerModuleUrl('Bili', 'block'), /bili-moderate\.mjs$/);
@@ -192,7 +206,8 @@ describe('block_user', () => {
     const w = fakeWriter(DONE);
     const r = await engageWrite(s.db, blk(), s.deps(w));
     assert.deepEqual([r.status, r.targetId, r.inputTarget], ['sent', 'Bili:9002', 'Bili:a']);
-    assert.deepEqual(w.calls[0].params.target, { mid: '9002', via: 'comment' });
+    // source：从哪条评论认出这个人（抖音要靠它重读出对方的 sec_uid；B站用不上）
+    assert.deepEqual(w.calls[0].params.target, { mid: '9002', via: 'comment', source: { kind: 'comment', commentId: 'a', workId: 'BV1xx', parentId: 'r1', rootId: 'r1', authorUid: '9002' } });
     assert.equal(actions(s.db)[0].targetId, 'Bili:9002');
     assert.deepEqual(r.ackedEvents, ['comment.created:Bili:a']);
   });
@@ -204,9 +219,34 @@ describe('block_user', () => {
     const dmEvents = s.db.prepare("SELECT id FROM events WHERE type = 'dm.received' AND subjectId = 'Bili:777'").all().map((e) => e.id);
     assert.ok(dmEvents.length > 0, '种子里应有这个会话的 dm.received');
     assert.deepEqual(a.ackedEvents, dmEvents);
+    assert.deepEqual(w.calls[0].params.target, { mid: '777', via: 'conversation', source: { kind: 'conversation', conversationId: '777', peerUid: '777' } });
     const b = await engageWrite(s.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k2' }), s.deps(w));
     assert.deepEqual([b.status, b.targetId, b.inputTarget], ['sent', 'Bili:9001', undefined]);
-    assert.deepEqual(w.calls[1].params.target, { mid: '9001', via: 'mid' });
+    // 只给 mid：source 取这个人在这个账号下最近的评论
+    assert.deepEqual(w.calls[1].params.target, { mid: '9001', via: 'mid', source: { kind: 'comment', commentId: 'r1', workId: 'BV1xx', parentId: null, rootId: 'r1', authorUid: '9001' } });
+  });
+
+  test('只给 mid：source 在评论和会话之间按时间取最新的；评论时间缺失时排后', async () => {
+    const addConv = (db, lastAt) => db.prepare(`INSERT INTO conversations (id, accountId, platformCode, peerUid, peerNickname, peerKind, lastAt, firstSeenAt, updatedAt)
+      VALUES ('Bili:c9001', ?, 'Bili', '9001', 'x', 'user', ?, 'x', 'x')`).run(BILI, lastAt);
+    // 9001 的评论 r1 是 2026-11-19T01:00，会话更新
+    addConv(s.db, '2026-11-19T05:00:00.000Z');
+    const w = fakeWriter(DONE);
+    await engageWrite(s.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k1' }), s.deps(w));
+    assert.deepEqual(w.calls[0].params.target.source, { kind: 'conversation', conversationId: 'c9001', peerUid: '9001' });
+    // 评论比会话新 → 评论
+    const s2 = setup();
+    addConv(s2.db, '2026-11-18T00:00:00.000Z');
+    const w2 = fakeWriter(DONE);
+    await engageWrite(s2.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k1' }), s2.deps(w2));
+    assert.equal(w2.calls[0].params.target.source.kind, 'comment');
+    // 评论没有时间、会话有 → 会话
+    const s3 = setup();
+    s3.db.prepare("UPDATE comments SET createdAt = NULL WHERE id = 'Bili:r1'").run();
+    addConv(s3.db, '2026-11-18T00:00:00.000Z');
+    const w3 = fakeWriter(DONE);
+    await engageWrite(s3.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k1' }), s3.deps(w3));
+    assert.equal(w3.calls[0].params.target.source.kind, 'conversation');
   });
 
   test('绝不拉黑我自己：Bili:478358005、我自己的评论 id → rejected self-target，能力位开着也不起 writer', async () => {

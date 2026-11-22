@@ -1,6 +1,6 @@
 # S7 MCP engage 组：回复评论、发私信（KIN-326 第一期）
 
-这一期只做 `reply_comment` 和 `send_dm`，以及它们需要的框架。B站另有处置工具 `delete_comment`、`block_user`、`delete_conversation`，见第 8 节。点赞、置顶（`like_comment` / `unlike_comment` / `pin_comment` / `unpin_comment`）留到后续。
+这一期只做 `reply_comment` 和 `send_dm`，以及它们需要的框架。另有处置工具 `delete_comment`、`block_user`、`delete_conversation`，见第 8 节。点赞、置顶（`like_comment` / `unlike_comment` / `pin_comment` / `unpin_comment`）留到后续。
 
 - B站：走接口，回复评论和私信都做了，用假 B站接口测过。**还没有在真实账号上发过**。
 - 抖音、视频号、小红书：页面适配器已经写好，只在本地测试页上验证过。能力位默认关着。
@@ -205,9 +205,20 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 
 关掉写入：`node src/hub.mjs ops accounts set-cap <账号 id> reply false`（`sendDM` 同理）。连续 2 轮失败时会自动关掉，并发飞书提醒。
 
-## 8. B站处置：删评论、拉黑、删私信会话
+## 8. 处置：删评论、拉黑、删私信会话
 
-用来处理广告评论和广告私信。只做 B站，其他平台调用返回 `rejected` / `unsupported-platform`。三个工具和 `reply_comment` 在同一个 `--scope engage` 服务里，用同一个口令把关，走第 3 节同一套流程：回收、幂等、目标、能力位、库里预检、每轮上限、平台写入租约、在 space 里写、回执、连续失败自动关。
+用来处理广告评论和广告私信。每种操作做得到的平台见下表（代码里是 `src/ops/engage/moderate.mjs` 的 `MOD_SUPPORT`），其余调用返回 `rejected` / `unsupported-platform`，`detail` 写原因（`MOD_UNSUPPORTED`）。MCP 工具的说明按这两张表生成。三个工具和 `reply_comment` 在同一个 `--scope engage` 服务里，用同一个口令把关，走第 3 节同一套流程：回收、幂等、目标、能力位、库里预检、每轮上限、平台写入租约、在 space 里写、回执、连续失败自动关。
+
+### 各平台能不能做
+
+2026-11-22 只读核对各平台创作者后台的页面代码（没调写接口、没点按钮）。
+
+| 平台 | `delete_comment` | `block_user` | `delete_conversation` |
+|---|---|---|---|
+| B站 | 能 | 能 | 能 |
+| 抖音 | 在做 | 在做 | 不做：私信页删普通会话时，页面 IM SDK 先删本地、再调 `MarkConversationDelete`，服务端报错被 SDK 吞掉；页面上没有能确认服务端已删的读接口 |
+| 视频号 | 在做 | 在做 | 做不了：视频号助手私信页没有删除会话（页面代码里 `deleteSessionById` 只打日志） |
+| 小红书 | 在评估 | 做不了：网页版没有拉黑入口，页面只提示「请前往手机端」 | 做不了：网页版私信只能删群聊（`chats/remove/group`），单聊没有删除接口 |
 
 ### 工具
 

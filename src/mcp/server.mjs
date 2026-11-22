@@ -2,7 +2,7 @@
 // 麦田本地 MCP（stdio）。启动：node src/mcp/server.mjs --scope read | engage
 // 只做参数校验和转发到 src/ops/engage/*。stdout 只走 MCP 协议，日志写 stderr。
 //   read：只查库，不现抓、不起 runner。
-//   engage：只注册 reply_comment、send_dm，和 B站处置 delete_comment、block_user、delete_conversation（不带 read 组），而且只在进程环境的 MAITIAN_ENGAGE_TOKEN 和仓库 .env 里的一致时注册
+//   engage：只注册 reply_comment、send_dm，和处置组 delete_comment、block_user、delete_conversation（不带 read 组），而且只在进程环境的 MAITIAN_ENGAGE_TOKEN 和仓库 .env 里的一致时注册
 //          （src/ops/tokens.mjs 的 checkToken，常数时间）；对不上或缺失就一个工具都不注册，只往 stderr 写一句原因。口令值不进日志、错误、返回。
 import fs from 'node:fs';
 import { parseArgs } from 'node:util';
@@ -13,6 +13,7 @@ import { openOpsDb } from '../ops/db.mjs';
 import { opsDbPath } from '../ops/paths.mjs';
 import * as q from '../ops/engage/query.mjs';
 import { engageWrite } from '../ops/engage/write.mjs';
+import { MOD_SUPPORT, MOD_UNSUPPORTED } from '../ops/engage/moderate.mjs';
 import { checkToken, TOKEN_SCOPES } from '../ops/tokens.mjs';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { subscribe, unsubscribe, EVENT_TYPES } from '../ops/engage/subscribers.mjs';
@@ -65,15 +66,21 @@ const idempotencyKey = z.string().describe('幂等键，建议填事件 id；同
 const eventId = z.string().optional().describe('对应的事件 id（可选）；发出后自动回执 replied。不填时回执这个目标所有没回执的同类事件');
 const WRITE_NOTE = '发前在平台上重读、发后回读；返回 status：sent（回读到了）、needs_readback（点了发送但没回读到，绝不重试，请人工看）、failed（没发，reason 说明，如 comment-gone、already-replied、last-is-me）、duplicate、rejected（能力位关、本轮已满 15 条、平台正被占用等）';
 
-// B站处置（广告评论、私信）。生效并回读确认才返回 sent；对象是我自己一律 rejected self-target
+// 处置（广告评论、私信）。生效并回读确认才返回 sent；对象是我自己一律 rejected self-target
 const modEventId = z.string().optional().describe('对应的事件 id（可选）；生效后自动回执 ignored。不填时回执这个目标所有没回执的同类事件');
-const MOD_NOTE = '只做 B站。发前重读、接口只调一次、发后回读；返回 status：sent（回读确认已生效）、needs_readback（调了接口没读回，绝不重试，请人工看）、failed（没调接口，reason 如 already-gone、already-blocked、not-my-work、not-a-user）；调过接口但平台报错、回读也没确认的记 needs_readback / send-error-unconfirmed，不要重试、duplicate、rejected（self-target、capability-off、round-limit 每小时每种 10 条等）';
+const MOD_NOTE = '发前重读、接口只调一次、发后回读；返回 status：sent（回读确认已生效）、needs_readback（调了接口没读回，绝不重试，请人工看）、failed（没调接口，reason 如 already-gone、already-blocked、not-my-work、not-a-user、deletes-thread）；调过接口但平台报错、回读也没确认的记 needs_readback / send-error-unconfirmed，不要重试、duplicate、rejected（self-target、capability-off、unsupported-platform、round-limit 每小时每种 10 条等）';
+const PLATFORM_LABEL = { Bili: 'B站', Douyin: '抖音', Channels: '视频号', XiaoHongShu: '小红书' };
+/** 「做得到：…；做不到：…（原因）」，按 moderate.mjs 的 MOD_SUPPORT / MOD_UNSUPPORTED 生成，和实际放行的一致。 */
+const modScope = (op) => {
+  const no = Object.entries(MOD_UNSUPPORTED).filter(([k]) => k.endsWith(`:${op}`)).map(([k, why]) => `${PLATFORM_LABEL[k.split(':')[0]] ?? k.split(':')[0]}（${why}）`);
+  return `做得到的平台：${(MOD_SUPPORT[op] ?? []).map((c) => PLATFORM_LABEL[c] ?? c).join('、')}。${no.length ? `做不到：${no.join('；')}。` : ''}`;
+};
 const mod = (op, targetKey) => (db, a, deps) => engageWrite(db, { op, targetId: a[targetKey], idempotencyKey: a.idempotencyKey, eventId: a.eventId, caller: deps.caller() }, deps);
 const MODERATE_TOOLS = [
-  ['delete_comment', `删除自己作品下别人的一条评论（一楼、楼中楼都行）。${MOD_NOTE}`, { commentId: id('评论 id'), idempotencyKey, eventId: modEventId }, mod('delete', 'commentId')],
-  ['block_user', `拉黑一个人。target 可以是 Bili:<mid>，也可以是这个人的评论 id 或私信会话 id（从库里推出 mid）；只认库里见过的人。${MOD_NOTE}`,
-    { target: z.string().describe('Bili:<mid>、评论 id 或会话 id'), idempotencyKey, eventId: modEventId }, mod('block', 'target')],
-  ['delete_conversation', `从私信会话列表里删掉一个会话（B站 remove_session：只移除会话，聊天记录还在，对方再发消息会话会回来；配合 block_user 用）。${MOD_NOTE}`,
+  ['delete_comment', `删除自己作品下别人的一条评论（一楼、楼中楼都行；一楼下面有回复的不删，返回 deletes-thread）。${modScope('delete')}${MOD_NOTE}`, { commentId: id('评论 id'), idempotencyKey, eventId: modEventId }, mod('delete', 'commentId')],
+  ['block_user', `拉黑一个人。target 可以是 <平台>:<uid>（如 Bili:<mid>），也可以是这个人的评论 id 或私信会话 id（从库里推出 uid）；只认库里见过的人。${modScope('block')}${MOD_NOTE}`,
+    { target: z.string().describe('<平台>:<uid>、评论 id 或会话 id'), idempotencyKey, eventId: modEventId }, mod('block', 'target')],
+  ['delete_conversation', `从私信会话列表里删掉一个会话（只移除会话，对方再发消息会话会回来；配合 block_user 用）。${modScope('deleteConversation')}${MOD_NOTE}`,
     { conversationId: id('会话 id'), idempotencyKey, eventId: modEventId }, mod('deleteConversation', 'conversationId')],
 ];
 
