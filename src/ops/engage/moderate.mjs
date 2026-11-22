@@ -7,7 +7,9 @@ import { listAccounts } from '../accounts.mjs';
 export const MOD_CAPS = ['deleteComment', 'block', 'deleteConversation'];
 export const MOD_ROUND_LIMIT = 10;   // 每个平台每轮（整点小时）每种操作分别计
 // 每种操作做得到的平台（各平台的写入脚本在 writers/index.mjs 的 MODERATE_FILES）。不在这里的调用一律 rejected unsupported-platform
-export const MOD_SUPPORT = { delete: ['Bili'], block: ['Bili'], deleteConversation: ['Bili'] };
+export const MOD_SUPPORT = { delete: ['Bili', 'Channels'], block: ['Bili', 'Channels'], deleteConversation: ['Bili'] };
+// 平台不给评论者 uid（视频号）：拉黑只能从一条评论发起，actions 按这条评论 id 记，认不出「同一个人换一条评论」
+export const BLOCK_BY_COMMENT = new Set(['Channels']);
 // 做不到的原因（2026-11-22 只读核对各平台页面代码）。没写原因的就是还没接上
 export const MOD_UNSUPPORTED = {
   'Douyin:deleteConversation': '抖音私信页删普通会话时，页面 IM SDK 先删本地、再调 MarkConversationDelete，服务端报错被 SDK 吞掉；页面上没有能确认服务端已删的读接口，删了也回读不了，暂不做',
@@ -39,6 +41,11 @@ export function resolveBlockTarget(db, req) {
   const n = nativeOf(req.inputId);
   const mine = new Set(selfUids(db, req.platformCode));
   const c = db.prepare('SELECT id, accountId, authorUid, authorIsMe FROM comments WHERE id = ?').get(req.inputId);
+  if (BLOCK_BY_COMMENT.has(req.platformCode)) {
+    if (!c) return { reject: ['unknown-target', `这个平台不给评论者 uid，拉黑只能从评论发起，target 要填库里见过的评论 id（${req.inputId} 不是）`] };
+    if (c.authorIsMe === 1) return { reject: ['self-target', `${req.inputId} 是我自己的评论，不拉黑`] };
+    return { targetId: req.inputId, mid: null, accountId: c.accountId, via: 'comment', ackType: 'comment.created', subjectId: req.inputId, sourceId: req.inputId, isMe: false, byComment: true };
+  }
   const k = db.prepare('SELECT id, accountId, peerUid, peerKind FROM conversations WHERE id = ?').get(req.inputId);
   // 群聊、官方号的会话 id 不是用户 mid（群 id 和用户 mid 是两套号），绝不拿来拉黑
   if (k && k.peerKind !== 'user' && !c) return { reject: ['not-a-user', `${req.inputId} 是${k.peerKind === 'group' ? '群聊' : '官方号'}会话，不是普通用户，不拉黑`] };
@@ -130,6 +137,8 @@ export function modEventMatches(db, req) {
   const acct = modTargetAccount(db, req);
   if (!acct || (e.accountId != null && e.accountId !== acct)) return false;
   if (req.op !== 'block') return e.type === req.spec.eventType && e.subjectId === req.targetId;
+  // 按评论拉黑的平台：只认这条评论自己的 comment.created
+  if (req.block.byComment) return e.type === 'comment.created' && e.subjectId === req.block.subjectId;
   // 同平台、同账号下这个人的评论或私信事件（不同平台的 uid 是不同的号，不能混）
   if (e.type === 'comment.created') {
     return String(db.prepare('SELECT authorUid FROM comments WHERE id = ? AND platformCode = ? AND accountId = ?').get(e.subjectId, req.platformCode, req.block.accountId)?.authorUid ?? '') === req.block.mid;
