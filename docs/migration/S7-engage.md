@@ -217,8 +217,31 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 |---|---|---|---|
 | B站 | 能 | 能 | 能 |
 | 抖音 | 在做 | 在做 | 不做：私信页删普通会话时，页面 IM SDK 先删本地、再调 `MarkConversationDelete`，服务端报错被 SDK 吞掉；页面上没有能确认服务端已删的读接口 |
-| 视频号 | 在做 | 在做 | 做不了：视频号助手私信页没有删除会话（页面代码里 `deleteSessionById` 只打日志） |
+| 视频号 | 能（见下文「视频号」） | 能，只能从评论发起（见下文「视频号」） | 做不了：视频号助手私信页没有删除会话（页面代码里 `deleteSessionById` 只打日志） |
 | 小红书 | 在评估 | 做不了：网页版没有拉黑入口，页面只提示「请前往手机端」 | 做不了：网页版私信只能删群聊（`chats/remove/group`），单聊没有删除接口 |
+
+### 视频号
+
+写入脚本 `src/ops/engage/writers/channels-moderate.mjs`。调 wujie 沙箱 iframe 里页面自己的评论服务（和 S9 回复用的是同一个对象），鉴权头、请求体里的 `_log_finder_uin` 等由页面的请求封装加。入口和参数只从页面代码里读来（2026-11-22），**没有在真实账号上调过写接口**。
+
+| 工具 | 页面服务调用 | 发前重读（命中就不调接口） | 发后回读（满足才算 `sent`） |
+|---|---|---|---|
+| `delete_comment` | `deleteComment({ exportId: 作品 objectId, commentId })` → `POST .../comment/del_comment`，`errCode=0` 是成功。和评论「删除」确认框一样 | 核对登录账号（`auth/auth_data`）；作品列表里找到作品的 `objectId`；用 `getCommentList` 把目标所在的楼读全（同 S9 回复）。楼读全了没有这条、或一楼列表翻到底没有这栋楼 → `already-gone`；楼没读全 → `thread-incomplete`；昵称是我 → `self-target`；一楼下面有回复、或回复没读全 → `deletes-thread` / `thread-incomplete` | 等 2 秒再读楼：楼读全了、这条不在了；一楼目标是一楼列表翻到底也没有它 |
+| `block_user` | `blockUser({ refCommentId: 评论 id, refObjectId: 作品 objectId, modType: 1 })` → `POST .../comment/block_user`，`errCode=0` 是成功（`modType` 枚举 `Add=1`、`Del=2`）。和评论「更多 → 拉黑」一样 | 同上读到这条评论：不在了 → `target-not-found`（拉黑要靠它）；昵称是我 → `self-target`；`blacklistFlag` 已为真 → `already-blocked` | 等 1.5 秒再读这条评论，`blacklistFlag` 为真（页面上「已在黑名单」就是按它显示的） |
+
+- 视频号不给评论者 uid（读适配器里 `author.uid` 是 `null`，「是不是我」按昵称），所以 `block_user` 的 `target` 只能是评论 id。`actions.targetId` 按这条评论记，`eventId` 只认这条评论自己的 `comment.created`。同一个人换一条评论再拉黑，框架认不出是同一个人，写入脚本发前看 `blacklistFlag` 会返回 `already-blocked`。
+- 拉黑不删评论，所以一楼的作者也能拉黑，不受「一楼有回复」限制。
+- 页面服务里没有 `deleteComment` / `blockUser`（页面改版）时返回 `failed` / `cannot-send`，不调接口。
+- 删会话做不了，原因见上表。
+
+能力位（默认全关）：
+
+```sh
+node src/hub.mjs ops accounts set-cap Channels:<uid> deleteComment true
+node src/hub.mjs ops accounts set-cap Channels:<uid> block true
+```
+
+首次真发验收同 B站，每种操作第一次都要负责人当次同意。视频号另外要核对：没有要求验证手机（`baseResp.errcode=-4300`）；拉黑后这条评论的 `blacklistFlag` 确实变成真（`readBack`）；拉黑后对方的评论是否还显示在评论列表里（不显示的话回读会读不到，记 `needs_readback`，要改回读方法）。
 
 ### 工具
 

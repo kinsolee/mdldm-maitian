@@ -194,7 +194,9 @@ describe('delete_comment', () => {
     assert.match(writerModuleUrl('Bili', 'delete'), /bili-moderate\.mjs$/);
     assert.match(writerModuleUrl('Bili', 'block'), /bili-moderate\.mjs$/);
     assert.match(writerModuleUrl('Bili', 'reply'), /\/bili\.mjs$/);
-    assert.throws(() => writerModuleUrl('Douyin', 'delete'), /没有 delete/);
+    assert.match(writerModuleUrl('Channels', 'delete'), /channels-moderate\.mjs$/);
+    assert.match(writerModuleUrl('Channels', 'reply'), /\/channels\.mjs$/);
+    assert.throws(() => writerModuleUrl('XiaoHongShu', 'delete'), /没有 delete/);
   });
 });
 

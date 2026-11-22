@@ -31,7 +31,7 @@ export function runInSpace(task, params) {
 
 const url = (p) => (p.op === 'reply' ? p.urls?.comments ?? PAGES.comments : p.urls?.dms ?? PAGES.dms);
 
-async function login(page, params, t) {
+export async function login(page, params, t) {
   // 测试钩子：本地测试页没有 auth_data 接口，从页面全局读（只在 params 里显式给了才走）
   if (params.test?.loginFromPage) {
     const u = await page.evaluate(() => window.__loginUser ?? null);

@@ -128,6 +128,27 @@ export async function channelsThread(call, { exportId, rootId }, lim = API_LIMIT
   return { root, l2: [...byId.values()], complete: pageEnd(flag), end: false };
 }
 
+/**
+ * 作品 id（库里是 objectNonce，也认 objectId）→ 评论接口用的 exportId（作品的 objectId）。从左侧作品列表组件的 commentFeeds 找，
+ * 组件刚挂载时是空数组，要等到非空；目标不在首屏就滚动懒加载（同页面写法）。返回 { exportId } 或 { blocked, detail }。
+ */
+export async function channelsExportId(page, workId, deps) {
+  const inShadow = (src) => page.evaluate(new Function(`const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null; ${src}`));
+  let feeds = await waitFor(async () => { const f = await inShadow(FEEDS_SRC); return Array.isArray(f) && f.length ? f : null; }, 20000, 1000);
+  if (!feeds) return { blocked: 'target-not-found', detail: '视频号作品列表读不到' };
+  const pick = () => feeds.find((f) => String(f.objectNonce) === workId || String(f.objectId) === workId);
+  for (let i = 0; i < 6 && !pick(); i++) {
+    await inShadow(`const l = [...sr.querySelectorAll('.comment-feed-wrap')].at(-1); l?.scrollIntoView({ block: 'end' }); return true;`);
+    await (deps?.sleep ?? realSleep)(2500);
+    const next = await inShadow(FEEDS_SRC);
+    if (!Array.isArray(next) || next.length <= feeds.length) break;
+    feeds = next;
+  }
+  const feed = pick();
+  if (!feed) return { blocked: 'target-not-found', detail: '作品列表里没有这个作品' };
+  return { exportId: feed.objectId };
+}
+
 export const channelsApi = {
   platform: 'Channels',
   async precheck({ call, page, params, me, deps }) {
@@ -135,21 +156,9 @@ export const channelsApi = {
     const target = String(t.commentId), rootId = String(t.rootId ?? t.commentId), workId = String(t.workId);
     const myNick = me.nickname ?? params.nickname ?? null;
     if (!myNick) return { blocked: 'no-uid', detail: '没读到自己的视频号昵称，判断不了哪条是我发的' };
-    const inShadow = (src) => page.evaluate(new Function(`const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null; ${src}`));
-    // 组件刚挂载时 commentFeeds 是空数组，要等到非空；目标不在首屏就滚动懒加载（同页面写法）
-    let feeds = await waitFor(async () => { const f = await inShadow(FEEDS_SRC); return Array.isArray(f) && f.length ? f : null; }, 20000, 1000);
-    if (!feeds) return { blocked: 'target-not-found', detail: '视频号作品列表读不到' };
-    const pick = () => feeds.find((f) => String(f.objectNonce) === workId || String(f.objectId) === workId);
-    for (let i = 0; i < 6 && !pick(); i++) {
-      await inShadow(`const l = [...sr.querySelectorAll('.comment-feed-wrap')].at(-1); l?.scrollIntoView({ block: 'end' }); return true;`);
-      await (deps?.sleep ?? realSleep)(2500);
-      const next = await inShadow(FEEDS_SRC);
-      if (!Array.isArray(next) || next.length <= feeds.length) break;
-      feeds = next;
-    }
-    const feed = pick();
-    if (!feed) return { blocked: 'target-not-found', detail: '作品列表里没有这个作品' };
-    const exportId = feed.objectId;
+    const fe = await channelsExportId(page, workId, deps);
+    if (fe.blocked) return fe;
+    const { exportId } = fe;
     const th = await channelsThread(call, { exportId, rootId });
     if (th.error) return { blocked: 'precheck-error', detail: th.error };
     if (!th.root) return th.end ? { blocked: 'comment-gone', detail: '一楼列表翻到底了也没有这条评论所在的楼' } : { blocked: 'target-not-found', detail: `一楼翻了 ${API_LIMITS.Channels.maxPages} 页还没找到这条评论所在的楼` };

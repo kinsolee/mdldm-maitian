@@ -78,7 +78,7 @@ const modScope = (op) => {
 const mod = (op, targetKey) => (db, a, deps) => engageWrite(db, { op, targetId: a[targetKey], idempotencyKey: a.idempotencyKey, eventId: a.eventId, caller: deps.caller() }, deps);
 const MODERATE_TOOLS = [
   ['delete_comment', `删除自己作品下别人的一条评论（一楼、楼中楼都行；一楼下面有回复的不删，返回 deletes-thread）。${modScope('delete')}${MOD_NOTE}`, { commentId: id('评论 id'), idempotencyKey, eventId: modEventId }, mod('delete', 'commentId')],
-  ['block_user', `拉黑一个人。target 可以是 <平台>:<uid>（如 Bili:<mid>），也可以是这个人的评论 id 或私信会话 id（从库里推出 uid）；只认库里见过的人。${modScope('block')}${MOD_NOTE}`,
+  ['block_user', `拉黑一个人。target 可以是 <平台>:<uid>（如 Bili:<mid>），也可以是这个人的评论 id 或私信会话 id（从库里推出 uid）；只认库里见过的人。视频号不给评论者 uid，只能填评论 id。${modScope('block')}${MOD_NOTE}`,
     { target: z.string().describe('<平台>:<uid>、评论 id 或会话 id'), idempotencyKey, eventId: modEventId }, mod('block', 'target')],
   ['delete_conversation', `从私信会话列表里删掉一个会话（只移除会话，对方再发消息会话会回来；配合 block_user 用）。${modScope('deleteConversation')}${MOD_NOTE}`,
     { conversationId: id('会话 id'), idempotencyKey, eventId: modEventId }, mod('deleteConversation', 'conversationId')],
