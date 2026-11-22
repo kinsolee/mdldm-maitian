@@ -62,11 +62,14 @@ export function resolveBlockTarget(db, req) {
     subjectId, sourceId: subjectId ?? latestSource(db, req.platformCode, pick.accountId, pick.mid), isMe: !!pick.isMe };
 }
 
-/** 只给了 mid 时，这个人在这个账号下最近的一条评论（没有就是最近的会话）：有的平台要从评论或会话里重读出对方的其他 id（如抖音 sec_uid）。 */
+/** 只给了 mid 时，这个人在这个账号下最近的一条评论或会话（两边一起按时间比）：有的平台要从评论或会话里重读出对方的其他 id（如抖音 sec_uid）。 */
 function latestSource(db, platformCode, accountId, mid) {
-  return db.prepare(`SELECT id FROM comments WHERE platformCode = ? AND accountId = ? AND authorUid = ? AND goneAt IS NULL ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get(platformCode, accountId, mid)?.id
-    ?? db.prepare(`SELECT id FROM conversations WHERE platformCode = ? AND accountId = ? AND peerUid = ? AND peerKind = 'user' ORDER BY lastAt DESC, rowid DESC LIMIT 1`).get(platformCode, accountId, mid)?.id
-    ?? null;
+  // 评论和会话放在一起按时间比，取最新的一条；时间缺失的排在最后，同一时间评论优先
+  return db.prepare(`SELECT id FROM (
+      SELECT id, createdAt t, 0 k, rowid r FROM comments WHERE platformCode = ? AND accountId = ? AND authorUid = ? AND goneAt IS NULL
+      UNION ALL
+      SELECT id, lastAt t, 1 k, rowid r FROM conversations WHERE platformCode = ? AND accountId = ? AND peerUid = ? AND peerKind = 'user')
+    ORDER BY t IS NULL, t DESC, k, r DESC LIMIT 1`).get(platformCode, accountId, mid, platformCode, accountId, mid)?.id ?? null;
 }
 
 /** 拉黑的来源（评论或会话）换成写入脚本用的原生 id；没有来源返回 null。 */

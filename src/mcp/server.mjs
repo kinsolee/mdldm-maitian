@@ -73,7 +73,7 @@ const PLATFORM_LABEL = { Bili: 'B站', Douyin: '抖音', Channels: '视频号', 
 /** 「做得到：…；做不到：…（原因）」，按 moderate.mjs 的 MOD_SUPPORT / MOD_UNSUPPORTED 生成，和实际放行的一致。 */
 const modScope = (op) => {
   const no = Object.entries(MOD_UNSUPPORTED).filter(([k]) => k.endsWith(`:${op}`)).map(([k, why]) => `${PLATFORM_LABEL[k.split(':')[0]] ?? k.split(':')[0]}（${why}）`);
-  return `做得到的平台：${MOD_SUPPORT[op].map((c) => PLATFORM_LABEL[c] ?? c).join('、')}。${no.length ? `做不到：${no.join('；')}。` : ''}`;
+  return `做得到的平台：${(MOD_SUPPORT[op] ?? []).map((c) => PLATFORM_LABEL[c] ?? c).join('、')}。${no.length ? `做不到：${no.join('；')}。` : ''}`;
 };
 const mod = (op, targetKey) => (db, a, deps) => engageWrite(db, { op, targetId: a[targetKey], idempotencyKey: a.idempotencyKey, eventId: a.eventId, caller: deps.caller() }, deps);
 const MODERATE_TOOLS = [

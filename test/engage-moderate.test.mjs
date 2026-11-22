@@ -226,6 +226,29 @@ describe('block_user', () => {
     assert.deepEqual(w.calls[1].params.target, { mid: '9001', via: 'mid', source: { kind: 'comment', commentId: 'r1', workId: 'BV1xx', parentId: null, rootId: 'r1', authorUid: '9001' } });
   });
 
+  test('只给 mid：source 在评论和会话之间按时间取最新的；评论时间缺失时排后', async () => {
+    const addConv = (db, lastAt) => db.prepare(`INSERT INTO conversations (id, accountId, platformCode, peerUid, peerNickname, peerKind, lastAt, firstSeenAt, updatedAt)
+      VALUES ('Bili:c9001', ?, 'Bili', '9001', 'x', 'user', ?, 'x', 'x')`).run(BILI, lastAt);
+    // 9001 的评论 r1 是 2026-11-19T01:00，会话更新
+    addConv(s.db, '2026-11-19T05:00:00.000Z');
+    const w = fakeWriter(DONE);
+    await engageWrite(s.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k1' }), s.deps(w));
+    assert.deepEqual(w.calls[0].params.target.source, { kind: 'conversation', conversationId: 'c9001', peerUid: '9001' });
+    // 评论比会话新 → 评论
+    const s2 = setup();
+    addConv(s2.db, '2026-11-18T00:00:00.000Z');
+    const w2 = fakeWriter(DONE);
+    await engageWrite(s2.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k1' }), s2.deps(w2));
+    assert.equal(w2.calls[0].params.target.source.kind, 'comment');
+    // 评论没有时间、会话有 → 会话
+    const s3 = setup();
+    s3.db.prepare("UPDATE comments SET createdAt = NULL WHERE id = 'Bili:r1'").run();
+    addConv(s3.db, '2026-11-18T00:00:00.000Z');
+    const w3 = fakeWriter(DONE);
+    await engageWrite(s3.db, blk({ targetId: 'Bili:9001', idempotencyKey: 'k1' }), s3.deps(w3));
+    assert.equal(w3.calls[0].params.target.source.kind, 'conversation');
+  });
+
   test('绝不拉黑我自己：Bili:478358005、我自己的评论 id → rejected self-target，能力位开着也不起 writer', async () => {
     const w = fakeWriter(DONE);
     for (const [targetId, key] of [['Bili:478358005', 'k-me'], ['Bili:m', 'k-my-comment']]) {
