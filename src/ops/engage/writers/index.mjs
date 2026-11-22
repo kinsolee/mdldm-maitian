@@ -6,7 +6,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const WRITER_FILES = { Bili: 'bili.mjs', Douyin: 'douyin.mjs', Channels: 'channels.mjs', XiaoHongShu: 'xhs.mjs' };
-// 处置组（delete、block、deleteConversation）只做 B站，单独一个文件
+// 处置组（delete、block、deleteConversation）每个平台单独一个文件；哪个操作放行哪个平台由 moderate.mjs 的 MOD_SUPPORT 决定
 export const MODERATE_FILES = { Bili: 'bili-moderate.mjs' };
 const MODERATE_OPS = new Set(['delete', 'block', 'deleteConversation']);
 // B站走接口，几秒就完；页面平台打开后台、切作品要 10 到 60 秒（S0）

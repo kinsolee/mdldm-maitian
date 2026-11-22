@@ -3,7 +3,7 @@
 // → 在账号的 space 里跑写入脚本（runner 自带 space 锁；脚本在页面上重读、只发一次、发后回读）→ 落结果、放租约、成功就回执事件
 // → 写入失败时看是否连续 2 轮失败，是就关掉这个平台的写能力位并发提醒。
 // 每次调用都记 actions（含被拒、重复的），只存正文的 sha256。绝不重试：回读不到记 needs_readback，同一个 key 之后也不再发。
-// 处置组（delete、block、deleteConversation，只做 B站）走同一条流程，库里那一半在 moderate.mjs；每轮上限、连续失败自动关和回复组分开算。
+// 处置组（delete、block、deleteConversation，各操作做得到的平台见 moderate.mjs 的 MOD_SUPPORT）走同一条流程，库里那一半在 moderate.mjs；每轮上限、连续失败自动关和回复组分开算。
 import { createHash, randomUUID } from 'node:crypto';
 import { getAccount, listAccounts, setCapability, PLATFORM_NAMES } from '../accounts.mjs';
 import { ENGAGE_PLATFORMS } from '../../daemon/schedule.mjs';
@@ -11,7 +11,7 @@ import { splitId } from './ids.mjs';
 import { ackEvent } from './query.mjs';
 import { redact } from './redact.mjs';
 import { runWriterInSpace, WRITE_TIMEOUT_MS } from './writers/index.mjs';
-import { MOD_OPS, MOD_CAPS, MOD_ROUND_LIMIT, MOD_PLATFORMS, resolveBlockTarget, loadModTarget, selfTarget, modEventMatches, modAckSubject, modPrecheck, modTargetAccount, selfUids } from './moderate.mjs';
+import { MOD_OPS, MOD_CAPS, MOD_ROUND_LIMIT, modSupported, modUnsupportedDetail, resolveBlockTarget, loadModTarget, selfTarget, modEventMatches, modAckSubject, modPrecheck, modTargetAccount, selfUids } from './moderate.mjs';
 
 export const STATUSES = ['sent', 'needs_readback', 'failed', 'duplicate', 'rejected'];
 export const ROUND_LIMIT = 15;
@@ -291,8 +291,8 @@ export async function engageWrite(db, input, deps = {}) {
     return tx(db, () => done({ status: 'rejected', reason: 'unsupported-platform', detail: `${req.platformCode} 不在评论私信范围（${ENGAGE_PLATFORMS.join('、')}）` }));
   }
   const family = FAMILIES[req.spec.family];
-  if (req.spec.family === 'moderate' && !MOD_PLATFORMS.includes(req.platformCode)) {
-    return tx(db, () => done({ status: 'rejected', reason: 'unsupported-platform', detail: `${req.op} 只做 ${MOD_PLATFORMS.join('、')}` }));
+  if (req.spec.family === 'moderate' && !modSupported(req.op, req.platformCode)) {
+    return tx(db, () => done({ status: 'rejected', reason: 'unsupported-platform', detail: modUnsupportedDetail(req.op, req.platformCode) }));
   }
 
   const start = tx(db, () => {

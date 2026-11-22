@@ -112,7 +112,7 @@ describe('MCP engage 组（--scope engage）', () => {
     fs.writeFileSync(envFile, `MAITIAN_ENGAGE_TOKEN=${TOKEN}\n`, { mode: 0o600 });
   });
 
-  test('口令和 .env 一致：只注册 engage 组（回复、私信、B站处置），不带 read 组', async () => {
+  test('口令和 .env 一致：只注册 engage 组（回复、私信、处置），不带 read 组', async () => {
     const c = await connect(file, ['--scope', 'engage'], { MAITIAN_ENV_FILE: envFile, MAITIAN_ENGAGE_TOKEN: TOKEN });
     try {
       assert.deepEqual(await listNames(c.client), ENGAGE_TOOLS);
@@ -126,6 +126,11 @@ describe('MCP engage 组（--scope engage）', () => {
       assert.deepEqual(props('delete_comment'), ['commentId', 'eventId', 'idempotencyKey']);
       assert.deepEqual(props('block_user'), ['eventId', 'idempotencyKey', 'target']);
       assert.deepEqual(props('delete_conversation'), ['conversationId', 'eventId', 'idempotencyKey']);
+      // 说明里的「做得到 / 做不到」按 MOD_SUPPORT、MOD_UNSUPPORTED 生成
+      const desc = (n) => tools.find((t) => t.name === n).description;
+      assert.match(desc('delete_conversation'), /做得到的平台：B站/);
+      assert.match(desc('delete_conversation'), /视频号（[^）]*deleteSessionById/);
+      assert.match(desc('block_user'), /小红书（[^）]*手机/);
       assert.ok(!c.stderr().includes(TOKEN));
     } finally { await c.client.close(); }
   });
