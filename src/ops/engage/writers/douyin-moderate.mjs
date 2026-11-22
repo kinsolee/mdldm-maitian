@@ -188,7 +188,8 @@ export async function block(api, p) {
   try {
     await api.sleep(1500);
     const rel = await relation(web, secUid);
-    const ok = !rel.error && rel.uid === mid && rel.isBlock === true && !sendError;
+    // 拉黑调用抛错（没拿到 status_code=0）时，回读看到已拉黑也不算：可能是别的操作同时拉黑的，交给框架记 needs_readback
+    const ok = !rel.error && rel.uid === mid && rel.isBlock === true && !sendError && !postError;
     readBack = { found: ok, count: ok ? 1 : 0, nativeId: mid,
       detail: [rel.error ?? (rel.isBlock ? null : '回读 is_block 还是 false'), postError ? `user/block 出错：${postError}` : null].filter(Boolean).join('；') || undefined };
   } catch (e) { readBack = { found: false, count: 0, nativeId: mid, detail: `回读出错：${errText(e)}` }; }

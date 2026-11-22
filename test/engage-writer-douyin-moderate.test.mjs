@@ -256,6 +256,14 @@ describe('抖音拉黑', () => {
     assert.equal(w.calls.length + w2.calls.length, 2);
   });
 
+  test('评审第 3 轮：拉黑调用抛错但回读已拉黑 → found=false（不当成这次拉黑的）', async () => {
+    const w = fakeWeb();
+    w.block = async (uid, sec) => { w.calls.push([uid, sec]); w.other = async () => ({ status_code: 0, user: { uid: '900', is_block: true } }); throw new Error('超时'); };
+    const r = await block(apiOf(thread(), { web: w }), blkParams());
+    assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false]);
+    assert.equal(w.calls.length, 1);
+  });
+
   test('拉黑调用抛错 → sendAttempted=true，回读照做、不重调', async () => {
     const w = fakeWeb();
     w.block = async (uid, sec) => { w.calls.push([uid, sec]); throw new Error('超时'); };

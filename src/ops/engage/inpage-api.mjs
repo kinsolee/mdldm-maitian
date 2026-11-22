@@ -17,7 +17,7 @@ export const SERVICES = {
 export const pageEnd = (v) => v === 0 || v === false || v === '0';
 export const pageMore = (v) => v === 1 || v === true || v === '1';
 /** 条数：非负整数（数字，或纯数字字符串）才算，其余（null、''、布尔、负数、小数）返回 null，按读不到处理。 */
-export const countOf = (v) => (typeof v === 'number' ? (Number.isInteger(v) && v >= 0 ? v : null) : typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : null);
+export const countOf = (v) => (typeof v === 'number' ? (Number.isInteger(v) && v >= 0 ? v : null) : typeof v === 'string' && /^\d+$/.test(v.trim()) && Number.isSafeInteger(Number(v.trim())) ? Number(v.trim()) : null);
 /** 发送接口给的新 id：空串、"0" 不算。 */
 export const idOf = (v) => (v == null || v === '' || String(v) === '0' ? null : String(v));
 
