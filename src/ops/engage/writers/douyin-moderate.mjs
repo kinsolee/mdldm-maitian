@@ -10,9 +10,13 @@
 //        发后再把楼读一遍：楼读全了、目标不在了（一楼目标：一楼列表翻到底也没有它），才算 found。
 //   拉黑 block：抖音网页版（www.douyin.com，和创作者后台同一个登录态）个人页模块里的两个函数：
 //          拉黑：(uid, sec_uid, block_type, source) → POST /aweme/v1/web/user/block/，页面自己点「拉黑」时传 block_type=1（block）、source=0；
-//               返回 { status_code, block_status }，block_status=1 是已拉黑。
-//          读对方：(sec_uid) → GET /aweme/v1/web/user/profile/other/，user.is_block 是我有没有拉黑他。
+//               block_status=1 是已拉黑。
+//          读对方：(sec_uid) → GET /aweme/v1/web/user/profile/other/，is_block 是我有没有拉黑他（is_blocked 是他有没有拉黑我）。
 //          读自己：fetchUserProfileSelf() → GET /aweme/v1/web/user/profile/self/，user.uid 核对登录的是不是这个账号。
+//        返回的字段名（2026-11-22 只读核对：self、other 实测，block 读的源码，没调过拉黑）：
+//          self、other：找到的函数把返回过一遍驼峰转换，实测是 { statusCode, statusMsg, logPb, user: { uid, secUid, isBlock, isBlocked, ... } }。
+//          block：走 POST 封装 v_，不转驼峰，返回 { log_pb, ...接口原样 { status_code, status_msg, block_status }, isVerifyPassportError, logId }。
+//          拉黑所在的模块里还有一个不转驼峰的 profile/other 函数，找到哪个取决于模块顺序。所以下划线、驼峰两种都认（fieldOf），都读不到就拒绝。
 //        模块 id 每次发版会变，按源码里的接口路径找函数（同 ../inpage-api.mjs 的找法）。
 //        对方的 sec_uid 库里没有：从来源评论（评论接口的 user.sec_uid）或来源会话（私信页会话对象的 secUid）重读出来，
 //        重读出来的 uid 要等于要拉黑的 uid。发前 profile/other 重读（is_block 已是 true → already-blocked），
@@ -144,12 +148,15 @@ async function secUidOf(api, p, mid) {
   return { blocked: 'target-not-found', detail: `库里没有 ${mid} 的评论或会话，读不到对方的 sec_uid，没拉黑` };
 }
 
+/** 网页版函数的返回字段：下划线写法优先，没有就读驼峰写法（见文件头）。 */
+const fieldOf = (o, snake) => o?.[snake] ?? o?.[snake.replace(/_([a-z])/g, (_, c) => c.toUpperCase())];
+
 /** profile/other 的 is_block：{ isBlock, uid } 或 { error }。 */
 async function relation(web, secUid) {
   const d = await web.other(secUid);
-  const u = d?.user;
-  if (d?.status_code !== 0 || !u || typeof u.is_block !== 'boolean') return { error: `profile/other status_code=${d?.status_code ?? '无'}${u && typeof u.is_block !== 'boolean' ? '，user.is_block 不是布尔值' : ''}` };
-  return { isBlock: u.is_block, uid: u.uid == null ? '' : String(u.uid) };
+  const u = d?.user, code = fieldOf(d, 'status_code'), isBlock = fieldOf(u, 'is_block');
+  if (code !== 0 || !u || typeof isBlock !== 'boolean') return { error: `profile/other status_code=${code ?? '无'}${u && typeof isBlock !== 'boolean' ? '，user.is_block / isBlock 不是布尔值' : ''}` };
+  return { isBlock, uid: u.uid == null ? '' : String(u.uid) };
 }
 
 export async function block(api, p) {
@@ -169,7 +176,8 @@ export async function block(api, p) {
     // 网页版登录的也得是这个账号
     const self = await web.self();
     const webUid = self?.user?.uid == null ? null : String(self.user.uid);
-    if (self?.statusCode !== 0 || !webUid) return stop(me, 'precheck-error', `抖音网页版读不到当前登录账号（profile/self statusCode=${self?.statusCode ?? '无'}）`);
+    const selfCode = fieldOf(self, 'status_code');
+    if (selfCode !== 0 || !webUid) return stop(me, 'precheck-error', `抖音网页版读不到当前登录账号（profile/self status_code=${selfCode ?? '无'}）`);
     if (webUid !== me) return stop(webUid, 'uid-mismatch', `抖音网页版登录的是 ${webUid}，不是 ${me}`);
     const rel = await relation(web, secUid);
     if (rel.error) return stop(me, 'precheck-error', rel.error);
@@ -182,8 +190,9 @@ export async function block(api, p) {
   let sendError = null, postError = null;
   try {
     const r = await web.block(mid, secUid);
-    if (r?.status_code !== 0) sendError = `user/block status_code=${r?.status_code ?? '无'} ${r?.status_msg ?? ''}`.trim();
-    else if (r.block_status !== BLOCKED_STATUS) sendError = `user/block 返回 block_status=${r.block_status ?? '无'}，不是 ${BLOCKED_STATUS}`;
+    const code = fieldOf(r, 'status_code'), status = fieldOf(r, 'block_status');
+    if (code !== 0) sendError = `user/block status_code=${code ?? '无'} ${fieldOf(r, 'status_msg') ?? ''}`.trim();
+    else if (status !== BLOCKED_STATUS) sendError = `user/block 返回 block_status=${status ?? '无'}，不是 ${BLOCKED_STATUS}`;
   } catch (e) { postError = errText(e); }
   let readBack;
   try {
