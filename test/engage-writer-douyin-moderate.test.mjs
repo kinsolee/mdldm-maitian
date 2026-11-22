@@ -19,7 +19,7 @@ function fakeComments({ roots, replies = {}, del = { status_code: 0, remove: tru
   const call = async (method, args) => {
     calls.push({ method, args });
     if (method === 'awemeV1CommentListSelect') return { ok: true, data: { status_code: 0, comments: st.roots.filter((r) => r.aweme_id === args.aweme_id), has_more: 0, cursor: 0 } };
-    if (method === 'awemeV1CommentListReply') return { ok: true, data: { status_code: 0, comments: st.replies[args.comment_id] ?? [], has_more: 0, cursor: 0 } };
+    if (method === 'awemeV1CommentListReply') return { ok: true, data: { status_code: 0, comments: st.replies[args.comment_id] ?? [], has_more: 0, cursor: 0, total: (st.replies[args.comment_id] ?? []).length } };
     if (method === 'awemeV1CommentMultiDelete') {
       if (del.throws) return { ok: false, error: del.throws };
       if (del.remove) {
@@ -99,6 +99,97 @@ describe('抖音删评论', () => {
     api.call = async (m, a) => (m === 'awemeV1CommentListReply' ? { ok: true, data: { status_code: 0, comments: [], has_more: 1, cursor: 10 } } : call(m, a));
     assert.equal((await deleteComment(api, delParams({ commentId: '101', rootId: '101', parentId: null }))).blocked, 'thread-incomplete');
     assert.equal(deletes(neg).length + deletes(more).length, 0);
+  });
+
+  // 实测：楼下没有回复时 comment/list/reply 返回 comments: null、has_more: 0（见 douyin-moderate.mjs 的 replyPage）
+  const rootDel = () => delParams({ commentId: '101', rootId: '101', parentId: null });
+  const withFirstPage = (page, total = 0) => {
+    const fc = fakeComments({ roots: [root('101', '800', total), root('102', '801', 0)] });
+    const call = fc.call;
+    const api = apiOf(fc);
+    api.call = async (m, a) => (m === 'awemeV1CommentListReply' ? { ok: true, data: page } : call(m, a));
+    return { fc, api };
+  };
+
+  test('楼中楼第一页 comments=null、has_more=0、total=0 → 当空页，删一次、回读 found', async () => {
+    for (const page of [
+      { status_code: 0, comments: null, cursor: 0, has_more: 0, total: 0 },
+      { status_code: 0, comments: null, has_more: false, total: 0 },
+      { status_code: 0, comments: null, has_more: '0', total: '0' },
+    ]) {
+      const { fc, api } = withFirstPage(page);
+      const r = await deleteComment(api, rootDel());
+      assert.equal(r.sendAttempted, true, JSON.stringify(page));
+      assert.equal(r.readBack.found, true);
+      assert.deepEqual(deletes(fc).map((c) => c.args), [{ cids: '101', need_block: false }]);
+    }
+  });
+
+  test('复审：实测形状——一楼 reply_comment_total=3，第一页只回 2 条、has_more=0、total=3 → deletes-thread，不调接口', async () => {
+    const fc = fakeComments({ roots: [root('101', '800', 3)], replies: { 101: [sub('201', '101', '900'), sub('202', '101', '901')] } });
+    const call = fc.call;
+    const api = apiOf(fc);
+    api.call = async (m, a) => (m === 'awemeV1CommentListReply' ? { ok: true, data: { status_code: 0, comments: fc.st.replies[101], has_more: 0, cursor: 10, total: 3 } } : call(m, a));
+    const r = await deleteComment(api, rootDel());
+    assert.deepEqual([r.blocked, r.rejected, r.sendAttempted], ['deletes-thread', true, false]);
+    assert.equal(deletes(fc).length, 0);
+  });
+
+  test('comments=null、has_more=0，但接口 total 大于 0 → deletes-thread；一楼 total 大于 0 → 楼中楼读失败 precheck-error；都不调接口', async () => {
+    for (const [page, total, want] of [[{ status_code: 0, comments: null, has_more: 0, total: 3 }, 0, 'deletes-thread'], [{ status_code: 0, comments: null, has_more: 0, total: 0 }, 2, 'precheck-error']]) {
+      const { fc, api } = withFirstPage(page, total);
+      const r = await deleteComment(api, rootDel());
+      assert.deepEqual([r.blocked, r.sendAttempted], [want, false]);
+      assert.equal(deletes(fc).length, 0);
+    }
+  });
+
+  test('comments=null 或缺失，但 has_more 说还有、缺失或不认识 → thread-incomplete，不调接口', async () => {
+    for (const page of [
+      { status_code: 0, comments: null, has_more: 1, cursor: 10, total: 0 },
+      { status_code: 0, comments: null, has_more: true, total: 0 },
+      { status_code: 0, comments: null, total: 0 },
+      { status_code: 0, has_more: 1, total: 0 },
+      { status_code: 0 },
+      { status_code: 0, comments: null, has_more: null, total: 0 },
+      { status_code: 0, comments: null, has_more: '', total: 0 },
+      // 复审：comments: [] 但没有 has_more
+      { status_code: 0, comments: [], total: 0 },
+    ]) {
+      const { fc, api } = withFirstPage(page);
+      const r = await deleteComment(api, rootDel());
+      assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false], JSON.stringify(page));
+      assert.equal(deletes(fc).length, 0);
+    }
+  });
+
+  test('comments 是对象、字符串、数字，或 status_code 不是 0 → thread-incomplete，不调接口', async () => {
+    for (const page of [
+      { status_code: 0, comments: {}, has_more: 0 },
+      { status_code: 0, comments: { 0: sub('201', '101', '900') }, has_more: 0 },
+      { status_code: 0, comments: '', has_more: 0 },
+      { status_code: 0, comments: '[]', has_more: 0 },
+      { status_code: 0, comments: 0, has_more: 0 },
+      { status_code: 0, comments: false, has_more: 0 },
+      { status_code: 8, comments: null, has_more: 0 },
+      // 评审第 1 轮：接口 total 读不懂（负数、小数、null、布尔、非数字串）不能当 0
+      ...[-1, 1.5, null, false, true, 'x', ''].map((total) => ({ status_code: 0, comments: null, has_more: 0, total })),
+      { status_code: 0, comments: [], has_more: 0, total: -1 },
+      { comments: null, has_more: 0, total: 0 },
+      // 复审：status_code 是字符串 '0' 不认
+      { status_code: '0', comments: null, has_more: 0, total: 0 },
+      // 复审：没有 comments 键、没有 total 键（结构变了），或字段包进 data 里，一律读不懂
+      { status_code: 0, has_more: 0, total: 0 },
+      { status_code: 0, comments: null, has_more: 0 },
+      { status_code: 0, comments: [], has_more: 0 },
+      { status_code: 0, has_more: 0 },
+      { status_code: 0, has_more: 0, data: { comments: [sub('201', '101', '900')], total: 3 } },
+    ]) {
+      const { fc, api } = withFirstPage(page);
+      const r = await deleteComment(api, rootDel());
+      assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false], JSON.stringify(page));
+      assert.equal(deletes(fc).length, 0);
+    }
   });
 
   test('评审第 2 轮：multi_delete 返回 status_code=0 但 delete_result 没有这条 / result 不明确 → 回读看到不在也不算 found', async () => {
