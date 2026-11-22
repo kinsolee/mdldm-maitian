@@ -37,7 +37,8 @@ const BLOCKED_STATUS = 1;
 // www.douyin.com 里按接口路径找的三个函数
 export const WEB_FNS = { block: '/aweme/v1/web/user/block/', other: '/aweme/v1/web/user/profile/other/', self: '/aweme/v1/web/user/profile/self/' };
 
-const errText = (e) => redact(String(e?.message ?? e)).slice(0, 300);
+// 错误消息是空的（throw ''、new Error('')、{ message: '' }）也要返回非空串：调用方拿它当「出过错」的标志
+const errText = (e) => redact(String(e?.message ?? e)).slice(0, 300) || '未知错误';
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
 const isSelf = (uid, me, p) => uid === me || uid === String(p.uid) || (p.selfUids ?? []).includes(uid);
 const stop = (me, blocked, detail, extra = {}) => ({ uidSeen: me ?? null, blocked, detail: redact(detail), sendAttempted: false, ...extra });
@@ -100,7 +101,7 @@ export async function deleteComment(api, p) {
   try {
     const r = await api.call('awemeV1CommentMultiDelete', { cids: target, need_block: false });
     const d = r.ok ? r.data : null;
-    if (!r.ok) postError = r.error;
+    if (!r.ok) postError = r.error || '未知错误';
     else if (d?.status_code !== 0) sendError = `multi_delete status_code=${d?.status_code ?? '无'} ${d?.status_msg ?? ''}`.trim();
     else {
       const hits = Array.isArray(d.delete_result) ? d.delete_result.filter((x) => String(x?.cid) === target) : [];

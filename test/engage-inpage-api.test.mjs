@@ -1,7 +1,7 @@
 // S9 页面内接口：找页面服务（假 window）、抖音 / 视频号接口读评论（假接口，parse 不变）、接口回复评论的护栏（假接口）、能力位开关。
 import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { locateService, callInPage, SERVICES } from '../src/ops/engage/inpage-api.mjs';
+import { locateService, callInPage, countOf, SERVICES } from '../src/ops/engage/inpage-api.mjs';
 import * as dy from '../src/ops/engage/adapters/douyin.mjs';
 import * as ch from '../src/ops/engage/adapters/channels.mjs';
 import { douyinApi, channelsApi, sendAndReadBack, runApiReply } from '../src/ops/engage/writers/api-reply.mjs';
@@ -461,5 +461,12 @@ describe('runApiReply 和开关', () => {
     await collect({ account: acc({ readViaApi: true }), kind: 'comments', log: (m) => logs.push(m),
       runner: async () => ({ ok: true, result: { kind: 'comments', via: 'dom', apiFallback: '页面评论服务没找到，退回 DOM 路径', uidSeen: ME, itemListCodes: [] } }) });
     assert.match(logs[0] ?? '', /页面内接口没用上：页面评论服务没找到/);
+  });
+});
+
+describe('countOf', () => {
+  test('非负安全整数（数字或纯数字串）才算；超过安全整数的数字和数字串、负数、小数、空串、布尔、null 都返回 null', () => {
+    assert.deepEqual([countOf(0), countOf(7), countOf('12'), countOf(' 3 '), countOf(Number.MAX_SAFE_INTEGER)], [0, 7, 12, 3, Number.MAX_SAFE_INTEGER]);
+    for (const v of [Number.MAX_SAFE_INTEGER + 1, 2 ** 60, Infinity, '9007199254740993', '99999999999999999999', -1, 1.5, '', ' ', '-1', '1.0', true, false, null, undefined, NaN]) assert.equal(countOf(v), null, String(v));
   });
 });

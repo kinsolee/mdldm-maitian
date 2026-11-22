@@ -158,6 +158,27 @@ describe('抖音删评论', () => {
     assert.equal(deletes(fc2).length, 1);
   });
 
+  test('删评论：multi_delete 抛出空消息错误（new Error(\'\')、throw \'\'、{ message: \'\' }）或返回 { ok: false, error: \'\' }、回读已不在 → found=false，只调一次', async () => {
+    const cases = [
+      ...[['new Error(\'\')', () => new Error('')], ["throw ''", () => ''], ["{ message: '' }", () => ({ message: '' })]].map(([name, err]) => [name, async () => { throw err(); }]),
+      ["{ ok: false, error: '' }", async () => ({ ok: false, error: '' })],
+    ];
+    for (const [name, onDelete] of cases) {
+      const fc = fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [sub('201', '101', '900')] } });
+      const api = apiOf(fc);
+      const call = fc.call;
+      api.call = async (m, a) => {
+        if (m !== 'awemeV1CommentMultiDelete') return call(m, a);
+        await call(m, a);   // 记一次调用，并把这条真的删掉：回读会看到不在
+        return onDelete();
+      };
+      const r = await deleteComment(api, delParams());
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], name);
+      assert.match(r.readBack.detail, /multi_delete 出错：未知错误/, name);
+      assert.equal(deletes(fc).length, 1, name);
+    }
+  });
+
   test('回读出错（读接口坏了）→ found=false，不重调删除', async () => {
     const fc = fakeComments({ roots: [root('101', '800', 1)], replies: { 101: [sub('201', '101', '900')] } });
     let n = 0;
@@ -262,6 +283,27 @@ describe('抖音拉黑', () => {
     const r = await block(apiOf(thread(), { web: w }), blkParams());
     assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false]);
     assert.equal(w.calls.length, 1);
+  });
+
+  // 错误消息为空时 errText 曾得到 ''，postError 是假值，回读看到已生效就判成 found
+  const EMPTY_ERRORS = [['new Error(\'\')', () => new Error('')], ["throw ''", () => ''], ["{ message: '' }", () => ({ message: '' })]];
+
+  test('拉黑调用抛出空消息错误（new Error(\'\')、throw \'\'、{ message: \'\' }）、回读已拉黑 → found=false，只调一次', async () => {
+    for (const [name, err] of EMPTY_ERRORS) {
+      const w = fakeWeb();
+      w.block = async (uid, sec) => { w.calls.push([uid, sec]); w.other = async () => ({ status_code: 0, user: { uid: '900', is_block: true } }); throw err(); };
+      const r = await block(apiOf(thread(), { web: w }), blkParams());
+      assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false], name);
+      assert.match(r.readBack.detail, /user\/block 出错：未知错误/, name);
+      assert.equal(w.calls.length, 1, name);
+    }
+  });
+
+  test('拉黑：页面函数返回 { __error: \'\' }（unwrap 抛 new Error(\'\')）、回读已拉黑 → found=false', async () => {
+    const w = fakeWeb();
+    w.block = async (uid, sec) => { w.calls.push([uid, sec]); w.other = async () => ({ status_code: 0, user: { uid: '900', is_block: true } }); const r = { __error: '' }; if ('__error' in r) throw new Error(r.__error); return r; };
+    const r = await block(apiOf(thread(), { web: w }), blkParams());
+    assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false]);
   });
 
   test('拉黑调用抛错 → sendAttempted=true，回读照做、不重调', async () => {
