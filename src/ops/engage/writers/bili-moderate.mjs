@@ -179,7 +179,7 @@ async function seek(page, rpid) {
 // 所以发后回读不只看「这条不在」：读到的整个集合要正好等于发前那一次减去这一条，作品下有任何别的变化都判确认不了；
 // 一页的内容和 page.total 也可能不是同一时刻的（R2 Codex-1：旧页面配新 total，前面删了一条、目标挪进读过的页），
 // 所以这样的结果要隔一会儿再完整读一遍、两次集合一样才算。
-const MAX_FULLLIST_PAGES = 20;             // 一个作品最多读 400 条：发前一遍、发后两遍，留在 120 秒写入超时里
+const MAX_FULLLIST_PAGES = 20;             // 一个作品最多读 400 条：发前一遍、发后两遍最多 60 页；写入 runner 的脚本时限约 108 秒，慢接口下回读没读完只会记 needs_readback，不重试
 
 /** 按作品读全 fulllist：{ items: Map(rpid → 条目), total } / { error, unsure? }。 */
 async function scanWork(api, bvid, oid) {
