@@ -16,8 +16,12 @@ if (sub === 'refresh' && !['fast', 'all'].includes(values.scope)) { console.erro
 
 const svc = createComputeService({ debounceMs: Infinity });
 try {
-  if (sub === 'refresh') await svc.refresh(values.scope).promise;
+  if (sub === 'refresh') {
+    const r = svc.refresh(values.scope);
+    if (!r.started) { console.error(`上一次刷新还在跑（${r.refreshing?.scope || '?'}，开始于 ${r.refreshing?.startedAt || '?'}），这次没起`); process.exitCode = 5; }
+    await r.promise;
+  }
   const s = svc.status();
   const brief = Object.fromEntries(Object.entries(s.providers).map(([p, v]) => [p, { status: v.last?.status || 'never', error: v.last?.error || undefined, at: v.last?.fetchedAt }]));
-  console.log(JSON.stringify(sub === 'status' ? s : { light: s.light, providers: brief }, null, 1));
+  if (process.exitCode !== 5) console.log(JSON.stringify(sub === 'status' ? s : { light: s.light, providers: brief }, null, 1));
 } finally { svc.close(); }

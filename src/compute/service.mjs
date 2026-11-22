@@ -1,9 +1,10 @@
 // 谷歌算力面板的服务层：秒回最新快照、Colab 实时态 15 秒防抖、单飞刷新、一键停机后回读。
 // 不建定时器：定时巡检由 OpenBot routine 调 `node src/hub.mjs compute refresh --scope all`。
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openStudio, PROVIDERS } from './store.mjs';
+import { openStudio, PROVIDERS, studioDbPath } from './store.mjs';
 import { readColab, stopColab } from './colab.mjs';
 import { readGemini } from './gemini.mjs';
 
@@ -46,13 +47,29 @@ export function runEgo({ cli = process.env.MAITIAN_COMPUTE_EGO_CLI || path.join(
 export function computeLight(view) {
   const colab = view.colab?.ok, kaggle = view.kaggle?.ok;
   const colabActive = !!colab && ((colab.sessions || []).length > 0 || (colab.metrics?.assignments || 0) > 0);
-  const kaggleActive = !!kaggle && (kaggle.sessions || []).length > 0;
+  const kaggleKnown = !!kaggle && kaggle.metrics?.sessionsKnown !== false;   // 会话没读到的快照不能当「空闲」
+  const kaggleActive = kaggleKnown && (kaggle.sessions || []).length > 0;
   if (colabActive || kaggleActive) return { level: 'warn', text: `${[colabActive && 'Colab', kaggleActive && 'Kaggle'].filter(Boolean).join('、')} 在跑，用完去停机` };
-  if (colab || kaggle) return { level: 'ok', text: '空闲' };
+  if (colab || kaggleKnown) return { level: 'ok', text: '空闲' };
   return { level: 'idle', text: '未读取' };
 }
 
-export function createComputeService({ dbFile, colab = readColab, stop = stopColab, gemini = readGemini, ego = runEgo, now = () => Date.now(), debounceMs = COLAB_DEBOUNCE_MS } = {}) {
+const pidAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const readLockFile = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return e.code === 'ENOENT' ? null : {}; } };
+/** 跨进程刷新锁（网页服务和 hub compute refresh 共用一把）：原子 wx 建文件；持有进程已退出的锁自动接管。 */
+export function tryRefreshLock(file, meta) {
+  for (let i = 0; i < 2; i++) {
+    try { fs.writeFileSync(file, JSON.stringify({ pid: process.pid, ...meta }), { flag: 'wx' }); return { ok: true, release: () => { try { if (readLockFile(file)?.pid === process.pid) fs.rmSync(file, { force: true }); } catch {} } }; }
+    catch (e) { if (e.code !== 'EEXIST') throw e; }
+    const h = readLockFile(file);
+    if (h && pidAlive(h.pid)) return { ok: false, holder: h };
+    if (h && !h.pid && h.startedAt && Date.now() - Date.parse(h.startedAt) < 10 * 60_000) return { ok: false, holder: h };   // 读到半写的文件：先当在跑
+    fs.rmSync(file, { force: true });
+  }
+  return { ok: false, holder: readLockFile(file) };
+}
+
+export function createComputeService({ dbFile = studioDbPath(), lockFile = `${dbFile}.refresh.lock`, colab = readColab, stop = stopColab, gemini = readGemini, ego = runEgo, now = () => Date.now(), debounceMs = COLAB_DEBOUNCE_MS } = {}) {
   const store = openStudio(dbFile);
   let refreshing = null, flight = null, colabAt = 0, colabFlight = null;
 
@@ -83,15 +100,20 @@ export function createComputeService({ dbFile, colab = readColab, stop = stopCol
     refresh(scope = 'fast') {
       if (scope !== 'fast' && scope !== 'all') throw new Error('scope 只能是 fast 或 all');
       if (flight) return { started: false, refreshing, promise: flight };
-      refreshing = { scope, startedAt: new Date(now()).toISOString() };
-      flight = (scope === 'all' ? full() : fast()).finally(() => { refreshing = null; flight = null; });
+      const meta = { scope, startedAt: new Date(now()).toISOString() };
+      const lk = tryRefreshLock(lockFile, meta);
+      if (!lk.ok) return { started: false, refreshing: { scope: lk.holder?.scope || null, startedAt: lk.holder?.startedAt || null, elsewhere: true }, promise: Promise.resolve() };
+      refreshing = meta;
+      flight = Promise.resolve().then(() => (scope === 'all' ? full() : fast())).finally(() => { lk.release(); refreshing = null; flight = null; });
       return { started: true, refreshing, promise: flight };
     },
     /** 秒回：不等任何采集。poll 时 Colab 距上次读超过防抖间隔就在后台再读一次（顶栏灯用 poll:false 只看快照）。 */
     status({ local = false, poll = true } = {}) {
-      if (poll && !flight && now() - colabAt >= debounceMs) pollColab().catch(() => {});
+      const other = !flight && readLockFile(lockFile);
+      const elsewhere = other && pidAlive(other.pid) ? { scope: other.scope || null, startedAt: other.startedAt || null, elsewhere: true } : null;
+      if (poll && !flight && !elsewhere && now() - colabAt >= debounceMs) pollColab().catch(() => {});
       const view = store.all();
-      return { providers: view, light: computeLight(view), refreshing, local, now: new Date(now()).toISOString() };
+      return { providers: view, light: computeLight(view), refreshing: refreshing || elsewhere, local, now: new Date(now()).toISOString() };
     },
     async stopColab(id) {
       const ok = store.latest('colab').ok;

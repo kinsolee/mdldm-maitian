@@ -122,6 +122,11 @@ function sameOrigin(req) {
   return !!o && o === `http://${String(req.headers.host || '').toLowerCase()}`;
 }
 
+// 刷新可以从 https 隧道点：Origin 等于「隧道协议 + Host」也算同源（浏览器改不了这些头，跨站页面发不出来）。停机仍走 localOnly + sameOrigin
+function sameSiteOrigin(req) {
+  const o = String(req.headers.origin || '').toLowerCase(), host = String(req.headers.host || '').toLowerCase();
+  return !!o && !!host && (o === `http://${host}` || (isHttps(req) && o === `https://${host}`));
+}
 // 谷歌算力面板（data/studio.db，第一次访问才打开）：状态秒回；刷新要同源；停机要本机直连且同源
 let compute = null;
 const computeSvc = () => compute || (compute = createComputeService());
@@ -129,7 +134,7 @@ async function computeApi(req, res, u) {
   if (u.pathname === '/api/compute/status') return req.method === 'GET' ? send(res, 200, computeSvc().status({ local: localOnly(req), poll: u.searchParams.get('peek') !== '1' })) : send(res, 405, { error: '只支持 GET' });
   if (req.method !== 'POST') return send(res, u.pathname === '/api/compute/refresh' || u.pathname === '/api/compute/colab/stop' ? 405 : 404, { error: '只支持 POST' });
   if (u.pathname === '/api/compute/refresh') {
-    if (!sameOrigin(req)) return send(res, 403, { error: '来源不对' });
+    if (!sameSiteOrigin(req)) return send(res, 403, { error: '来源不对' });
     const scope = u.searchParams.get('scope') || 'fast';
     if (scope !== 'fast' && scope !== 'all') return send(res, 400, { error: 'scope 只能是 fast 或 all' });
     const r = computeSvc().refresh(scope);

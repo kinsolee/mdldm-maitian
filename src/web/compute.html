@@ -97,7 +97,7 @@ function render() {
   <div class="btns" style="margin:0 2px 16px">
     <button class="btn pri" id="rf-fast" ${busy ? 'disabled' : ''}>快速刷新</button>
     <button class="btn" id="rf-all" ${busy ? 'disabled' : ''}>全量刷新</button>
-    <span class="note" style="font-size:12.5px;color:var(--t3);align-self:center">${busy ? `${S.refreshing.scope === 'all' ? '全量' : '快速'}刷新中（${ago(S.refreshing.startedAt)}开始）…` : ''}</span>
+    <span class="note" style="font-size:12.5px;color:var(--t3);align-self:center">${busy ? `${S.refreshing.scope === 'all' ? '全量' : '快速'}刷新中${S.refreshing.elsewhere ? '（定时巡检或命令行在跑）' : ''}${S.refreshing.startedAt ? `（${ago(S.refreshing.startedAt)}开始）` : ''}…` : ''}</span>
   </div>
   <div class="notice"><b>时间红线：</b>① Flow 旧模型 <b>2026-12-05</b> 停用（${days(DEADLINES.flowOld)} 天后）；② Flow 点数${fl ? ` <b>${fmt(fl.credits)}</b>` : ''} 将于 <b>${esc(fl?.resetText || '12月9日 15:22')}</b> 重置、不结转（${days(flowReset(fl))} 天后）；③ Colab / Kaggle 用完立刻关机。</div>
   <div class="sec"><h2>在跑的会话</h2><span class="note">有会话时顶栏「谷歌算力」灯变橙</span></div>
@@ -107,10 +107,11 @@ function render() {
   if (typeof gcSet === 'function') gcSet(S);
 }
 
-async function load() {
-  try { S = await api('/api/compute/status'); render(); }
+// 只有打开页面和点按钮后才让后端读一次 Colab（带 15 秒防抖）；后台自动重画只看快照（peek=1），不触发任何采集
+async function load(peek = false) {
+  try { S = await api(`/api/compute/status${peek ? '?peek=1' : ''}`); render(); }
   catch (e) { $('#app').innerHTML = `<div class="empty" style="height:60vh">读不到状态：${esc(e.message)}</div>`; }
-  clearTimeout(poll); poll = setTimeout(load, S?.refreshing ? 3000 : 30000);
+  clearTimeout(poll); poll = setTimeout(() => load(true), S?.refreshing ? 3000 : 30000);
 }
 
 async function post(url, data) {
@@ -127,15 +128,15 @@ document.addEventListener('click', async (e) => {
       document.querySelectorAll('#rf-fast,#rf-all').forEach((b) => { b.disabled = true; });
       await post(`/api/compute/refresh?scope=${t.id === 'rf-all' ? 'all' : 'fast'}`);
       toast(t.id === 'rf-all' ? '全量刷新已开始，约 1 分钟' : '快速刷新已开始');
-      await load(); return;
+      await load(true); return;
     }
     if (t.dataset.stop) {
       if (!confirm(`停掉 Colab 会话 ${t.dataset.stop}？运行中的任务会中断。`)) return;
       t.disabled = true;
       await post('/api/compute/colab/stop', { id: t.dataset.stop });
-      toast('已停机'); await load();
+      toast('已停机'); await load(true);
     }
-  } catch (err) { toast(`没成功：${err.message}`); await load(); }
+  } catch (err) { toast(`没成功：${err.message}`); await load(true); }
 });
 
 load();

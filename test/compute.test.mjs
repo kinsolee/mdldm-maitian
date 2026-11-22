@@ -107,6 +107,7 @@ describe('状态灯', () => {
     assert.equal(computeLight(v(null, { sessions: [] })).level, 'ok');
     assert.equal(computeLight(v({ sessions: [{ id: 'a' }] }, null)).level, 'warn');
     assert.equal(computeLight(v({ sessions: [], metrics: { assignments: 1 } }, null)).level, 'warn', 'sessions 空但有 assignment 也算');
+    assert.equal(computeLight(v(null, { sessions: [], metrics: { sessionsKnown: false } })).level, 'idle', 'Kaggle 会话没读到不算空闲');
     const both = computeLight(v({ sessions: [{ id: 'a' }] }, { sessions: [{ id: 'k' }] }));
     assert.equal(both.level, 'warn'); assert.match(both.text, /Colab、Kaggle/);
   });
@@ -139,6 +140,36 @@ describe('服务：单飞、防抖、ego 失败保留旧快照', () => {
       const d = s.refresh('fast'); assert.equal(d.started, true); await d.promise;
       assert.throws(() => s.refresh('nope'));
     } finally { s.close(); }
+  });
+
+  test('跨进程锁：另一个实例（同一个 studio.db）在刷新时不再起，状态里显示别处在刷', async () => {
+    const d = tmp();
+    let release, colabN = 0;
+    const base = { dbFile: dbIn(d), gemini: async () => ({ status: 'unconfigured' }), colab: async () => { colabN++; return { status: 'ok', sessions: [] }; } };
+    const a = createComputeService({ ...base, ego: () => new Promise((r) => { release = () => r({ ok: true, result: {} }); }) });
+    const b = createComputeService({ ...base, ego: OK_EGO });
+    try {
+      const ra = a.refresh('all');
+      assert.equal(ra.started, true);
+      const rb = b.refresh('fast');
+      assert.equal(rb.started, false); assert.equal(rb.refreshing.elsewhere, true); assert.equal(rb.refreshing.scope, 'all');
+      await rb.promise;
+      await new Promise((r) => setImmediate(r));
+      const n = colabN;
+      const st = b.status();
+      assert.equal(st.refreshing.elsewhere, true);
+      await b.idle(); assert.equal(colabN, n, '别处在刷时 status 不再起 Colab');
+      release(); await ra.promise;
+      assert.equal(fs.existsSync(`${dbIn(d)}.refresh.lock`), false, '跑完释放锁');
+      const rb2 = b.refresh('fast'); assert.equal(rb2.started, true); await rb2.promise;
+    } finally { a.close(); b.close(); }
+  });
+
+  test('锁文件的进程已经不在：接管', async () => {
+    const d = tmp();
+    fs.writeFileSync(`${dbIn(d)}.refresh.lock`, JSON.stringify({ pid: 2147483646, scope: 'all', startedAt: new Date().toISOString() }));
+    const s = createComputeService({ dbFile: dbIn(d), colab: async () => ({ status: 'ok', sessions: [] }), gemini: async () => ({ status: 'unconfigured' }), ego: OK_EGO });
+    try { const r = s.refresh('fast'); assert.equal(r.started, true); await r.promise; } finally { s.close(); }
   });
 
   test('status 秒回不等 Colab；15 秒内不重复读；peek 不读', async () => {
@@ -271,6 +302,11 @@ describe('网页接口（起真的网页服务，假 colab）', () => {
       assert.equal((await req('POST', '/api/compute/refresh?scope=fast')).status, 403);
       assert.equal((await req('POST', '/api/compute/refresh?scope=fast', { origin: 'https://evil.example' })).status, 403);
       assert.equal((await req('POST', '/api/compute/refresh?scope=bad', origin)).status, 400);
+      // https 隧道：Origin 是 https://隧道域名、带 x-forwarded-proto https 时刷新算同源；同一组头调停机仍 403
+      const tunnel = { host: 'maitian.example.com', origin: 'https://maitian.example.com', 'x-forwarded-proto': 'https' };
+      assert.equal((await req('POST', '/api/compute/refresh?scope=bad', tunnel)).status, 400, '过了同源检查');
+      assert.equal((await req('POST', '/api/compute/refresh?scope=fast', { host: 'maitian.example.com', origin: 'https://maitian.example.com' })).status, 403, '没有 https 代理头不认 https Origin');
+      assert.equal((await req('POST', '/api/compute/colab/stop', tunnel, JSON.stringify({ id: 'gpu-1' }))).status, 403);
       const rf = await req('POST', '/api/compute/refresh?scope=fast', origin);
       assert.ok(rf.status === 202 || rf.status === 409);
       const st = await until(async () => { const s = (await req('GET', '/api/compute/status?peek=1')).json; return !s.refreshing && s.providers.gemini.last && s; });

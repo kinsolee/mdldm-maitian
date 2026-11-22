@@ -56,6 +56,9 @@ await step('kaggle', async () => {
   });
   if ([401, 403].includes(r.q.status)) return { status: 'logged_out', error: `Kaggle 登录失效（HTTP ${r.q.status}）` };
   if (!r.q.body) return { status: 'error', error: `Kaggle 额度没读到（HTTP ${r.q.status}）` };
+  // 会话读不到就不能说「空闲」：整项算失败，保留上次成功快照
+  if ([401, 403].includes(r.s.status)) return { status: 'logged_out', error: `Kaggle 会话列表登录失效（HTTP ${r.s.status}）` };
+  if (r.s.status !== 200 || !r.s.body) return { status: 'error', error: `Kaggle 会话列表没读到（HTTP ${r.s.status}）` };
   const sec = (v) => (v == null ? null : Number(String(v).replace(/s$/, '')));
   const quota = (q) => q && { totalHours: sec(q.totalTimeAllowed) / 3600, usedHours: sec(q.timeUsed) / 3600, reservedHours: sec(q.timeReserved) / 3600, leftHours: (sec(q.totalTimeAllowed) - sec(q.timeUsed) - sec(q.timeReserved)) / 3600 };
   // ListKernelSessions：没有会话时只回 quotaLimits；有会话时是一个数组字段，名字不确定，取所有对象数组
