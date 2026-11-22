@@ -99,6 +99,8 @@ export async function deleteComment(api, p) {
       const fj = first.ok ? first.data : null;
       const list = fj?.status_code === 0 ? replyPage(fj) : null;
       if (!list) return stop(me, 'thread-incomplete', `读一楼下面的回复失败（${first.ok ? `status_code=${fj?.status_code ?? '无'}，comments=${fj?.comments === null ? 'null' : typeof fj?.comments}，has_more=${fj?.has_more ?? '缺失'}` : first.error}），判断不了有没有回复，没删`);
+      // 接口给了 total 但不是非负整数（负数、小数、null、布尔…）：条数读不到，不删；没给 total 才只看列表
+      if (Object.hasOwn(fj, 'total') && countOf(fj.total) == null) return stop(me, 'thread-incomplete', `一楼下面的回复接口 total=${JSON.stringify(fj.total) ?? '无'} 读不懂，判断不了有没有回复，没删`);
       if (!list.length && !pageEnd(fj.has_more)) return stop(me, 'thread-incomplete', `一楼下面的回复第一页是空的，但 has_more=${fj.has_more ?? '缺失'}，判断不了有没有回复，没删`);
       const n = Math.max(total, th.replies?.length ?? 0, list.length, countOf(fj.total) ?? 0);
       if (n > 0) return stop(me, 'deletes-thread', `${target} 是一楼，下面有 ${n} 条回复；抖音删一楼会把楼下回复一起删掉，不删`, { rejected: true });

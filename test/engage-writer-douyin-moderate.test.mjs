@@ -116,6 +116,7 @@ describe('抖音删评论', () => {
       { status_code: 0, comments: null, cursor: 0, has_more: 0, total: 0 },
       { status_code: 0, cursor: 0, has_more: 0, total: 0 },
       { status_code: 0, comments: null, has_more: false },
+      { status_code: 0, comments: null, has_more: '0', total: '0' },
     ]) {
       const { fc, api } = withFirstPage(page);
       const r = await deleteComment(api, rootDel());
@@ -160,6 +161,9 @@ describe('抖音删评论', () => {
       { status_code: 0, comments: 0, has_more: 0 },
       { status_code: 0, comments: false, has_more: 0 },
       { status_code: 8, comments: null, has_more: 0 },
+      // 评审第 1 轮：接口 total 读不懂（负数、小数、null、布尔、非数字串）不能当 0
+      ...[-1, 1.5, null, false, true, 'x', ''].map((total) => ({ status_code: 0, comments: null, has_more: 0, total })),
+      { status_code: 0, comments: [], has_more: 0, total: -1 },
       { comments: null, has_more: 0 },
     ]) {
       const { fc, api } = withFirstPage(page);
