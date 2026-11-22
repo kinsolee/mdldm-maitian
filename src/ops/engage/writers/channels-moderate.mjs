@@ -97,7 +97,8 @@ export async function deleteComment(api, p) {
   try {
     await api.sleep(2000);
     const at = locate(await channelsThread(api.call, { exportId, rootId: ids.rootId }), ids.target, ids.rootId);
-    const gone = !!at.gone && !sendError;
+    // 接口调用抛错（没拿到 errCode=0）时，回读看到不在也不算：可能是别人或平台同时删的
+    const gone = !!at.gone && !sendError && !postError;
     readBack = { found: gone, count: gone ? 1 : 0, nativeId: ids.target,
       detail: [gone ? at.detail : at.node ? '回读时这条还在' : at.gone ? null : at.detail, postError ? `del_comment 出错：${postError}` : null].filter(Boolean).join('；') };
   } catch (e) { readBack = { found: false, count: 0, nativeId: ids.target, detail: `回读出错：${errText(e)}` }; }
@@ -135,7 +136,7 @@ export async function block(api, p) {
   try {
     await api.sleep(1500);
     const at = locate(await channelsThread(api.call, { exportId, rootId: ids.rootId }), ids.target, ids.rootId);
-    const ok = !!at.node?.blacklistFlag && !sendError;
+    const ok = !!at.node?.blacklistFlag && !sendError && !postError;
     readBack = { found: ok, count: ok ? 1 : 0, nativeId: ids.target,
       detail: [at.node ? (at.node.blacklistFlag ? null : '回读时这条评论的 blacklistFlag 还是假') : `回读时读不到这条评论：${at.detail}`, postError ? `block_user 出错：${postError}` : null].filter(Boolean).join('；') };
   } catch (e) { readBack = { found: false, count: 0, nativeId: ids.target, detail: `回读出错：${errText(e)}` }; }
