@@ -706,6 +706,27 @@ describe('reply/reply 乱序的楼（改走 up/fulllist）', () => {
     assert.equal(f.posts.length, 1);
   });
 
+  for (const authorUid of [null, undefined, '']) {
+    test(`乱序、预期作者是 ${JSON.stringify(authorUid) ?? 'undefined'} → 核对不了作者，不删`, async () => {
+      const f = messy();
+      const r = await deleteComment(f.api, P('delete', { ...target, authorUid }));
+      assert.deepEqual([r.blocked, r.sendAttempted, f.posts.length], ['target-not-found', false, 0]);
+    });
+  }
+
+  test('每页有序、跨页倒退且目标在没细看的前一页：删除没生效 → 回读不能报 found', async () => {
+    const f = fakeBili({ delEffective: false, threads: { 100: { root: rp(100), replies: replies(asc(101, 60)) } } });
+    const post = f.api.post;
+    f.api.post = async (url, form, c) => {
+      const x = await post(url, form, c);
+      f.st.threads[100].replies = replies([...asc(101, 19), 130, ...asc(120, 10), ...asc(131, 30)]);
+      return x;
+    };
+    const r = await deleteComment(f.api, P('delete', { ...target, commentId: '130', authorUid: '9100' }));
+    assert.equal(r.readBack.found, false, r.readBack.detail);
+    assert.equal(f.posts.length, 1);
+  });
+
   test('删一楼、page(1) 乱序 → 仍然不删，也不改走 fulllist', async () => {
     const f = messy();
     const r = await deleteComment(f.api, P('delete', { ...root }));

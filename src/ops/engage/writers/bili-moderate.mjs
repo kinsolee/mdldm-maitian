@@ -112,6 +112,8 @@ function threadReader(api, oid, root, goneCodes = GONE_CODES) {
       else if (ids.some((x, i) => i > 0 && x <= ids[i - 1])) { unordered = true; r = { error: `reply/reply 第 ${pn} 页不是按 rpid 递增，定位不了`, unsure: true, unordered: true }; }
       else r = { replies, ids, count: countOf(j.data?.page?.count), root: j.data?.root ?? null };
     }
+    // 每页各自递增也可能跨页倒退：和已读过的页比一遍
+    if (r.ids?.length) for (const [q, c] of cache) if (c.ids?.length && (q < pn ? c.ids.at(-1) >= r.ids[0] : r.ids.at(-1) >= c.ids[0])) unordered = true;
     cache.set(pn, r);
     return r;
   };
@@ -244,7 +246,7 @@ async function precheckComment(api, p, me, oid) {
 
   const s = await seek(page, rpid);
   if (s.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${s.code}）`);
-  const viaWork = async (why) => precheckFromWork(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), why);
+  const viaWork = async (why) => precheckFromWork(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), why, page.sawUnordered());
   if (s.hidden || s.unordered) return viaWork(s.error);
   if (s.error) return stop(s.unsure ? 'thread-incomplete' : 'precheck-error', s.error);
   if (!s.at) return viaWork(`按 rpid 定位到楼 ${t.rootId} 第 ${s.slot.pn} 页，没有 ${t.commentId}`);
@@ -260,15 +262,14 @@ async function precheckComment(api, p, me, oid) {
   if (!whole(s.at.pn, here)) return stop('thread-incomplete', `目标所在的第 ${s.at.pn} 页只有 ${here.ids.length} 条，和 page.count=${here.count} 对不上，删了也确认不了，没删`);
   const prev = s.at.i > 0 ? here.ids[s.at.i - 1] : await before(page, s.at.pn);
   const next = s.at.i < here.ids.length - 1 ? here.ids[s.at.i + 1] : await after(page, s.at.pn, here);
-  // 邻居证据要求前后都按 rpid 递增：相邻页乱序，或跨页倒退，都不能用
-  const crossPageBroken = (typeof prev === 'bigint' && prev >= rpid) || (typeof next === 'bigint' && next <= rpid);
-  if (page.sawUnordered() || crossPageBroken) return viaWork(`楼 ${t.rootId} 第 ${s.at.pn} 页附近不是按 rpid 递增，邻居证据用不了`);
+  // 邻居证据要求读过的页都按 rpid 递增：页内乱序或跨页倒退都不能用
+  if (page.sawUnordered()) return viaWork(`楼 ${t.rootId} 第 ${s.at.pn} 页附近不是按 rpid 递增，邻居证据用不了`);
   if (prev == null || next == null) return stop('thread-incomplete', `定位到了 ${t.commentId}（第 ${s.at.pn} 页），但读不到它前后的两条，删了也确认不了，没删`);
   return { check: { isRoot: false, rpid, prev, next } };
 }
 
-/** reply/reply 靠不住时，在 fulllist 里找这一条（w 是 scanWork 的结果，why 是 reply/reply 那边的情况）。 */
-function precheckFromWork(p, me, oid, rpid, stop, w, why) {
+/** reply/reply 靠不住时，在 fulllist 里找这一条（w 是 scanWork 的结果，why 是 reply/reply 那边的情况）。needAuthor：乱序时必须有预期作者并对上。 */
+function precheckFromWork(p, me, oid, rpid, stop, w, why, needAuthor = false) {
   const t = p.target;
   if (w.error) return stop(w.unsure ? 'thread-incomplete' : 'precheck-error', `${why}；改查 up/fulllist：${w.error}，没删`);
   const node = w.items.get(String(rpid));
@@ -278,6 +279,7 @@ function precheckFromWork(p, me, oid, rpid, stop, w, why) {
   const author = midOf(node);
   if (!author) return stop('precheck-error', '读不到这条评论的作者');
   if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
+  if (needAuthor && (t.authorUid == null || String(t.authorUid) === '')) return stop('target-not-found', `${why}；这条没有预期作者，核对不了，没删`);
   if (t.authorUid != null && String(t.authorUid) !== '' && String(t.authorUid) !== author) return stop('target-not-found', `up/fulllist 里 ${t.commentId} 的作者是 ${author}，不是 ${t.authorUid}`);
   return { check: { isRoot: false, viaWork: true, rpid, before: new Set(w.items.keys()) } };
 }
@@ -311,7 +313,8 @@ async function readBackComment(api, p, oid, check) {
   if (s.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${s.code}）` };
   if (s.error) return { gone: false, detail: s.error };
   if (s.at) return { gone: false, detail: '回读时这条还在' };
-  let pred, succ;
+  if (page.sawUnordered()) return { gone: false, detail: `回读时楼 ${t.rootId} 跨页不是按 rpid 递增，确认不了` };
+  let pred, succ, freshUnordered;
   if (s.slot.i > 0) {
     // 目标该在的位置在一页中间：同一次读到的这一页里，前后两条直接相邻
     const here = await page(s.slot.pn);
@@ -320,6 +323,7 @@ async function readBackComment(api, p, oid, check) {
   } else {
     // 跨页：不用定位时的缓存，先重读后一页、再重读前一页
     const fresh = threadReader(api, oid, t.rootId, READBACK_GONE_CODES);
+    freshUnordered = fresh.sawUnordered;
     const pn = s.slot.pn;
     const back = await fresh(pn);
     if (back.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${back.code}）` };
@@ -340,6 +344,7 @@ async function readBackComment(api, p, oid, check) {
       else succ = !back.ids.length && pred != null && (pn - 2) * PS + front.ids.length >= front.count ? END : null;
     }
   }
+  if (freshUnordered?.()) return { gone: false, detail: `回读时楼 ${t.rootId} 跨页不是按 rpid 递增，确认不了` };
   const nextOk = succ === check.next || (check.next === END && typeof succ === 'bigint' && succ > check.rpid);
   if (pred === check.prev && nextOk) return { gone: true, detail: `楼 ${t.rootId} 里已没有 ${t.commentId}` };
   return { gone: false, detail: `回读时定位不到 ${t.commentId}，但证明不了它原来前后两条现在挨着（原来 ${showId(check.prev)}、${showId(check.next)}，现在 ${showId(pred)}、${showId(succ)}），确认不了` };
