@@ -150,7 +150,7 @@ sqlite3 -readonly data/ops.db "SELECT id, createdAt, json_extract(readBack,'$.de
 
 | 看到的 | 说明 |
 | --- | --- |
-| `msg` 末位是 0，`row` 是 `me1,srv1,new1,eq1` | 目标会话行的 `lastMessage` 有同文候选，聊天区 fiber 上没有。要另行验证它是否属于这次发送，才能考虑改读列表行 |
+| `msg` 末位是 0，`row` 是 `me1,srv1,new1,eq1` | 目标会话行的 `lastMessage` 有同文候选，本次聊天区 fiber 扫描（20 层内）未命中。要另行验证它是否属于这次发送，才能考虑改读列表行 |
 | `deep` 大于 0 | 同文候选在 fiber 第 6 层或更深，正式回读看不到。同样要先排除旧消息 |
 | `noid` 大于 0 | 同文候选既没有 `clientMessageId` 也没有 `serverId`，正式回读会跳过。可能还没拿到服务端确认，这时不能算发出 |
 | `hit` 的 content 类型是 `object` | 诊断能取到正文，正式回读只解析 JSON 字符串，两处解析方式不同。这种情况加长窗口没有用 |
