@@ -112,8 +112,9 @@ function threadReader(api, oid, root, goneCodes = GONE_CODES) {
       else if (ids.some((x, i) => i > 0 && x <= ids[i - 1])) { unordered = true; r = { error: `reply/reply 第 ${pn} 页不是按 rpid 递增，定位不了`, unsure: true, unordered: true }; }
       else r = { replies, ids, count: countOf(j.data?.page?.count), root: j.data?.root ?? null };
     }
-    // 每页各自递增也可能跨页倒退：和已读过的页比一遍
-    if (r.ids?.length) for (const [q, c] of cache) if (c.ids?.length && (q < pn ? c.ids.at(-1) >= r.ids[0] : r.ids.at(-1) >= c.ids[0])) unordered = true;
+    // 每页各自递增也可能跨页倒退：和已读过的页比一遍，当场按乱序结束，后面的读取不能盖过它
+    const clash = r.ids?.length ? [...cache].find(([q, c]) => c.ids?.length && (q < pn ? c.ids.at(-1) >= r.ids[0] : r.ids.at(-1) >= c.ids[0])) : null;
+    if (clash) { unordered = true; r = { error: `reply/reply 第 ${pn} 页和第 ${clash[0]} 页之间 rpid 倒退，定位不了`, unsure: true, unordered: true }; }
     cache.set(pn, r);
     return r;
   };
@@ -313,8 +314,7 @@ async function readBackComment(api, p, oid, check) {
   if (s.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${s.code}）` };
   if (s.error) return { gone: false, detail: s.error };
   if (s.at) return { gone: false, detail: '回读时这条还在' };
-  if (page.sawUnordered()) return { gone: false, detail: `回读时楼 ${t.rootId} 跨页不是按 rpid 递增，确认不了` };
-  let pred, succ, freshUnordered;
+  let pred, succ;
   if (s.slot.i > 0) {
     // 目标该在的位置在一页中间：同一次读到的这一页里，前后两条直接相邻
     const here = await page(s.slot.pn);
@@ -323,7 +323,6 @@ async function readBackComment(api, p, oid, check) {
   } else {
     // 跨页：不用定位时的缓存，先重读后一页、再重读前一页
     const fresh = threadReader(api, oid, t.rootId, READBACK_GONE_CODES);
-    freshUnordered = fresh.sawUnordered;
     const pn = s.slot.pn;
     const back = await fresh(pn);
     if (back.gone) return { gone: true, detail: `楼 ${t.rootId} 已不在（code=${back.code}）` };
@@ -344,7 +343,6 @@ async function readBackComment(api, p, oid, check) {
       else succ = !back.ids.length && pred != null && (pn - 2) * PS + front.ids.length >= front.count ? END : null;
     }
   }
-  if (freshUnordered?.()) return { gone: false, detail: `回读时楼 ${t.rootId} 跨页不是按 rpid 递增，确认不了` };
   const nextOk = succ === check.next || (check.next === END && typeof succ === 'bigint' && succ > check.rpid);
   if (pred === check.prev && nextOk) return { gone: true, detail: `楼 ${t.rootId} 里已没有 ${t.commentId}` };
   return { gone: false, detail: `回读时定位不到 ${t.commentId}，但证明不了它原来前后两条现在挨着（原来 ${showId(check.prev)}、${showId(check.next)}，现在 ${showId(pred)}、${showId(succ)}），确认不了` };

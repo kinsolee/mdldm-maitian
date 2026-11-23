@@ -727,6 +727,41 @@ describe('reply/reply 乱序的楼（改走 up/fulllist）', () => {
     assert.equal(f.posts.length, 1);
   });
 
+  test('回读二分途中发现跨页倒退，下一页再返回 12006 → 不能盖过乱序，found=false', async () => {
+    const f = fakeBili({ delEffective: false, threads: { 100: { root: rp(100), replies: replies(asc(101, 100)) } } });
+    const get = f.api.get;
+    f.api.get = async (url) => {
+      const j = await get(url);
+      if (!f.posts.length || !url.includes('reply/reply')) return j;
+      const pn = Number(new URL(url).searchParams.get('pn'));
+      if (pn === 4) return { code: 12006, message: '没有该评论', data: null };
+      if (pn === 1) j.data.replies = replies([...asc(101, 19), 190]);
+      if (pn === 3) j.data.replies = replies(asc(141, 20));
+      return j;
+    };
+    const r = await deleteComment(f.api, P('delete', { ...target, commentId: '171', authorUid: '9100' }));
+    assert.equal(r.readBack.found, false, r.readBack.detail);
+    assert.equal(f.posts.length, 1);
+  });
+
+  test('发前二分发现跨页倒退、目标所在页又少给 → 仍改走 fulllist，不停在 thread-incomplete', async () => {
+    const f = fakeBili({ threads: { 100: { root: rp(100), replies: replies(asc(101, 100)) } } });
+    const get = f.api.get;
+    f.api.get = async (url) => {
+      const j = await get(url);
+      if (f.posts.length || !url.includes('reply/reply')) return j;
+      const pn = Number(new URL(url).searchParams.get('pn'));
+      if (pn === 1) j.data.replies = replies([...asc(101, 19), 190]);
+      if (pn === 3) j.data.replies = replies(asc(141, 15));
+      return j;
+    };
+    const r = await deleteComment(f.api, P('delete', { ...target, commentId: '150', authorUid: '9100' }));
+    assert.equal(r.sendAttempted, true, r.detail);
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.match(r.readBack.detail, /up\/fulllist/);
+    assert.equal(f.posts.length, 1);
+  });
+
   test('删一楼、page(1) 乱序 → 仍然不删，也不改走 fulllist', async () => {
     const f = messy();
     const r = await deleteComment(f.api, P('delete', { ...root }));
