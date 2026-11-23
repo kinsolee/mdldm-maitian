@@ -10,6 +10,7 @@ import { setCapability } from '../src/ops/accounts.mjs';
 import { requestRefresh, getJob, startJob, createJob, STALE_RUNNING_MS } from '../src/ops/engage/store.mjs';
 import { subscribe } from '../src/ops/engage/subscribers.mjs';
 import { runRound, shouldStartRound, makeEngageTicker, engageStatus, redact } from '../src/daemon/sync.mjs';
+import { stableNodeExecPath } from '../src/ops/node-bin.mjs';
 import { acquireRoundLock } from '../src/daemon/round-lock.mjs';
 import { startFakeBot, verify } from './helpers/fake-bot.mjs';
 import { freshDb, comment, commentsSnap, conv, dmsSnap, T0, MIN } from './helpers/engage-fixtures.mjs';
@@ -348,7 +349,7 @@ describe('守护进程接线', () => {
     const tick = makeEngageTicker({ openDb: () => db, spawnImpl, now: base.now, lockPath: base.lockPath, log: (s) => logs.push(s) });
     assert.deepEqual(tick(), { started: true, reason: 'schedule' });
     assert.equal(spawned.length, 1);
-    assert.equal(spawned[0].cmd, process.execPath);
+    assert.equal(spawned[0].cmd, stableNodeExecPath());
     assert.match(spawned[0].args[0], /src\/daemon\/sync\.mjs$/);
     assert.equal(spawned[0].args[1], '--once');
     assert.equal(spawned[0].opts.detached, false);
