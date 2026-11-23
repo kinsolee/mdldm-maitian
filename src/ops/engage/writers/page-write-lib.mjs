@@ -174,7 +174,16 @@ export async function runWrite(task, params, plat) {
   }
 }
 
-async function readBack(page, step, { before, toastBefore, capFrom, t, text }) {
+// 诊断只补充 detail：出错或 3 秒没结果都当没有，绝不影响回读结论
+async function diagnosis(step, before, want) {
+  if (!step.diagnose) return null;
+  let timer;
+  try {
+    return await Promise.race([step.diagnose(before, want), new Promise((r) => { timer = setTimeout(() => r(null), 3000); })]);
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+export async function readBack(page, step, { before, toastBefore, capFrom, t, text }) {
   const want = norm(text);
   const fresh = async () => uniqById((await step.items()).filter((x) => x.id != null && !before.has(String(x.id)) && x.mine && x.rel && norm(x.text) === want));
   const pageError = async () => {
@@ -197,5 +206,6 @@ async function readBack(page, step, { before, toastBefore, capFrom, t, text }) {
   if (count > 1) return { readBack: { found: false, count, nativeId: null, detail: `读到 ${count} 条我发的、内容相同的新条目` } };
   err ??= await pageError();
   if (err) return { sendError: redact(err), readBack: { found: false, count: 0, nativeId: null, detail: '页面报错，且没读到新条目' } };
-  return { readBack: { found: false, count: 0, nativeId: null, detail: `${t.readbackMs}ms 内没读到我发的这条` } };
+  const diag = await diagnosis(step, before, want);
+  return { readBack: { found: false, count: 0, nativeId: null, detail: `${t.readbackMs}ms 内没读到我发的这条${diag ? `；${diag}` : ''}` } };
 }

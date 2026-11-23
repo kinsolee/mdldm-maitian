@@ -17,7 +17,7 @@
 import { EXPAND_SRC, switchTo } from '../adapters/douyin.mjs';
 import { bigJson, capCount, clickMarked, sleep } from '../adapters/page-lib.mjs';
 import { runApiReply, douyinApi } from './api-reply.mjs';
-import { capturedJson, findObjects, inPage, mark, markSel, runWrite, sendNearBox, waitFor } from './page-write-lib.mjs';
+import { capturedJson, findObjects, inPage, mark, markSel, norm, runWrite, sendNearBox, waitFor } from './page-write-lib.mjs';
 
 export const FILE = 'douyin.mjs';
 export const PAGES = {
@@ -286,6 +286,49 @@ const CONV_OPEN_SRC = FIBER + `for (const el of document.querySelectorAll('body 
   }
   return false;`;
 
+/** 这个会话聊天区里的消息，给发后回读比对。 */
+export const dmItems = async (page, conversationId) => (await inPage(page, MSGS_SRC, conversationId)).map((m) => ({ id: m.id, mine: m.mine, rel: true, text: m.text }));
+
+// 回读没读到时的脱敏诊断：页面里只算数字和字段有没有，不带出正文、id、uid。读法见 docs/migration/S7-engage.md「抖音私信回读诊断」
+const DM_DIAG_SRC = FIBER + `const __norm = ${norm};
+  const before = new Set(arg.before), seen = new Map();
+  for (const el of document.querySelectorAll('body *')) {
+    for (let f = __fiber(el), j = 0; f && j < 20; f = f.return, j++) {
+      const p = f.memoizedProps; if (!p || typeof p !== 'object') continue;
+      for (const v of [p, ...Object.values(p)]) {
+        if (!v || typeof v !== 'object' || Array.isArray(v) || typeof v.isFromMe !== 'boolean' || !('content' in v)) continue;
+        if (!seen.has(v) || j < seen.get(v)) seen.set(v, j);
+      }
+    }
+  }
+  const eqText = (v) => { try { const t = typeof v.content === 'string' ? JSON.parse(v.content)?.text : v.content?.text; return t != null && __norm(t) === arg.want; } catch { return false; } };
+  const isOld = (v) => [v.clientMessageId, v.serverId, v.clientId].some((x) => x != null && before.has(String(x)));
+  const all = [...seen.entries()];
+  const conv = all.filter(([v]) => v.conversationId == null || String(v.conversationId) === arg.conv);
+  const me = conv.filter(([v]) => v.isFromMe), fresh = me.filter(([v]) => !isOld(v)), eq = fresh.filter(([v]) => eqText(v)).sort((a, b) => a[1] - b[1]);
+  let row = null;
+  for (const li of document.querySelectorAll('li.semi-list-item')) {
+    let f = __fiber(li); for (let j = 0; j < 2 && f; j++) f = f.return;
+    const it = f?.memoizedProps?.item;
+    if (String(it?.id) !== arg.conv) continue;
+    const m = it.lastMessage;
+    row = m ? { me: +!!m.isFromMe, srv: +(m.serverId != null), fresh: +!isOld(m), eq: +eqText(m) } : { me: 0, srv: 0, fresh: 0, eq: 0 };
+    break;
+  }
+  const h = eq[0];
+  return { msg: [all.length, conv.length, me.length, fresh.length, eq.length], deep: eq.filter(([, d]) => d >= 6).length,
+    noId: eq.filter(([v]) => v.clientMessageId == null && v.serverId == null).length, row,
+    hit: h ? { cm: +(h[0].clientMessageId != null), ci: +(h[0].clientId != null && h[0].clientId !== ''), srv: +(h[0].serverId != null), ct: typeof h[0].content,
+      fs: Number.isInteger(h[0].flightStatus) ? h[0].flightStatus : null, d: h[1] } : null };`;
+
+/** 诊断结果 → 一行短文本（actions.readBack.detail 总长限 300 字）。 */
+export function formatDmDiag(d) {
+  const row = d.row ? `me${d.row.me},srv${d.row.srv},new${d.row.fresh},eq${d.row.eq}` : 'none';
+  const hit = d.hit ? `cm${d.hit.cm},ci${d.hit.ci},srv${d.hit.srv},${d.hit.ct},fs${d.hit.fs ?? '-'},d${d.hit.d}` : 'none';
+  return `诊断v1 msg=${d.msg.join('/')} deep=${d.deep} noid=${d.noId} row=${row} hit=${hit}`;
+}
+export const dmDiagnose = async (page, conversationId, before, want) => formatDmDiag(await inPage(page, DM_DIAG_SRC, { conv: conversationId, before: [...before], want }));
+
 async function prepareDM({ page, params, t }) {
   const tg = params.target ?? {};
   await waitFor(async () => (await inPage(page, CONVS_SRC)).length > 0, t.loadMs, 1000);
@@ -314,6 +357,7 @@ async function prepareDM({ page, params, t }) {
   if (!box) return { blocked: 'no-input-box', detail: '打开会话后没有唯一的输入框（[class*=chat-editor-] [contenteditable=true]）' };
   return {
     send: (await mark(page, 'send', sendNearBox('^发送$'))) ? sendNearBox('^发送$') : 'enter',
-    items: async () => (await inPage(page, MSGS_SRC, c.id)).map((m) => ({ id: m.id, mine: m.mine, rel: true, text: m.text })),
+    items: () => dmItems(page, c.id),
+    diagnose: (before, want) => dmDiagnose(page, c.id, before, want),
   };
 }
