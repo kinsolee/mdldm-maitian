@@ -289,13 +289,14 @@ describe('B站 delete（假接口）', () => {
     assert.equal(r.readBack.found, true, r.readBack.detail);
   });
 
-  test('reply/reply 的一页不是按 rpid 递增 → thread-incomplete（定位不了），不调接口', async () => {
+  test('reply/reply 的一页不是按 rpid 递增 → 不二分，改按 up/fulllist 核对、删除、回读', async () => {
     const t = bigThread(100);
     t[100].replies.reverse();
     const f = fakeBili({ threads: t });
-    const r = await deleteComment(f.api, P('delete', { ...sub, commentId: String(1000 + 50 * 3) }));
-    assert.deepEqual([r.blocked, r.sendAttempted], ['thread-incomplete', false]);
-    assert.equal(f.posts.length, 0);
+    const r = await deleteComment(f.api, P('delete', { ...sub, commentId: String(1000 + 50 * 3), authorUid: '9100' }));
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.match(r.readBack.detail, /up\/fulllist/);
+    assert.equal(f.posts.length, 1);
   });
 
   test('没登录 → loginLost；登录的不是这个账号 → uid-mismatch；都不调接口', async () => {
@@ -619,6 +620,96 @@ describe('B站 delete（假接口）', () => {
       assert.equal(r.readBack.found, true);
       assert.equal(fullGets(f), 0);
     });
+  });
+});
+
+// 2026-11-23 真实现象：楼中楼的 rpid 不跟时间走，reply/reply 一页内可以乱序，这时不能二分，也不能用邻居证据
+describe('reply/reply 乱序的楼（改走 up/fulllist）', () => {
+  const reply = (id, mid = '9100') => rp(id, { root: 100, parent: 100, mid });
+  const replies = (ids) => ids.map((id) => reply(id));
+  const asc = (from, n, step = 1) => Array.from({ length: n }, (_, i) => from + i * step);
+  const messy = (extra = {}) => fakeBili({ threads: { 100: { root: rp(100), replies: replies([105, 103, 106]) } },
+    hidden: [rp(104, { root: 100, parent: 105, mid: '9666' })], ...extra });
+  const target = { commentId: '104', workId: 'BV1xx', parentId: '105', rootId: '100', authorUid: '9666' };
+  const fullGets = (f) => f.gets.filter((x) => x === '/x/v2/reply/up/fulllist').length;
+
+  test('乱序、fulllist 有目标 → 只调一次删除，回读 found', async () => {
+    const f = messy();
+    const r = await deleteComment(f.api, P('delete', target));
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.match(r.readBack.detail, /up\/fulllist/);
+    assert.equal(f.posts.length, 1);
+    assert.equal(fullGets(f), 3);   // 发前一遍、发后两遍
+  });
+
+  test('乱序、fulllist 没有 → target-not-found，不删', async () => {
+    const f = messy({ hidden: [] });
+    const r = await deleteComment(f.api, P('delete', target));
+    assert.deepEqual([r.blocked, r.sendAttempted, f.posts.length], ['target-not-found', false, 0]);
+  });
+
+  test('乱序、fulllist 读不全 → thread-incomplete，不删', async () => {
+    const f = messy({ fulllist: (_u, all) => ({ code: 0, data: { page: { total: all.length + 1 }, list: all } }) });
+    const r = await deleteComment(f.api, P('delete', target));
+    assert.deepEqual([r.blocked, r.sendAttempted, f.posts.length], ['thread-incomplete', false, 0]);
+  });
+
+  test('乱序、fulllist 里楼或作者对不上 → 不删', async () => {
+    const wrongRoot = messy({ hidden: [rp(104, { root: 200, parent: 200, mid: '9666' })] });
+    assert.equal((await deleteComment(wrongRoot.api, P('delete', target))).blocked, 'target-not-found');
+    const wrongAuthor = messy({ hidden: [rp(104, { root: 100, parent: 105, mid: '9777' })] });
+    assert.equal((await deleteComment(wrongAuthor.api, P('delete', target))).blocked, 'target-not-found');
+    const self = messy({ hidden: [rp(104, { root: 100, parent: 105, mid: ME })] });
+    assert.equal((await deleteComment(self.api, P('delete', { ...target, authorUid: ME }))).blocked, 'self-target');
+    assert.equal(wrongRoot.posts.length + wrongAuthor.posts.length + self.posts.length, 0);
+  });
+
+  test('第 2 页才乱序 → 同样改走 fulllist', async () => {
+    const f = fakeBili({ threads: { 100: { root: rp(100), replies: replies([...asc(1000, 20), ...asc(1020, 20).reverse()]) } } });
+    const r = await deleteComment(f.api, P('delete', { ...target, commentId: '1030', authorUid: '9100' }));
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.match(r.readBack.detail, /up\/fulllist/);
+    assert.equal(f.posts.length, 1);
+  });
+
+  test('目标所在页有序、取邻居的下一页乱序 → 不用邻居证据，改走 fulllist', async () => {
+    const f = fakeBili({ threads: { 100: { root: rp(100), replies: replies([...asc(1000, 20), 1025, 1021, 1023]) } } });
+    const r = await deleteComment(f.api, P('delete', { ...target, commentId: '1019', authorUid: '9100' }));
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.match(r.readBack.detail, /up\/fulllist/);
+  });
+
+  test('每页各自有序、跨页倒退 → 不用邻居证据，改走 fulllist', async () => {
+    const f = fakeBili({ threads: { 100: { root: rp(100), replies: replies([...asc(1000, 20, 2), ...asc(1001, 5, 2)]) } } });
+    const r = await deleteComment(f.api, P('delete', { ...target, commentId: '1038', authorUid: '9100' }));
+    assert.equal(r.readBack.found, true, r.readBack.detail);
+    assert.match(r.readBack.detail, /up\/fulllist/);
+  });
+
+  test('删后 fulllist 还有别的变化 → found=false，只调一次', async () => {
+    const f = messy();
+    const post = f.api.post;
+    f.api.post = async (url, form, c) => { const x = await post(url, form, c); f.st.hidden.push(rp(99, { root: 100, parent: 100 })); return x; };
+    const r = await deleteComment(f.api, P('delete', target));
+    assert.equal(r.readBack.found, false);
+    assert.match(r.readBack.detail, /别的变化/);
+    assert.equal(f.posts.length, 1);
+  });
+
+  test('发前有序、发后 reply/reply 变乱序 → 确认不了（found=false），不猜成功', async () => {
+    const f = fakeBili({ threads: { 100: { root: rp(100), replies: replies([101, 102, 103]) } } });
+    const post = f.api.post;
+    f.api.post = async (url, form, c) => { const x = await post(url, form, c); f.st.threads[100].replies.reverse(); return x; };
+    const r = await deleteComment(f.api, P('delete', { ...target, commentId: '102', authorUid: '9100' }));
+    assert.equal(r.readBack.found, false);
+    assert.match(r.readBack.detail, /rpid/);
+    assert.equal(f.posts.length, 1);
+  });
+
+  test('删一楼、page(1) 乱序 → 仍然不删，也不改走 fulllist', async () => {
+    const f = messy();
+    const r = await deleteComment(f.api, P('delete', { ...root }));
+    assert.deepEqual([r.blocked, r.sendAttempted, f.posts.length, fullGets(f)], ['thread-incomplete', false, 0, 0]);
   });
 });
 

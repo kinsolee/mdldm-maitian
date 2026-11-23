@@ -3,7 +3,8 @@
 //        （楼已不在 → already-gone；定位不到 → target-not-found；定位不了 → thread-incomplete；作者是我 → self-target；
 //        一楼下面有回复 → deletes-thread，rejected，因为 B站删一楼会连整楼回复一起删）
 //        → x/v2/reply/del 只调一次 → 等 2 秒再定位这一条：楼没了，或这条不在、它原来前后的两条现在挨着，才算 found。
-//        reply/reply 定位不到（或第 1 页空、count>0）：B站把广告类楼中楼对外隐藏了，它还在 x/v2/reply/up/fulllist 里。
+//        reply/reply 定位不到（第 1 页空、count>0，或楼中楼被隐藏），或读到的页 rpid 乱序（不能二分、邻居证据也不成立）：
+//        目标可能还在 x/v2/reply/up/fulllist 里。
 //        改按作品把 fulllist 读全、找这一条（rpid、作品、楼、作者都对上），删后用同一套读法确认它不在了才算 found；
 //        fulllist 里也没有才报 target-not-found，读不全就不删（thread-incomplete）。
 //   拉黑 block：x/relation?fid= 重读（attribute 128 已拉黑 → already-blocked）→ x/relation/modify act=5 只调一次 → 再读 x/relation，attribute 128 才算 found。
@@ -77,8 +78,9 @@ async function whoAmI(api, uid) {
 }
 
 // —— 删评论：只定位目标这一条，不读整楼 ——
-// x/v2/reply/reply 按回复顺序（时间正序）给楼中楼，rpid 跟着时间递增。按 rpid 二分页码，十来页就能落到目标那一页，
-// 再按 rpid 精确对上。页内 rpid 不是递增的就不猜（thread-incomplete）。
+// x/v2/reply/reply 大多数楼的 rpid 是递增的，按 rpid 二分页码，十来页就能落到目标那一页，再按 rpid 精确对上。
+// 但这不是接口保证：2026-11-23 只读核过 BV1BGWx6YE8J 的一栋楼（page.count=21），第 1 页 20 条里有 4 处 rpid 倒退。
+// 读到乱序（页内，或目标和相邻页之间）就不二分、不用邻居证据，发前改按作品读 up/fulllist；发后回读在这条路径上遇到乱序只算确认不了。
 // 回读不靠「整楼读全」：发前记下目标前后的两条（邻居），发后这条不见了、并且这两条现在挨着，才算删掉。
 // 「挨着」的证据只认两种（用到的每一页都要没少给：满页，或条数够得上 page.count）：同一次读到的同一页里两条相邻；或者跨页时先读后一页、再读前一页（删除只会让后面的往前挪，
 // 这个顺序拼不出假的「挨着」），前一页还得是满的。「楼的末尾」要本页不满、条数和 page.count 对得上，或下一页空、count 也到这儿为止。
@@ -90,10 +92,11 @@ const bigOf = (x) => (/^\d+$/.test(String(x ?? '')) ? BigInt(String(x)) : null);
 const countOf = (x) => (typeof x === 'number' ? (Number.isInteger(x) && x >= 0 ? x : NaN) : typeof x === 'string' && /^\d+$/.test(x) ? Number(x) : NaN);
 const showId = (x) => (x === START ? '楼的开头' : x === END ? '楼的末尾' : x == null ? '（读不到）' : String(x));
 
-/** 按页读楼，带缓存和页数上限。page(pn) → { replies, ids, count, root } / { gone, code } / { error, unsure? }。goneCodes：哪些 code 算楼已不在。 */
+/** 按页读楼，带缓存和页数上限。page(pn) → { replies, ids, count, root } / { gone, code } / { error, unsure?, unordered? }。page.sawUnordered()：读过的页里有没有乱序。goneCodes：哪些 code 算楼已不在。 */
 function threadReader(api, oid, root, goneCodes = GONE_CODES) {
   const cache = new Map();
-  return async function page(pn) {
+  let unordered = false;
+  const page = async (pn) => {
     if (cache.has(pn)) return cache.get(pn);
     if (cache.size >= MAX_LOCATE_PAGES) return { error: `reply/reply 读了 ${MAX_LOCATE_PAGES} 页还没定位到`, unsure: true };
     if (cache.size) await api.sleep(200);
@@ -106,12 +109,14 @@ function threadReader(api, oid, root, goneCodes = GONE_CODES) {
       const replies = j.data.replies ?? [];
       const ids = replies.map((x) => bigOf(rpidOf(x)));
       if (ids.some((x) => x == null)) r = { error: `reply/reply 第 ${pn} 页有条目缺 rpid`, unsure: true };
-      else if (ids.some((x, i) => i > 0 && x <= ids[i - 1])) r = { error: `reply/reply 第 ${pn} 页不是按 rpid 递增，定位不了`, unsure: true };
+      else if (ids.some((x, i) => i > 0 && x <= ids[i - 1])) { unordered = true; r = { error: `reply/reply 第 ${pn} 页不是按 rpid 递增，定位不了`, unsure: true, unordered: true }; }
       else r = { replies, ids, count: countOf(j.data?.page?.count), root: j.data?.root ?? null };
     }
     cache.set(pn, r);
     return r;
   };
+  page.sawUnordered = () => unordered;
+  return page;
 }
 
 /** 这一页本身没少给：满页，或者前面各页加本页的条数够得上这次读到的 page.count（隐藏、折叠、少给的页不算）。 */
@@ -135,7 +140,7 @@ async function before(page, pn) {
   return prev.ids?.length === PS ? prev.ids.at(-1) : null;
 }
 
-/** 在楼里按 rpid 找：{ at: { pn, i, node } } / { slot: { pn, i } }（不在，i 是它该在的位置）/ { gone } / { error, unsure? }。 */
+/** 在楼里按 rpid 找：{ at: { pn, i, node } } / { slot: { pn, i } }（不在，i 是它该在的位置）/ { gone } / { error, unsure?, hidden?, unordered? }。 */
 async function seek(page, rpid) {
   const first = await page(1);
   if (!first.ids) return first;
@@ -167,7 +172,7 @@ async function seek(page, rpid) {
   return { slot: { pn: lo, i: 0 } };
 }
 
-// —— 被隐藏的楼中楼：按作品读 UP 主评论管理 ——
+// —— reply/reply 靠不住时（楼中楼被隐藏、rpid 乱序）：按作品读 UP 主评论管理 ——
 // 2026-11-22 登录态只读核过（B站 478358005，两条被隐藏的广告楼中楼）：
 //   x/v2/reply/up/fulllist?bvid=&order=1&filter=-1&type=1&pn=&ps=20 只给这个作品的评论（含楼中楼，新到旧），page.total 是这个作品的条数
 //   （BV1iBsg6sEjz total=21：第 1 页 20 条、第 2 页 1 条；BV1aasw6xEiB total=4）；翻过末尾、或 bvid 不存在时 data.list 是 null。
@@ -239,9 +244,10 @@ async function precheckComment(api, p, me, oid) {
 
   const s = await seek(page, rpid);
   if (s.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${s.code}）`);
-  if (s.hidden) return precheckHidden(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), s.error);
+  const viaWork = async (why) => precheckFromWork(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), why);
+  if (s.hidden || s.unordered) return viaWork(s.error);
   if (s.error) return stop(s.unsure ? 'thread-incomplete' : 'precheck-error', s.error);
-  if (!s.at) return precheckHidden(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), `按 rpid 定位到楼 ${t.rootId} 第 ${s.slot.pn} 页，没有 ${t.commentId}`);
+  if (!s.at) return viaWork(`按 rpid 定位到楼 ${t.rootId} 第 ${s.slot.pn} 页，没有 ${t.commentId}`);
   const node = s.at.node;
   const nodeRoot = String(node.root_str ?? node.root ?? '');
   if (nodeRoot !== String(t.rootId)) return stop('target-not-found', `对上 rpid 的这条属于楼 ${nodeRoot || '（没给）'}，不是楼 ${t.rootId}`);
@@ -254,12 +260,15 @@ async function precheckComment(api, p, me, oid) {
   if (!whole(s.at.pn, here)) return stop('thread-incomplete', `目标所在的第 ${s.at.pn} 页只有 ${here.ids.length} 条，和 page.count=${here.count} 对不上，删了也确认不了，没删`);
   const prev = s.at.i > 0 ? here.ids[s.at.i - 1] : await before(page, s.at.pn);
   const next = s.at.i < here.ids.length - 1 ? here.ids[s.at.i + 1] : await after(page, s.at.pn, here);
+  // 邻居证据要求前后都按 rpid 递增：相邻页乱序，或跨页倒退，都不能用
+  const crossPageBroken = (typeof prev === 'bigint' && prev >= rpid) || (typeof next === 'bigint' && next <= rpid);
+  if (page.sawUnordered() || crossPageBroken) return viaWork(`楼 ${t.rootId} 第 ${s.at.pn} 页附近不是按 rpid 递增，邻居证据用不了`);
   if (prev == null || next == null) return stop('thread-incomplete', `定位到了 ${t.commentId}（第 ${s.at.pn} 页），但读不到它前后的两条，删了也确认不了，没删`);
   return { check: { isRoot: false, rpid, prev, next } };
 }
 
-/** reply/reply 定位不到时，在 fulllist 里找这一条（w 是 scanWork 的结果，why 是 reply/reply 那边的情况）。 */
-function precheckHidden(p, me, oid, rpid, stop, w, why) {
+/** reply/reply 靠不住时，在 fulllist 里找这一条（w 是 scanWork 的结果，why 是 reply/reply 那边的情况）。 */
+function precheckFromWork(p, me, oid, rpid, stop, w, why) {
   const t = p.target;
   if (w.error) return stop(w.unsure ? 'thread-incomplete' : 'precheck-error', `${why}；改查 up/fulllist：${w.error}，没删`);
   const node = w.items.get(String(rpid));
@@ -270,7 +279,7 @@ function precheckHidden(p, me, oid, rpid, stop, w, why) {
   if (!author) return stop('precheck-error', '读不到这条评论的作者');
   if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
   if (t.authorUid != null && String(t.authorUid) !== '' && String(t.authorUid) !== author) return stop('target-not-found', `up/fulllist 里 ${t.commentId} 的作者是 ${author}，不是 ${t.authorUid}`);
-  return { check: { isRoot: false, hidden: true, rpid, before: new Set(w.items.keys()) } };
+  return { check: { isRoot: false, viaWork: true, rpid, before: new Set(w.items.keys()) } };
 }
 
 /** 发后：只回读这一条在不在。{ gone, detail }，gone 只在拿到证据时为 true。 */
@@ -284,8 +293,8 @@ async function readBackComment(api, p, oid, check) {
     if (first.root && rpidOf(first.root) === String(t.commentId)) return { gone: false, detail: '回读时这条还在' };
     return { gone: false, detail: `回读时 reply/reply 给的一楼是 ${first.root ? rpidOf(first.root) : '（没给）'}，确认不了` };
   }
-  if (check.hidden) {
-    // 发前就是在 fulllist 里找到的，reply/reply 本来就看不到它：用同一套读法确认它不在了
+  if (check.viaWork) {
+    // 发前就是在 fulllist 里核对的，reply/reply 看不到它或顺序不可信：用同一套读法确认它不在了
     const w = await scanWork(api, t.workId, oid);
     if (w.error) return { gone: false, detail: `回读 up/fulllist：${w.error}，确认不了` };
     if (w.items.has(String(check.rpid))) return { gone: false, detail: '回读时 up/fulllist 里这条还在' };
