@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { openStudio, PROVIDERS, studioDbPath } from './store.mjs';
 import { readColab, stopColab } from './colab.mjs';
 import { readGemini } from './gemini.mjs';
+import { stableNodeExecPath } from '../ops/node-bin.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 export const EGO_SPACE = 'kinso/google-compute/ultra';
@@ -28,7 +29,7 @@ const EGO_REASON = {
 export function runEgo({ cli = process.env.MAITIAN_COMPUTE_EGO_CLI || path.join(DIR, '..', 'ego-runner', 'cli.mjs'), script = path.join(DIR, 'ego-collect.js'), timeoutMs = EGO_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     let out = '';
-    const p = spawn(process.execPath, [cli, '--space', EGO_SPACE, '--timeout-ms', String(timeoutMs), script], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const p = spawn(stableNodeExecPath(), [cli, '--space', EGO_SPACE, '--timeout-ms', String(timeoutMs), script], { stdio: ['ignore', 'pipe', 'ignore'] });
     const kill = setTimeout(() => p.kill('SIGKILL'), timeoutMs + 60_000);
     p.stdout.on('data', (d) => { out += d; });
     p.on('error', () => { clearTimeout(kill); resolve({ ok: false, status: 'error', error: 'ego-runner 起不来' }); });

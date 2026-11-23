@@ -10,6 +10,7 @@ import { parseArgs } from 'node:util';
 import { openOpsDb } from '../ops/db.mjs';
 import { listAccounts, getAccount, PENDING, PLATFORM_NAMES } from '../ops/accounts.mjs';
 import { opsDbPath, engageLockPath } from '../ops/paths.mjs';
+import { stableNodeExecPath } from '../ops/node-bin.mjs';
 import { defaultNotify } from '../ops/login.mjs';
 import { ingestSnapshot, createJob, startJob, finishJob, getJob, pendingRefreshes, reclaimStaleJobs, recordSyncFailure, recordLoginLost, SYNC_KINDS } from '../ops/engage/store.mjs';
 import { redact } from '../ops/engage/redact.mjs';
@@ -213,7 +214,7 @@ export function makeEngageTicker({ openDb = () => openOpsDb(opsDbPath()), spawnI
       db ??= openDb();
       const d = shouldStartRound(db, { now, lockPath });
       if (!d.start) return { started: false, reason: d.reason };
-      child = spawnImpl(process.execPath, [import.meta.filename, '--once'], { stdio: 'inherit', detached: false });
+      child = spawnImpl(stableNodeExecPath(), [import.meta.filename, '--once'], { stdio: 'inherit', detached: false });
       const t0 = now();
       child.on('exit', (code, signal) => { log(`${localTime(now())} [engage] 抓取轮子进程退出 code=${code ?? signal}，用时 ${Math.round((now() - t0) / 1000)} 秒`); child = null; });
       child.on('error', (e) => { log(`${localTime(now())} [engage] 起抓取轮失败：${redact(e.message)}`); child = null; });

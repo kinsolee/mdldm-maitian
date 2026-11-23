@@ -12,6 +12,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { verifySignature, HOOK_PATH, MAX_BODY_BYTES } from '../openbot/receiver.mjs';
 import { ensureSubscribed } from '../openbot/subscribe.mjs';
 import { childEnv } from '../openbot/forward.mjs';
+import { stableNodeExecPath } from '../../src/ops/node-bin.mjs';
 import { ENV_FILE, enforceEnvPerms, loadEnvFile, readConfig } from './config.mjs';
 import { openInbox, eventProblem } from './store.mjs';
 
@@ -95,7 +96,7 @@ export function mcpListEvents({ mcpServer, opsDb, timeoutMs = MCP_TIMEOUT_MS }) 
   return async (args) => {
     const env = childEnv();
     if (opsDb) env.MAITIAN_OPS_DB = opsDb;
-    const transport = new StdioClientTransport({ command: process.execPath, args: [mcpServer, '--scope', 'read'], env, stderr: 'ignore' });
+    const transport = new StdioClientTransport({ command: stableNodeExecPath(), args: [mcpServer, '--scope', 'read'], env, stderr: 'ignore' });
     const client = new Client({ name: 'cindy-receiver', version: '1' });
     let timer;
     const timeout = new Promise((_, reject) => {

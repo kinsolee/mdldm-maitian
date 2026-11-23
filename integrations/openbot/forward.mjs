@@ -3,6 +3,7 @@
 // 平台用户写的东西（正文、昵称、作品标题）只进数据块；块外没有任何用户内容。
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { stableNodeExecPath } from '../../src/ops/node-bin.mjs';
 
 export const FORWARD_TIMEOUT_MS = 60_000;
 export const DEFAULT_MAX_CHARS = 12_000;
@@ -89,7 +90,7 @@ export const clientMessageId = (key) => `maitian-${key}`;
  * contexts(ids) 返回 Map<事件 id, 上下文>（见 context.mjs 的 opsContextSource），每次投递（含重试）现取。
  * 退出码见 openbot-cli：1 失败或被拒，2 命令行错，3 等人，4 超时，5 连不上 OpenBot 或找不到 bot。
  */
-export function cliForwarder({ cli, agent, timeoutMs = FORWARD_TIMEOUT_MS, node = process.execPath, contexts = () => new Map(), maxChars = DEFAULT_MAX_CHARS }) {
+export function cliForwarder({ cli, agent, timeoutMs = FORWARD_TIMEOUT_MS, node = stableNodeExecPath(), contexts = () => new Map(), maxChars = DEFAULT_MAX_CHARS }) {
   return (ids, key) => new Promise((resolve, reject) => {
     const text = taskText(ids, { contexts: contexts(ids), maxChars });
     const child = spawn(node, [cli, 'run', agent, '-', '--id', clientMessageId(key), '--json'], { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv() });
