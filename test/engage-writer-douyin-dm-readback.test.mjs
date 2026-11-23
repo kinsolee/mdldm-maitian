@@ -38,7 +38,7 @@ describe('抖音私信回读', () => {
     assert.deepEqual(await run(['1']), { found: true, count: 1, nativeId: '2' });
   });
 
-  test('还没确认的本地消息（没有 serverId）不算发出', async () => {
+  test('只有 clientId 的同文消息不算确认', async () => {
     show(new Msg({}));
     const r = await run();
     assert.equal(r.found, false);
@@ -81,6 +81,19 @@ describe('抖音私信回读', () => {
     r = await run();
     assert.equal(r.found, false);
     assert.match(r.detail, /deep=1/);
+  });
+
+  test('content 是对象时正式回读不认，诊断标出 object', async () => {
+    show(new Msg({ serverId: '2', content: { text: TEXT } }));
+    const r = await run();
+    assert.equal(r.found, false);
+    assert.match(r.detail, /deep=0 noid=0 .*hit=cm0,ci1,srv1,object/);
+  });
+
+  test('诊断一直不返回时，3 秒后保留原来的回读结果', async () => {
+    const r = await readBack(page, { items: async () => [], diagnose: () => new Promise(() => {}) },
+      { before: new Set(), toastBefore: new Set(), capFrom: 0, t: { readbackMs: 10 }, text: TEXT });
+    assert.deepEqual(r.readBack, { found: false, count: 0, nativeId: null, detail: '10ms 内没读到我发的这条' });
   });
 
   test('诊断出错不影响回读结论', async () => {

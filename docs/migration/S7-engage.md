@@ -140,15 +140,22 @@ sqlite3 data/ops.db "UPDATE actions SET status = 'failed', reason = 'human-clear
 sqlite3 -readonly data/ops.db "SELECT id, createdAt, json_extract(readBack,'$.detail') FROM actions WHERE platformCode = 'Douyin' AND op = 'sendDM' AND reason = 'readback-missing' ORDER BY createdAt DESC LIMIT 1"
 ```
 
-格式：`诊断v1 msg=全部/本会话/我发的/发送前没有的/正文也相同 deep=A noid=B row=me,srv,new,eq hit=cm,ci,srv,content类型,fs,d`。
+格式：`诊断v1 msg=全部/本会话/我发的/候选新消息/同文候选 deep=A noid=B row=me,srv,new,eq hit=cm,ci,srv,content类型,fs,d`。
+
+口径：这是回读落空后的一次扫描，只能提示下一步查什么，不能证明某条消息就是这次发的。
+
+- 「本会话」包括没有 `conversationId` 的对象。
+- 「候选新消息」和 `new1` 只表示它的 id 不在发送前快照里。快照只收正式回读能识别的消息（fiber 6 层内），所以发送前就存在、当时在更深层的旧消息也可能被算成候选。
+- `msg` 末位是 0 只表示这次扫描没命中，不代表消息没发出。
 
 | 看到的 | 说明 |
 | --- | --- |
-| `msg` 最后一位是 0，`row` 是 `me1,srv1,new1,eq1` | 聊天区 fiber 上没有这条，会话列表的 `lastMessage` 有。回读要改读列表行 |
-| `deep` 大于 0 | 消息在 fiber 第 6 层以上，现有回读只看 6 层 |
-| `noid` 大于 0，`hit` 里 `srv0` | 消息还没拿到服务端确认（`serverId` 为空）。这时不能算发出，要看是确认慢还是发送失败 |
-| `hit` 里 `cm0,ci1,srv1` 且 `deep=0`、`noid=0` | 窗口结束时已经能读到，多半是确认晚于最后一次回读，考虑加长窗口 |
-| `msg` 最后一位和 `row` 的 `eq` 都是 0 | 页面上两处都没有这条，先去平台确认是否真的发出 |
+| `msg` 末位是 0，`row` 是 `me1,srv1,new1,eq1` | 目标会话行的 `lastMessage` 有同文候选，聊天区 fiber 上没有。要另行验证它是否属于这次发送，才能考虑改读列表行 |
+| `deep` 大于 0 | 同文候选在 fiber 第 6 层或更深，正式回读看不到。同样要先排除旧消息 |
+| `noid` 大于 0 | 同文候选既没有 `clientMessageId` 也没有 `serverId`，正式回读会跳过。可能还没拿到服务端确认，这时不能算发出 |
+| `hit` 的 content 类型是 `object` | 诊断能取到正文，正式回读只解析 JSON 字符串，两处解析方式不同。这种情况加长窗口没有用 |
+| `hit` 是 `cm0,ci1,srv1,string` 且 `deep=0`、`noid=0` | 窗口结束时正式回读应该能读到。确认晚于最后一次回读是待验证的原因之一 |
+| `msg` 末位和 `row` 的 `eq` 都是 0 | 这次扫描两处都没命中，先去平台确认是否真的发出 |
 
 另外两张新表：`engage_write_leases`（平台写入租约）和 `engage_write_trips`（自动关能力位的记录，`alertedAt` 是提醒真正发出的时间）。
 
