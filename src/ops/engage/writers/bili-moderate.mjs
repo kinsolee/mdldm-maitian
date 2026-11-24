@@ -3,7 +3,7 @@
 //        （楼已不在 → already-gone；定位不到 → target-not-found；定位不了 → thread-incomplete；作者是我 → self-target；
 //        一楼下面有回复 → deletes-thread，rejected，因为 B站删一楼会连整楼回复一起删）
 //        → x/v2/reply/del 只调一次 → 等 2 秒再定位这一条：楼没了，或这条不在、它原来前后的两条现在挨着，才算 found。
-//        reply/reply 定位不到（第 1 页空、count>0，或楼中楼被隐藏），或读到的页 rpid 乱序（不能二分、邻居证据也不成立）：
+//        发前 reply/reply 返回 12006（一楼和楼中楼均改查作品），或定位不到（第 1 页空、count>0，或楼中楼被隐藏），或读到的页 rpid 乱序（不能二分、邻居证据也不成立）：
 //        目标可能还在 x/v2/reply/up/fulllist 里。
 //        改按作品把 fulllist 读全、找这一条（rpid、作品、楼、作者都对上），删后用同一套读法确认它不在了才算 found；
 //        fulllist 里也没有才报 target-not-found，读不全就不删（thread-incomplete）。
@@ -103,6 +103,7 @@ function threadReader(api, oid, root, goneCodes = GONE_CODES) {
     const j = await api.get(`${API}/x/v2/reply/reply?oid=${oid}&type=1&root=${root}&ps=${PS}&pn=${pn}`);
     let r;
     if (goneCodes.has(j.code)) r = { gone: true, code: j.code };
+    else if (j.code === 12006) r = { notFound: true, error: `reply/reply 第 ${pn} 页 code=12006` };
     else if (j.code !== 0) r = { error: `reply/reply 第 ${pn} 页 code=${j.code} ${j.message ?? ''}`.trim() };
     else if (!Array.isArray(j.data?.replies) && j.data?.replies !== null) r = { error: `reply/reply 第 ${pn} 页缺 data.replies` };
     else {
@@ -130,6 +131,7 @@ async function after(page, pn, p) {
   // 本页不满：本页就是最后一页，但条数要和 page.count 对得上（少给的页不算到底）
   if (p.ids.length < PS) return whole(pn, p) ? END : null;
   const next = await page(pn + 1);
+  if (next.error) return next;
   if (!next.ids) return null;
   // 下一页第 1 条也要来自没少给的页
   if (next.ids.length) return whole(pn + 1, next) ? next.ids[0] : null;
@@ -140,6 +142,7 @@ async function after(page, pn, p) {
 async function before(page, pn) {
   if (pn === 1) return START;
   const prev = await page(pn - 1);
+  if (prev.error) return prev;
   return prev.ids?.length === PS ? prev.ids.at(-1) : null;
 }
 
@@ -227,9 +230,12 @@ async function precheckComment(api, p, me, oid) {
   if (rpid == null) return stop('target-not-found', `评论 id 不对：${t.commentId}`);
   const page = threadReader(api, oid, t.rootId);
 
+  const viaWork = async (why) => precheckFromWork(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), why, page.sawUnordered());
+
   if (String(t.commentId) === String(t.rootId)) {
     // 删一楼：B站会把它下面的整楼回复一起删掉。下面有回复（不管是谁的）就不删
     const first = await page(1);
+    if (first.notFound) return viaWork(first.error);
     if (first.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${first.code}）`);
     if (!first.ids) return stop(first.unsure ? 'thread-incomplete' : 'precheck-error', first.error);
     if (!first.root || rpidOf(first.root) !== String(t.commentId)) return stop('target-not-found', `reply/reply 给的一楼是 ${first.root ? rpidOf(first.root) : '（没给）'}，不是 ${t.commentId}`);
@@ -247,8 +253,7 @@ async function precheckComment(api, p, me, oid) {
 
   const s = await seek(page, rpid);
   if (s.gone) return stop('already-gone', `楼 ${t.rootId} 已不在（code=${s.code}）`);
-  const viaWork = async (why) => precheckFromWork(p, me, oid, rpid, stop, await scanWork(api, t.workId, oid), why, page.sawUnordered());
-  if (s.hidden || s.unordered) return viaWork(s.error);
+  if (s.notFound || s.hidden || s.unordered) return viaWork(s.error);
   if (s.error) return stop(s.unsure ? 'thread-incomplete' : 'precheck-error', s.error);
   if (!s.at) return viaWork(`按 rpid 定位到楼 ${t.rootId} 第 ${s.slot.pn} 页，没有 ${t.commentId}`);
   const node = s.at.node;
@@ -265,6 +270,10 @@ async function precheckComment(api, p, me, oid) {
   const next = s.at.i < here.ids.length - 1 ? here.ids[s.at.i + 1] : await after(page, s.at.pn, here);
   // 邻居证据要求读过的页都按 rpid 递增：页内乱序或跨页倒退都不能用
   if (page.sawUnordered()) return viaWork(`楼 ${t.rootId} 第 ${s.at.pn} 页附近不是按 rpid 递增，邻居证据用不了`);
+  for (const neighbor of [prev, next]) {
+    if (neighbor?.notFound) return viaWork(neighbor.error);
+    if (neighbor?.error) return stop(neighbor.unsure ? 'thread-incomplete' : 'precheck-error', neighbor.error);
+  }
   if (prev == null || next == null) return stop('thread-incomplete', `定位到了 ${t.commentId}（第 ${s.at.pn} 页），但读不到它前后的两条，删了也确认不了，没删`);
   return { check: { isRoot: false, rpid, prev, next } };
 }
@@ -275,14 +284,23 @@ function precheckFromWork(p, me, oid, rpid, stop, w, why, needAuthor = false) {
   if (w.error) return stop(w.unsure ? 'thread-incomplete' : 'precheck-error', `${why}；改查 up/fulllist：${w.error}，没删`);
   const node = w.items.get(String(rpid));
   if (!node) return stop('target-not-found', `${why}；up/fulllist 作品 ${t.workId} 的 ${w.total} 条评论里也没有 ${t.commentId}`);
+  const isRoot = String(t.commentId) === String(t.rootId);
   const nodeRoot = String(node.root_str ?? node.root ?? '');
-  if (nodeRoot !== String(t.rootId)) return stop('target-not-found', `up/fulllist 里的 ${t.commentId} 属于楼 ${nodeRoot || '（没给）'}，不是楼 ${t.rootId}`);
+  if (isRoot && (![0, '0'].includes(node.root) || ![0, '0'].includes(node.parent))) return stop('target-not-found', `up/fulllist 里的 ${t.commentId} 不是一楼`);
+  if (!isRoot && nodeRoot !== String(t.rootId)) return stop('target-not-found', `up/fulllist 里的 ${t.commentId} 属于楼 ${nodeRoot || '（没给）'}，不是楼 ${t.rootId}`);
   const author = midOf(node);
   if (!author) return stop('precheck-error', '读不到这条评论的作者');
   if (isSelf(author, me, p)) return stop('self-target', '这条是我自己的评论，不删');
   if (needAuthor && (t.authorUid == null || String(t.authorUid) === '')) return stop('target-not-found', `${why}；这条没有预期作者，核对不了，没删`);
   if (t.authorUid != null && String(t.authorUid) !== '' && String(t.authorUid) !== author) return stop('target-not-found', `up/fulllist 里 ${t.commentId} 的作者是 ${author}，不是 ${t.authorUid}`);
-  return { check: { isRoot: false, viaWork: true, rpid, before: new Set(w.items.keys()) } };
+  if (isRoot) {
+    const counts = ['rcount', 'count'].filter((key) => Object.hasOwn(node, key)).map((key) => countOf(node[key]));
+    if (counts.some((n) => !Number.isFinite(n))) return stop('thread-incomplete', '一楼的 rcount / count 不是非负整数');
+    const children = [...w.items.values()].filter((x) => x !== node && [x.root, x.parent, x.root_str, x.parent_str].some((id) => String(id) === String(rpid)));
+    const n = Math.max(children.length, ...counts);
+    if (n > 0) return { done: { ...stop('deletes-thread', `${t.commentId} 是一楼，下面有 ${n} 条回复，不删`).done, rejected: true } };
+  }
+  return { check: { viaWork: true, rpid, before: new Set(w.items.keys()) } };
 }
 
 /** 发后：只回读这一条在不在。{ gone, detail }，gone 只在拿到证据时为 true。 */
