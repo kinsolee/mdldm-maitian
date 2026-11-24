@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { openOpsDb } from '../src/ops/db.mjs';
 import { ensureWorksTables } from '../src/ops/works-db.mjs';
 
@@ -43,12 +43,25 @@ function setup({ scenario = {}, closer = true, tools = ['python3', 'lark-cli', '
     MAITIAN_DAILY_NOW: t.now, MAITIAN_DAILY_COLLECT_CMD: path.join(FIX, 'fake-collect.mjs'),
     MAITIAN_DAILY_PATH: `${bin}:/usr/bin:/bin`,
     DAILY_FAKE: t.fake, DAILY_FAKE_LOG: t.log, DAILY_FAKE_DASHBOARD: t.dashboard,
+    ...t.extraEnv,
   });
+  t.extraEnv = {};
   t.cli = (mode, extra = []) => {
     const args = [DAILY, mode, ...(t.closer ? ['--closer', t.closer] : []), ...extra];
     const r = spawnSync(process.execPath, args, { env: t.env(), encoding: 'utf8', input: '{"protocol":"cindy-script/1","type":"start"}\n' });
     return { code: r.status, stdout: r.stdout, stderr: r.stderr };
   };
+  t.cliAsync = (mode, extra = []) => new Promise((resolve) => {
+    const c = spawn(process.execPath, [DAILY, mode, ...(t.closer ? ['--closer', t.closer] : []), ...extra], { env: t.env() });
+    let stdout = '', stderr = '';
+    c.stdout.on('data', (d) => { stdout += d; });
+    c.stderr.on('data', (d) => { stderr += d; });
+    c.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+  t.notesDir = path.join(t.vault, '10.个人IP', '数据', '平台数据', '2026年');
+  t.writeNote = (file, fm) => { fs.mkdirSync(t.notesDir, { recursive: true }); fs.writeFileSync(path.join(t.notesDir, file), `---\n${Object.entries(fm).map(([k, v]) => `${k}: ${v}`).join('\n')}\n---\n`); };
+  /** 每篇笔记今天的抓取记录行数（假收口脚本和 backfill.py 一样，每回填一次追加一行）。 */
+  t.todayRows = () => Object.fromEntries(fs.readdirSync(t.notesDir).map((f) => [f, fs.readFileSync(path.join(t.notesDir, f), 'utf8').split('\n').filter((l) => l.startsWith('| 2026-11-25')).length]));
   t.calls = () => fs.readFileSync(t.log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   t.clearCalls = () => fs.writeFileSync(t.log, '');
   t.syncOk = (platformCode, at) => db.prepare("INSERT INTO sync_jobs (id, platformCode, kind, trigger, status, requestedAt, startedAt, finishedAt) VALUES (?, ?, 'comments', 'schedule', 'ok', ?, ?, ?)")
@@ -119,7 +132,7 @@ describe('新的一天', () => {
     const t = setup();
     t.cli('run');
     const dir = path.join(t.vault, '10.个人IP', '数据', '平台数据', '2026年');
-    for (const id of ['Douyin-1', 'Channels-2']) fs.writeFileSync(path.join(dir, `zz-旧-${id}.md`), `---\ntype: 平台数据\nplatform: 抖音\npost_id: ${id}\nfetched_at: "2026-11-16 09:42"\n---\n`);
+    for (const [id, plat] of [['Douyin-1', '抖音'], ['Channels-2', '视频号']]) fs.writeFileSync(path.join(dir, `zz-旧-${id}.md`), `---\ntype: 平台数据\nplatform: ${plat}\npost_id: ${id}\nfetched_at: "2026-11-16 09:42"\n---\n`);
     t.now = later(T10, 15);
     assert.equal(t.cli('check').code, 2);
   });
@@ -302,5 +315,232 @@ describe('环境和配置', () => {
     t.cli('run');
     t.now = later(T10, 24 * 60);
     assert.equal(t.cli('check').code, 0);
+  });
+});
+
+describe('第 1 轮评审补的边界', () => {
+  test('笔记写到一半退出 3：下一轮只传还没回填的作品，每篇笔记今天恰好一行（B1）', () => {
+    const t = setup({ scenario: { closer: { backfill: 'partial' } } });
+    assert.equal(t.cli('run').code, 1);
+    t.setScenario({});
+    t.now = later(T10, 15);
+    t.clearCalls();
+    assert.equal(t.cli('run').code, 0);
+    assert.equal(closerCalls(t)[0].posts.length, POSTS.length / 2);
+    const rows = t.todayRows();
+    for (const p of POSTS) assert.equal(rows[`${p.postId}.md`], 1, p.postId);
+  });
+
+  test('同平台只缺一篇：只传那一篇（B1）', () => {
+    const t = setup();
+    t.cli('run');
+    t.writeNote('Bili-2.md', { type: '平台数据', platform: '哔哩哔哩', post_id: 'Bili-2', fetched_at: '"2026-11-24 10:00"' });
+    t.now = later(T10, 15);
+    t.clearCalls();
+    assert.equal(t.cli('run').code, 0);
+    assert.deepEqual(closerCalls(t)[0].posts, ['Bili-2']);
+  });
+
+  test('另一轮在跑：并发的第二轮不调用任何东西；死掉进程留下的锁会回收，活着的进程持有的锁再旧也不抢（B2、B15）', async () => {
+    const t = setup({ scenario: { sleepMs: 1500 } });
+    const [a, b] = await Promise.all([t.cliAsync('run'), new Promise((ok) => setTimeout(ok, 300)).then(() => t.cliAsync('run'))]);
+    assert.equal(collectCalls(t).length, 1);
+    assert.equal([a, b].filter((r) => /另一轮还在跑/.test(frame(r.stdout).resultText)).length, 1);
+
+    const t2 = setup();
+    fs.mkdirSync(path.dirname(t2.state), { recursive: true });
+    fs.writeFileSync(`${t2.state}.lock`, JSON.stringify({ pid: 2 ** 22 + 12345, token: 'dead', at: Date.now() }));
+    assert.equal(t2.cli('run').code, 0);
+    assert.equal(collectCalls(t2).length, 1);
+
+    const t3 = setup();
+    fs.mkdirSync(path.dirname(t3.state), { recursive: true });
+    fs.writeFileSync(`${t3.state}.lock`, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() - 60 * 60_000 }));
+    assert.match(frame(t3.cli('run').stdout).resultText, /另一轮还在跑/);
+    assert.equal(t3.cli('check').code, 2);
+    assert.deepEqual(t3.calls(), []);
+    assert.ok(fs.existsSync(`${t3.state}.lock`), '别人的锁不能删');
+  });
+
+  test('四个平台都没登录、没有当天导出：不调用收口脚本，看板不动（B3）', () => {
+    const t = setup({ scenario: { collect: { Douyin: 'out', XiaoHongShu: 'out', Bili: 'out', Channels: 'out' } } });
+    fs.writeFileSync(t.dashboard, 'window.DATA = "旧的"');
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    frame(r.stdout);
+    assert.equal(closerCalls(t).length, 0);
+    assert.equal(fs.readFileSync(t.dashboard, 'utf8'), 'window.DATA = "旧的"');
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 2);
+  });
+
+  test('影子导出结构不对：先重新导出一次；还不对就提醒一次，不调用收口脚本（B4）', () => {
+    const t = setup({ scenario: { exportBroken: true } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    frame(r.stdout);
+    assert.match(r.stderr, /导出/);
+    assert.deepEqual(collectCalls(t).map((c) => c.args[0]), ['collect', 'export', 'export']);
+    assert.equal(closerCalls(t).length, 0);
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 2);
+  });
+
+  test('只采了 1 天的 ok 不算今天采过（导出不收短窗口），会重新按 30 天采（B4）', () => {
+    const t = setup();
+    t.db.prepare("INSERT INTO collect_runs (runId, platformCode, uid, startedAt, finishedAt, result, days) VALUES ('m', 'Bili', 'u', ?, ?, 'ok', 1)").run(T10, T10);
+    t.now = later(T10, 5);
+    t.cli('run');
+    assert.ok(collectCalls(t)[0].args.includes('Bili'));
+  });
+
+  test('第四个平台补采时笔记已经是今天的：照样重跑同步，看板拿到四个平台（B5）', () => {
+    const t = setup({ scenario: { collect: { Channels: 'out' } } });
+    t.cli('run');
+    for (const i of [1, 2]) t.writeNote(`Channels-${i}.md`, { type: '平台数据', platform: '视频号', post_id: `Channels-${i}`, fetched_at: '"2026-11-25 10:20"', daily_fetched_at: '"2026-11-25 10:20"' });
+    t.syncOk('Channels', later(T10, 30));
+    t.setScenario({});
+    t.now = later(T10, 45);
+    t.clearCalls();
+    assert.equal(t.cli('run').code, 0);
+    const [cl] = closerCalls(t);
+    assert.ok(cl, '要调收口脚本同步看板');
+    assert.deepEqual(cl.posts, []);
+    assert.deepEqual(cl.dashboardPlatforms, [...PLATFORMS].sort());
+  });
+
+  test('公众号抓到了但写笔记失败（退出 4）：本轮失败，下一轮重跑公众号（B6）', () => {
+    const t = setup({ scenario: { closer: { mp: 'backfill-fail' } } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /mp_backfill/);
+    t.setScenario({});
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 0);
+    t.clearCalls();
+    assert.equal(t.cli('run').code, 0);
+    assert.ok(!closerCalls(t)[0].args.includes('--skip-mp'));
+  });
+
+  test('收口脚本输出不是 JSON：本轮失败，下一轮重试同步（B7）', () => {
+    const t = setup({ scenario: { closer: { garbage: true } } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    frame(r.stdout);
+    assert.match(r.stderr, /收口脚本/);
+    t.setScenario({});
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 0);
+  });
+
+  test('看板那步被跳过（没有工作台工程）：不算同步成功（B7）', () => {
+    const t = setup({ scenario: { closer: { dashboard: 'skipped' } } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /看板/);
+  });
+
+  test('--retry-waiting 强制重试后仍未登录：照样提醒一次（B9）', () => {
+    const t = setup({ scenario: { collect: { Channels: 'out' } } });
+    t.cli('run');
+    t.now = later(T10, 15);
+    fs.rmSync(t.state);
+    const r = t.cli('run', ['--retry-waiting']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /视频号/);
+  });
+
+  test('评论私信同步的成功早于分日发现未登录：不当成已恢复（B10）', () => {
+    const t = setup({ scenario: { closer: { channels: 'login', syncOkDuringRun: true } } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /视频号/);
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 2);
+  });
+
+  test('采集命令没给每个平台的结果：本轮失败（B11）', () => {
+    const t = setup({ scenario: { collectBroken: true } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    frame(r.stdout);
+    assert.match(r.stderr, /采集/);
+  });
+
+  test('账号表里没有这个平台：提醒一次怎么导入，之后跳过（B11）', () => {
+    const t = setup({ scenario: { collect: { Bili: 'no-account' } } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /accounts import/);
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 2);
+  });
+
+  test('没配置收口脚本时，坏掉的旧导出不挡采集（B12）', () => {
+    const t = setup({ closer: false });
+    fs.mkdirSync(t.shadow, { recursive: true });
+    fs.writeFileSync(path.join(t.shadow, 'posts-20261125.json'), '{坏的');
+    assert.equal(t.cli('check').code, 0);
+    assert.equal(t.cli('run').code, 0);
+    assert.equal(collectCalls(t).length, 1);
+  });
+
+  test('状态目录建不了：退出 1，仍然恰好一个完成帧（B13）', () => {
+    const t = setup();
+    fs.writeFileSync(path.join(t.dir, 'plain'), '');
+    const r = t.cli('run', ['--state', path.join(t.dir, 'plain', 'x', 'daily.json')]);
+    assert.equal(r.code, 1);
+    frame(r.stdout);
+  });
+
+  test('别的平台有同 ID 的笔记：不传给收口脚本（会写错笔记），提醒一次（B14）', () => {
+    const t = setup();
+    t.writeNote('冲突.md', { type: '平台数据', platform: '抖音', post_id: 'Bili-1', fetched_at: '"2026-11-25 09:00"' });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /Bili-1/);
+    assert.ok(!closerCalls(t)[0].posts.includes('Bili-1'));
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 2);
+  });
+
+  test('收口脚本卡住：超时杀掉整棵进程树；笔记写了、同步没做完，下一轮补同步（B15、B16）', () => {
+    const t = setup();
+    const pidFile = path.join(t.dir, 'grandchild.pid');
+    t.setScenario({ closer: { hang: pidFile } });
+    fs.writeFileSync(t.dashboard, 'old');
+    fs.utimesSync(t.dashboard, new Date(T10), new Date(T10));   // 看板今天已经刷过一次
+    t.extraEnv = { MAITIAN_DAILY_CLOSER_TIMEOUT_MS: '800', MAITIAN_DAILY_KILL_GRACE_MS: '300' };
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /超过/);
+    const gpid = Number(fs.readFileSync(pidFile, 'utf8'));
+    assert.throws(() => process.kill(gpid, 0), '孙进程要被杀掉');
+    t.setScenario({});
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 0);
+    t.clearCalls();
+    assert.equal(t.cli('run').code, 0);
+    assert.deepEqual(closerCalls(t)[0].posts, []);
+  });
+
+  test('前置检查跑完输出 CINDY_PRECHECK_OK（N2）；需要负责人的事写在 stderr 最后（N3）', () => {
+    const t = setup({ scenario: { collect: { Channels: 'out' }, closer: { feishu: 'fail' } } });
+    assert.match(t.cli('check').stdout, /CINDY_PRECHECK_OK\s*$/);
+    const r = t.cli('run');
+    assert.match(r.stderr.trim().split('\n').at(-1), /需要你：视频号/);
+  });
+});
+
+describe('零 token（B8）', () => {
+  test('每次调收口脚本都传 --no-llm：看板分析走规则版，不调模型', () => {
+    const t = setup({ scenario: { closer: { feishu: 'fail' } } });
+    t.cli('run');
+    t.setScenario({});
+    t.now = later(T10, 15);
+    t.cli('run');
+    const calls = closerCalls(t);
+    assert.equal(calls.length, 2);
+    for (const c of calls) assert.ok(c.args.includes('--no-llm'), JSON.stringify(c.args));
   });
 });

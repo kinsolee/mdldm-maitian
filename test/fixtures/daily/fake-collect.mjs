@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 const scenario = JSON.parse(fs.readFileSync(process.env.DAILY_FAKE, 'utf8'));
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.DAILY_FAKE_LOG, `${JSON.stringify({ cmd: 'collect', args })}\n`);
+if (scenario.sleepMs) await new Promise((ok) => setTimeout(ok, scenario.sleepMs));
 const now = new Date(process.env.MAITIAN_DAILY_NOW).toISOString();
 const ALL = ['Douyin', 'XiaoHongShu', 'Bili', 'Channels'];
 const [group] = args;
@@ -18,12 +19,14 @@ const day = new Date(Date.parse(now) + 8 * 3600_000).toISOString().slice(0, 10).
 const writeExport = () => {
   const okNow = new Set(db.prepare("SELECT DISTINCT platformCode p FROM collect_runs WHERE result = 'ok'").all().map((r) => r.p));
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, `posts-${day}.json`), JSON.stringify(scenario.posts.filter((p) => okNow.has(p.platform))));
+  const posts = scenario.exportBroken ? { error: '假的导出坏了' } : scenario.posts.filter((p) => okNow.has(p.platform));
+  fs.writeFileSync(path.join(dir, `posts-${day}.json`), JSON.stringify(posts));
   fs.writeFileSync(path.join(dir, `accounts-${day}.json`), JSON.stringify([...okNow].map((p) => ({ uid: p, fans: 1, daily: [] }))));
   for (const k of ['posts', 'accounts']) fs.utimesSync(path.join(dir, `${k}-${day}.json`), new Date(now), new Date(now));   // 测试的时钟是假的，文件时间跟着它
 };
 
 if (group === 'export') { writeExport(); console.log(JSON.stringify({ exitCode: 0 })); process.exit(0); }
+if (scenario.collectBroken) { console.log(JSON.stringify({ error: 'collect failed' })); process.exit(1); }
 
 const platforms = args.filter((a) => !a.startsWith('--') && a !== 'collect');
 const rows = [];
@@ -32,7 +35,7 @@ for (const p of platforms.length ? platforms : ALL) {
   const [result, reason] = r === 'ok' ? ['ok', null] : r === 'out' ? ['out', 'logged-out'] : r === 'failed' ? ['failed', null] : r === 'uid-mismatch' ? ['uid-mismatch', null] : ['skipped', r];
   db.prepare('INSERT INTO collect_runs (runId, platformCode, uid, startedAt, finishedAt, result, reason, days) VALUES (?, ?, ?, ?, ?, ?, ?, 30)')
     .run('fake', p, 'u', now, now, result, reason);
-  rows.push({ id: `${p}:u`, platformCode: p, result, ...(reason ? { reason } : {}), ...(result === 'failed' ? { message: '假的采集失败' } : {}) });
+  rows.push({ id: `${p}:u`, platformCode: p, result, ...(reason ? { reason } : {}), ...(result === 'failed' ? { message: '假的采集失败' } : {}), ...(reason === 'no-account' ? { message: `表里没有 ${p} 的账号，先 hub ops accounts import` } : {}) });
 }
 if (args.includes('--export')) writeExport();
 const exitCode = rows.some((r) => r.result === 'uid-mismatch') ? 2 : rows.every((r) => r.result === 'ok') ? 0 : rows.some((r) => r.result === 'ok') ? 3 : 1;
