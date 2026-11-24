@@ -108,8 +108,9 @@ export function scanNotes(vault) {
 
 /** 当天的影子导出：两份文件都在、都是数组、每条作品有 postId 和四个平台之一，才算可用。 */
 function readExport(postsFile, accountsFile) {
-  const at = Math.min(mtime(postsFile) ?? NaN, mtime(accountsFile) ?? NaN);
+  const at = Math.min(mtime(postsFile) ?? NaN, mtime(accountsFile) ?? NaN);   // 和采集比：较旧的那份
   if (!Number.isFinite(at)) return { missing: true };
+  const newest = Math.max(mtime(postsFile), mtime(accountsFile));               // 和看板比：较新的那份
   const sig = `${mtime(postsFile)}:${mtime(accountsFile)}`;
   const parse = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return { bad: `${path.basename(file)} 不是合法 JSON（${e.message}）` }; } };
   const raw = parse(postsFile), acc = parse(accountsFile);
@@ -118,7 +119,7 @@ function readExport(postsFile, accountsFile) {
   if (!problem && !posts) problem = `${path.basename(postsFile)} 不是作品数组`;
   if (!problem && posts.some((p) => !p || p.postId == null || !LABEL[p.platform])) problem = `${path.basename(postsFile)} 有作品缺 postId 或平台不对`;
   if (!problem && (!Array.isArray(acc) || acc.length === 0)) problem = `${path.basename(accountsFile)} 不是非空的账号数组`;
-  return { at, sig, posts: problem ? [] : posts, problem };
+  return { at, newest, sig, posts: problem ? [] : posts, problem };
 }
 
 const onPath = (cmd, PATH) => PATH.split(':').some((d) => { try { fs.accessSync(path.join(d, cmd), fs.constants.X_OK); return true; } catch { return false; } });
@@ -181,7 +182,7 @@ export function buildPlan(cfg, state, { retryWaiting = false } = {}) {
       // 不合格的导出先重新导出一次；导出过还是这份，就是要人看的问题，提醒一次
       if (state.exportTried === ex.sig) plan.issues.push({ key: `export:${ex.sig}`, status: 'waiting', need: `影子导出不合格：${ex.problem}。跑 hub ops export posts / accounts 看原因` });
       else plan.exportStale = true;
-    } else { plan.exportReady = true; plan.posts = ex.posts; plan.exportAt = ex.at; plan.exportSig = ex.sig; }
+    } else { plan.exportReady = true; plan.posts = ex.posts; plan.exportAt = ex.at; plan.exportNewest = ex.newest; plan.exportSig = ex.sig; }
   }
   plan.exportProblem = ex.problem ?? null;
   plan.exportCheckedSig = ex.sig ?? null;
@@ -222,7 +223,7 @@ export function buildPlan(cfg, state, { retryWaiting = false } = {}) {
 
   // 看板要比今天的导出新；收口脚本跑之前就记下「同步进行中」，拿到成功证据才清掉（中途断了下一轮照样重跑）
   const dash = mtime(cfg.dashboard);
-  const dashFresh = dash != null && dateCn(dash) === today && plan.exportReady && dash >= plan.exportAt;
+  const dashFresh = dash != null && dateCn(dash) === today && plan.exportReady && dash >= plan.exportNewest;
   if (closerState) plan.sync = { status: closerState };
   else plan.sync = { status: dashFresh && !state.syncPending ? 'done' : 'todo', ...(state.syncPending ? { last: '上次同步没做完' } : !dashFresh && dash != null ? { last: '看板比今天的导出旧' } : {}) };
   return plan;
@@ -302,25 +303,29 @@ function saveState(file, state) {
 const lockFile = (cfg) => `${cfg.state}.lock`;
 const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 const readLock = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return e.code === 'ENOENT' ? null : {}; } };
-/** 锁在不在用：主人进程还活着（不论锁多旧，除非超过 LOCK_MAX_MS）。读不出内容的锁刚写一半时也当在用，1 分钟后才算死锁。 */
-function lockLive(file) {
-  const l = readLock(file);
-  if (!l) return false;
-  if (!Number.isInteger(l.pid)) return (Date.now() - (mtime(file) ?? 0)) < 60_000;
-  return pidAlive(l.pid) && Date.now() - (l.at ?? 0) < LOCK_MAX_MS;
+/** 读到的这把锁在不在用：主人进程还活着（不论锁多旧，除非超过 LOCK_MAX_MS）。读不出内容的锁刚写一半时也当在用，1 分钟后才算死锁。 */
+function isLockLive(lock, file) {
+  if (!Number.isInteger(lock.pid)) return (Date.now() - (mtime(file) ?? 0)) < 60_000;
+  return pidAlive(lock.pid) && Date.now() - (lock.at ?? 0) < LOCK_MAX_MS;
 }
-/** 争锁：wx 原子创建。死锁先改名到唯一的名字再核对是不是刚读到的那把，免得两个进程互删对方刚建的锁。拿到返回 token，被占返回 null，其他错误照常抛出。 */
+const lockLive = (file) => { const l = readLock(file); return !!l && isLockLive(l, file); };
+/**
+ * 争锁：wx 原子创建。死锁只读一次，判死后改名到唯一的名字，再核对改名拿到的就是判死的那把（token 相同、仍是死的）；
+ * 不是就放回去算被占，免得两个进程互删对方刚建的活锁。拿到返回 token，被占返回 null，其他错误照常抛出。
+ */
 function takeLock(cfg) {
   const file = lockFile(cfg);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const token = `${process.pid}-${randomUUID()}`;
   for (let i = 0; i < 3; i++) {
     try { fs.writeFileSync(file, JSON.stringify({ pid: process.pid, token, at: Date.now() }), { flag: 'wx' }); return token; } catch (e) { if (e.code !== 'EEXIST') throw e; }
-    if (lockLive(file)) return null;
     const seen = readLock(file);
+    if (!seen) continue;                      // 刚被主人释放：再抢一次
+    if (isLockLive(seen, file)) return null;
     const grave = `${file}.stale-${token}`;
     try { fs.renameSync(file, grave); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
-    if (readLock(grave)?.token !== seen?.token) {   // 改名时拿到的已经是别人刚建的新锁：放回去，算被占
+    const got = readLock(grave);
+    if (!got || got.token !== seen.token || isLockLive(got, grave)) {   // 改名拿到的已经是别人刚建的新锁：放回去，算被占
       try { fs.linkSync(grave, file); } catch { /* 第三个进程又建了锁，同样算被占 */ }
       fs.rmSync(grave, { force: true });
       return null;
@@ -373,6 +378,10 @@ async function runOnce(cfg) {
   const errors = [], progress = [];
   const childEnv = { ...process.env, PATH: cfg.childPath };
   const replan = () => buildPlan(cfg, state);
+  if (cfg.retryWaiting) {   // 手动强制重试的等待项：清掉「已提醒」，重试后还不行照样提醒一次
+    const p0 = buildPlan(cfg, state);
+    for (const u of [...Object.values(p0.collect), p0.channels, p0.mp]) if (u?.key && u.status === 'waiting') delete state.notified?.[u.key];
+  }
   let plan = buildPlan(cfg, state, { retryWaiting: cfg.retryWaiting });
   if (!doable(plan, state)) {
     return { ok: true, text: isComplete(plan) ? `今天的数据流程已做完，没有要做的。${plan.closer ? '' : '回填未配置。'}` : `本轮没有要做的，还在等：${waitingText(plan)}` };
@@ -393,7 +402,9 @@ async function runOnce(cfg) {
         else if (row.result === 'failed') errors.push(`${l}采集失败：${short(row.message ?? '原因不明')}`);
         else if (row.result === 'skipped' && ['busy', 'user-controlled'].includes(row.reason)) progress.push(`${l}这轮没采（${row.reason === 'busy' ? '空间被评论私信同步占着' : '负责人正在操作'}），下一轮再试`);
       }
-      for (const e of ['posts', 'accounts']) { const x = r.json.export?.[e]; if (x && x.exitCode === 1) errors.push(`导出 ${e} 不合格：${short(x.message ?? (x.problems ?? []).join('；'))}`); }
+      // 没有平台能导出时（库里 26 小时内没有采满 30 天的 ok、本轮又都是瞬时跳过）导出也是 exitCode 1：那不是错。本轮有平台采成功、要回填时才算
+      const exportMatters = plan.closer && rows.some((x) => x.result === 'ok');
+      for (const e of ['posts', 'accounts']) { const x = r.json.export?.[e]; if (exportMatters && x && x.exitCode === 1) errors.push(`导出 ${e} 不合格：${short(x.message ?? (x.problems ?? []).join('；'))}`); }
     }
     plan = replan();
   }
@@ -452,11 +463,12 @@ async function runOnce(cfg) {
       const syncErr = take(SYNC_ERR_RE);
       const dashSkipped = s.dashboard?.refresh?.skipped;
       const dash = mtime(cfg.dashboard);
+      const rest = errs.filter((e) => !attributed.has(e));
       if (syncErr.length) errors.push(...syncErr.map((e) => `飞书和看板同步失败：${short(e)}`));
       else if (dashSkipped) errors.push(`看板没刷新：${short(dashSkipped)}`);
-      else if (!(dash != null && dateCn(dash) === today && dash >= plan.exportAt)) errors.push('收口脚本说成功，但看板 data.js 没有更新');
+      else if (!(dash != null && dateCn(dash) === today && dash >= plan.exportNewest)) errors.push('收口脚本说成功，但看板 data.js 没有更新');
+      else if (rest.length || (r.code === 4 && !errs.length)) { /* 有说不清是哪一步的错：同步保持待做，下一轮重跑 */ }
       else { delete state.syncPending; progress.push('飞书和看板已同步'); }
-      const rest = errs.filter((e) => !attributed.has(e));
       errors.push(...rest.map((e) => `收口脚本报错：${short(e)}`));
       if (r.code === 4 && !errs.length) errors.push('收口脚本退出码 4，但没说哪一步失败');
     }

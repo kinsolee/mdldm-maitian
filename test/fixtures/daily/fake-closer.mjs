@@ -82,6 +82,7 @@ function finish() {
   else if (c.dashboard === 'skipped') dashboard = { refresh: { skipped: '没有工作台工程' } };
   else { fs.writeFileSync(dash, `window.DATA = ${JSON.stringify([...new Set(dashPosts.map((p) => p.platform))].sort())};\n`); fs.utimesSync(dash, now, now); }
 
+  if (c.extraError) errors.push(c.extraError);   // 说不清是哪一步的错
   const status = errors.length ? 4 : 0;
   if (c.garbage) { console.log('Traceback (most recent call last): 不是 JSON'); process.exit(4); }
   console.log(JSON.stringify({ ok: status === 0, exit_code: status, backfill: { created: [], updated_count: posts.length }, channels_daily: channels, mp, feishu, dashboard, errors }, null, 1));

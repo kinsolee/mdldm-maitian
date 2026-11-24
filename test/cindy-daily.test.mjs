@@ -544,3 +544,48 @@ describe('零 token（B8）', () => {
     for (const c of calls) assert.ok(c.args.includes('--no-llm'), JSON.stringify(c.args));
   });
 });
+
+describe('第 2 轮评审补的边界', () => {
+  test('库里没有可导出的平台、本轮都是瞬时跳过：导出 exitCode 1 不算失败，带不带收口脚本都一样（R2-B2）', () => {
+    for (const closer of [true, false]) {
+      const t = setup({ closer, scenario: { collect: { Douyin: 'busy', XiaoHongShu: 'busy', Bili: 'user-controlled', Channels: 'busy' } } });
+      const r = t.cli('run');
+      assert.equal(r.code, 0, r.stderr);
+      assert.doesNotMatch(frame(r.stdout).resultText, /导出/);
+      assert.equal(closerCalls(t).length, 0);
+    }
+  });
+
+  test('当天已提醒过，手动 --retry-waiting 重试仍未登录：再提醒一次（R2-N1）', () => {
+    const t = setup({ scenario: { collect: { Channels: 'out' } } });
+    assert.equal(t.cli('run').code, 1);
+    t.now = later(T10, 15);
+    const r = t.cli('run', ['--retry-waiting']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr.trim().split('\n').at(-1), /需要你：视频号/);
+    t.now = later(T10, 30);
+    assert.equal(t.cli('check').code, 2);
+  });
+
+  test('收口脚本报了说不清是哪一步的错：同步保持待做，下一轮重跑（R2-N2）', () => {
+    const t = setup({ scenario: { closer: { extraError: '某个新步骤: 假的出错' } } });
+    const r = t.cli('run');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /某个新步骤/);
+    t.setScenario({});
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 0);
+    t.clearCalls();
+    assert.equal(t.cli('run').code, 0);
+    assert.equal(closerCalls(t).length, 1);
+  });
+
+  test('只有一份导出比看板新：看板也要重刷（R2-N3）', () => {
+    const t = setup();
+    assert.equal(t.cli('run').code, 0);
+    const acc = path.join(t.shadow, 'accounts-20261125.json');
+    fs.utimesSync(acc, new Date(later(T10, 5)), new Date(later(T10, 5)));
+    t.now = later(T10, 15);
+    assert.equal(t.cli('check').code, 0);
+  });
+});
