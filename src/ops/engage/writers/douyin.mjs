@@ -16,7 +16,8 @@
 // 不点赞、不置顶、不删除、不调页面 Context 上的写函数。
 import { EXPAND_SRC, switchTo } from '../adapters/douyin.mjs';
 import { bigJson, capCount, clickMarked, sleep } from '../adapters/page-lib.mjs';
-import { runApiReply, douyinApi } from './api-reply.mjs';
+import { runApiWrite, douyinApi } from './api-reply.mjs';
+import { douyinDmApi } from './api-dm.mjs';
 import { capturedJson, findObjects, inPage, mark, markSel, norm, runWrite, sendNearBox, waitFor } from './page-write-lib.mjs';
 
 export const FILE = 'douyin.mjs';
@@ -27,9 +28,10 @@ export const PAGES = {
 // maxPickerPages：「选择作品」作品列表最多翻几页（每页 20 个）；maxCommentPages：一楼最多加载几页（每页 10 条）
 export const LIMITS = { maxExpand: 25, maxPickerPages: 10, maxCommentPages: 30 };
 
-// S9：writeVia='api'（能力位 writeViaApi）时回复评论走页面内接口，见 ./api-reply.mjs；私信照旧用页面写法
+// S9：writeVia='api' 时走页面内接口：回复评论看能力位 writeViaApi（./api-reply.mjs），发私信看 writeDmViaApi（./api-dm.mjs），两个各自开关
 export function runInSpace(task, params) {
-  if (params.writeVia === 'api' && params.op === 'reply') return runApiReply(task, params, { api: douyinApi, hook: true, url, login });
+  if (params.writeVia === 'api' && params.op === 'reply') return runApiWrite(task, params, { api: douyinApi, hook: true, url, login });
+  if (params.writeVia === 'api' && params.op === 'sendDM') return runApiWrite(task, params, { api: douyinDmApi, hook: false, url, login });
   return runWrite(task, params, { hook: true, url, login, prepareReply, prepareDM });
 }
 

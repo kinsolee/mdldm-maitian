@@ -5,8 +5,9 @@ import fs from 'node:fs';
 export const PENDING = 'pending';
 export const DEFAULT_PROFILE = 'Profile 5';
 // readViaApi / writeViaApi（S9）：评论读、回复评论改用页面内接口（调页面自己的接口封装函数），默认关；关着时走 DOM 路径。
-// 它们只选「怎么读、怎么写」，不授权：回复照样要 reply 打开。连续失败自动关写能力位时不动它们（reply 关了就写不了）。
-export const CAPABILITIES = ['readWorks', 'readComments', 'readDM', 'reply', 'sendDM', 'likeComment', 'pinComment', 'deleteComment', 'block', 'deleteConversation', 'setVisibility', 'publish', 'readViaApi', 'writeViaApi'];
+// writeDmViaApi：抖音发私信改用页面内接口（调私信页自己的 IM SDK 发送函数），和 writeViaApi 分开开关、分开回撤。
+// 它们只选「怎么读、怎么写」，不授权：回复照样要 reply 打开、私信要 sendDM 打开。连续失败自动关写能力位时不动它们（reply、sendDM 关了就写不了）。
+export const CAPABILITIES = ['readWorks', 'readComments', 'readDM', 'reply', 'sendDM', 'likeComment', 'pinComment', 'deleteComment', 'block', 'deleteConversation', 'setVisibility', 'publish', 'readViaApi', 'writeViaApi', 'writeDmViaApi'];
 export const PLATFORM_NAMES = { Douyin: '抖音', Channels: '视频号', XiaoHongShu: '小红书', Bili: 'B站', GongZhongHao: '公众号', Weibo: '微博', X: 'X', YouTube: 'YouTube', Instagram: 'Instagram', Zhishi: '知识站' };
 
 /** uid 统一写法：去首尾空白和前导 @（X 的 handle）。空的返回 null。导入、set-uid、迁移、检测比对都用它。 */

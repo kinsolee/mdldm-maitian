@@ -13,7 +13,7 @@
 // 不点 .like-action、不置顶、不删除。
 import { FEEDS_SRC, SESSIONS_SRC } from '../adapters/channels.mjs';
 import { clickMarked, sleep } from '../adapters/page-lib.mjs';
-import { runApiReply, channelsApi } from './api-reply.mjs';
+import { runApiWrite, channelsApi } from './api-reply.mjs';
 import { inPage, mark, markSel, runWrite, sendNearBox, waitFor } from './page-write-lib.mjs';
 
 export const FILE = 'channels.mjs';
@@ -25,7 +25,7 @@ export const LIMITS = { maxExpand: 15, maxScroll: 6 };
 
 // S9：writeVia='api'（能力位 writeViaApi）时回复评论走页面内接口，见 ./api-reply.mjs；私信照旧用页面写法
 export function runInSpace(task, params) {
-  if (params.writeVia === 'api' && params.op === 'reply') return runApiReply(task, params, { api: channelsApi, hook: false, url, login });
+  if (params.writeVia === 'api' && params.op === 'reply') return runApiWrite(task, params, { api: channelsApi, hook: false, url, login });
   return runWrite(task, params, { hook: false, url, login, prepareReply, prepareDM });
 }
 

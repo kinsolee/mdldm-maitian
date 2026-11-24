@@ -1,4 +1,4 @@
-// S9：回复评论走页面内接口（账号能力位 writeViaApi 打开时 params.writeVia = 'api'；私信不走这里，照旧用页面写法）。
+// S9：回复评论走页面内接口（账号能力位 writeViaApi 打开时 params.writeVia = 'api'）。抖音私信的接口写法在 ./api-dm.mjs，也用这里的 runApiWrite。
 // 调的是页面自己的接口封装函数（见 ../inpage-api.mjs），签名、鉴权头、风控 SDK 由页面自己加。接口路径和参数只从页面代码里读来，
 // 没有为了抓写请求点过发送（docs/migration/S9-in-page-api.md）。
 //   抖音：awemeV1CommentMultiPublish({ aweme_id, text, reply_to_comment_ids: 目标 cid, channel_id: 618 })
@@ -63,6 +63,9 @@ const chRepliesTo = (c, s) => (s.target === s.rootId ? isRootTarget(c.replyComme
 
 export const douyinApi = {
   platform: 'Douyin',
+  op: 'reply',
+  cap: 'writeViaApi',
+  service: '页面自己的评论服务',
   async precheck({ call, params, me }) {
     const t = params.target ?? {};
     const target = String(t.commentId), rootId = String(t.rootId ?? t.commentId), awemeId = String(t.workId);
@@ -151,6 +154,9 @@ export async function channelsExportId(page, workId, deps) {
 
 export const channelsApi = {
   platform: 'Channels',
+  op: 'reply',
+  cap: 'writeViaApi',
+  service: '页面自己的评论服务',
   async precheck({ call, page, params, me, deps }) {
     const t = params.target ?? {};
     const target = String(t.commentId), rootId = String(t.rootId ?? t.commentId), workId = String(t.workId);
@@ -190,9 +196,12 @@ export const channelsApi = {
 /**
  * 发送 + 回读（不碰页面，只用 call）。导出给测试用假接口跑。
  * 返回 { readBack: { found, count, nativeId, detail } }：回读要恰好 1 条，并且发送接口认得、返回的 id 就是它，found 才是 true。
+ * send 返回 notSent（页面确定还没调发送函数就停下了）时不回读，返回 { notSent: detail }。
+ * api.quietIds：detail 里不写消息 id（私信诊断只要固定格式）。
  */
 export async function sendAndReadBack(api, ctx, state, { readbackMs = DEFAULT_TIMEOUTS.readbackMs, stepMs = 2500, sleep = realSleep } = {}) {
   const sent = await api.send(ctx, state);
+  if (!sent.ok && sent.notSent) return { notSent: sent.detail ?? '页面没调发送函数' };
   let got = null;
   for (const end = Date.now() + readbackMs; ;) {
     await sleep(stepMs);
@@ -202,15 +211,18 @@ export async function sendAndReadBack(api, ctx, state, { readbackMs = DEFAULT_TI
   const items = got.items ?? [];
   const count = items.length;
   const found = sent.ok && count === 1 && items[0] === sent.nativeId;
-  const detail = !sent.ok ? sent.detail : got.items == null ? got.detail : count === 1 && !found ? `回读到的 ${items[0]} 不是发送接口返回的 ${sent.nativeId}` : null;
+  const detail = !sent.ok ? sent.detail : got.items == null ? got.detail : count === 1 && !found ? (api.quietIds ? `${got.detail ?? ''} idMatch=0`.trim() : `回读到的 ${items[0]} 不是发送接口返回的 ${sent.nativeId}`) : got.detail ?? null;
   return { readBack: { found, count, nativeId: sent.ok ? sent.nativeId : items.length === 1 ? items[0] : null, ...(detail ? { detail } : {}) } };
 }
 
-/** 写入脚本入口（writers/douyin.mjs、writers/channels.mjs 的 runInSpace 在 writeVia='api' 且 op='reply' 时转到这里）。plat：{ api, url, login, hook }。 */
-export async function runApiReply(task, params, plat, deps = {}) {
+/**
+ * 写入脚本入口（writers/douyin.mjs、writers/channels.mjs 的 runInSpace 在 writeVia='api' 时转到这里）。plat：{ api, url, login, hook }。
+ * api：{ platform, op, cap, service, caller?, precheck, send, fresh }；caller 不给时用 serviceCaller（按方法名找 webpack 模块）。
+ */
+export async function runApiWrite(task, params, plat, deps = {}) {
   const t = { ...DEFAULT_TIMEOUTS, ...(params.timeouts ?? {}) };
   const out = { uidSeen: null, sendAttempted: false, via: 'api' };
-  if (params.op !== 'reply') return { ...out, blocked: 'precheck-error', detail: `页面内接口只做回复评论：${params.op}` };
+  if (params.op !== plat.api.op) return { ...out, blocked: 'precheck-error', detail: `这个页面内接口写法只做 ${plat.api.op}：${params.op}` };
   if (!norm(params.text).trim()) return { ...out, blocked: 'precheck-error', detail: 'text 为空' };
   try {
     const page = await mainPage(task);
@@ -224,16 +236,19 @@ export async function runApiReply(task, params, plat, deps = {}) {
     out.uidSeen = who.uid == null || who.uid === '' ? null : String(who.uid);
     if (!out.uidSeen) return { ...out, blocked: 'no-uid', detail: redact(who.detail ?? '页面上没读到当前登录账号的 uid') };
     if (out.uidSeen !== String(params.uid).trim()) return { ...out, blocked: 'uid-mismatch', detail: `页面登录的是 ${out.uidSeen}，要用的账号是 ${params.uid}` };
-    const call = await (deps.serviceCaller ?? serviceCaller)(page, plat.api.platform, { waitMs: Math.min(t.loadMs, 60000) });
-    if (!call) return { ...out, blocked: 'cannot-send', detail: '页面自己的评论服务没找到（页面可能改版了），没发。可以关掉 writeViaApi 改回页面写法' };
+    const call = await (deps.serviceCaller ?? plat.api.caller ?? serviceCaller)(page, plat.api.platform, { waitMs: Math.min(t.loadMs, 60000) });
+    if (!call) return { ...out, blocked: 'cannot-send', detail: `${plat.api.service}没找到（页面可能改版了），没发。可以关掉 ${plat.api.cap} 改回页面写法` };
     const ctx = { call, page, params, me: who, uuid: deps.uuid ?? randomUUID, deps };
     const pre = await plat.api.precheck(ctx);
     if (pre.blocked) return { ...out, blocked: pre.blocked, ...(pre.detail ? { detail: redact(pre.detail) } : {}) };
     out.sendAttempted = true;
-    const { readBack } = await sendAndReadBack(plat.api, ctx, pre.state, { readbackMs: t.readbackMs, ...(deps.sleep ? { sleep: deps.sleep } : {}) });
+    const { readBack, notSent } = await sendAndReadBack(plat.api, ctx, pre.state, { readbackMs: t.readbackMs, ...(deps.sleep ? { sleep: deps.sleep } : {}) });
+    // 页面确定没调发送函数（服务、会话在发送前一刻没了，建消息出错）：按没发处理，不锁目标
+    if (notSent) return { ...out, sendAttempted: false, blocked: 'cannot-send', detail: redact(notSent) };
     return { ...out, readBack: { ...readBack, ...(readBack.detail ? { detail: redact(readBack.detail) } : {}) } };
   } catch (e) {
-    if (out.sendAttempted) return { ...out, readBack: { found: false, count: 0, nativeId: null, detail: redact(`发送后出错：${e?.message ?? e}`) } };
-    return { ...out, blocked: 'precheck-error', detail: redact(`发送前出错：${e?.message ?? e}`) };
+    // quietIds（私信）：异常原文可能带正文，只写固定阶段
+    if (out.sendAttempted) return { ...out, readBack: { found: false, count: 0, nativeId: null, detail: plat.api.quietIds ? '发送后出错（脚本异常）' : redact(`发送后出错：${e?.message ?? e}`) } };
+    return { ...out, blocked: 'precheck-error', detail: plat.api.quietIds ? '发送前出错（脚本异常）' : redact(`发送前出错：${e?.message ?? e}`) };
   }
 }
