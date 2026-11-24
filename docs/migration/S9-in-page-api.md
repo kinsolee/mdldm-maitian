@@ -9,7 +9,7 @@
 | 平台 | 读评论 | 读私信 | 回评论 | 发私信 |
 |---|---|---|---|---|
 | B站 | 接口（原来就是） | 接口（原来就是） | 接口（原来就是） | 接口（原来就是） |
-| 抖音 | **页面内接口（可选）**：页面评论服务 `awemeV1CommentListSelect` / `awemeV1CommentListReply` | DOM（IM SDK 的 fiber） | **页面内接口（可选）**：页面评论服务 `awemeV1CommentMultiPublish` | DOM |
+| 抖音 | **页面内接口（可选）**：页面评论服务 `awemeV1CommentListSelect` / `awemeV1CommentListReply` | DOM（IM SDK 的 fiber） | **页面内接口（可选）**：页面评论服务 `awemeV1CommentMultiPublish` | **页面内接口（可选）**：私信页的 `sendMessageWithAuth`，回读用 IM SDK 的 `getMessagesByConversation` |
 | 视频号 | **页面内接口（可选）**：沙箱 iframe 里的评论服务 `getCommentList` | DOM（Vue 组件数据） | **页面内接口（可选）**：同一个服务的 `createComment` | DOM |
 | 小红书 | 不变（抄页面自己的响应） | 不变 | 不变（DOM） | 不变（DOM） |
 
@@ -17,22 +17,26 @@
 
 ## 2. 开关
 
-账号能力位里新加两个，默认都是 `false`：
+账号能力位里新加三个，默认都是 `false`：
 
 | 能力位 | 打开后 |
 |---|---|
 | `readViaApi` | 抖音、视频号的评论采集改成调页面服务，不再点作品、不点展开。私信不变 |
-| `writeViaApi` | 抖音、视频号的 `reply_comment` 改成调页面服务。`send_dm` 不变 |
+| `writeViaApi` | 抖音、视频号的 `reply_comment` 改成调页面服务。`send_dm` 不受它影响 |
+| `writeDmViaApi` | 抖音的 `send_dm` 改成调私信页自己的发送函数。`reply_comment` 不受它影响 |
 
 ```sh
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 readViaApi true
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi true   # 只有负责人同意首次真发时才开，见第 7 节
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi false  # 关回页面写法
+node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi true   # 私信，只有负责人同意首次真发时才开，见第 7 节
+node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi false  # 私信关回页面写法
 ```
 
-- 这两个能力位只选择读写的方法，本身不授权写入：回复评论仍然要打开 `reply`。连续 2 轮失败自动关写能力位时，`reply` 会被关掉，所以 `writeViaApi` 不用另外关。
-- 小红书、B站开了也没有影响。
-- 页面服务找不到时（例如页面改版）：读退回 DOM 路径，原始数据里写 `apiFallback`；写不发送，返回 `failed` / `cannot-send`，不算写入失败。
+- 这三个能力位只选择读写的方法，本身不授权写入：回复评论仍然要打开 `reply`，私信仍然要打开 `sendDM`。连续 2 轮失败自动关写能力位时，`reply`、`sendDM` 会被关掉，所以 `writeViaApi`、`writeDmViaApi` 不用另外关。
+- 回复评论和私信分开开关：出问题时只回撤出问题的那一个。
+- 小红书、B站开了也没有影响；视频号开 `writeDmViaApi` 也没有影响。
+- 页面服务找不到时（例如页面改版）：读退回 DOM 路径，原始数据里写 `apiFallback`；写（回复评论、私信）不发送，返回 `failed` / `cannot-send`，不算写入失败，也不退回 DOM。
 
 ## 3. 怎么找到页面服务
 
@@ -62,6 +66,21 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi false  # �
 - 旧路径 `/aweme/v1/creator/comment/list/select/`、`/aweme/v1/creator/comment/list/reply/` 返回 HTTP 200、`status_code=0`，但 `status_msg` 是 `url doesn't match`，并且**没有 `comments`**。所以「`status_code=0` 但没有列表」要按出错处理，代码里已经这样处理。
 - 作品列表不用主动请求：页面打开时自己会发 `GET /aweme/v1/creator/item/list?cursor=&aid=2906&msToken&a_bogus`，照旧抄这个响应。
 - 页面评论服务能拿到（只看了 `typeof`，没有调写函数）：`awemeV1WebCommentDigg`、`awemeV1CommentPublish`、`awemeV1CommentMultiPublish`、`awemeV1CommentListSelect`、`awemeV1CommentListReply`、`awemeV1CommentMultiDelete`。
+
+### 抖音私信（2026-11-24，没有主动请求）
+
+只读了私信页的 webpack 模块源码（`String(模块函数)`），看了 React Context 上字段的 `typeof`。没有调发送函数、没有调读写接口、没有点会话、没有往编辑框打字。
+
+- 私信页是 Garfish 子应用 `douyin_creator_data`，chunk 在 `Garfish.activeApps[*].global.webpackChunkdouyin_creator_data`。用的是新版 PC IM SDK（`createPcIM`，Context 上 `isNewIMSDK = true`），SDK 核心类和旧版是同一个模块。
+- 聊天区的 React Context（从 `li.semi-list-item` 的 fiber 往上约 36 层）上有：`bytedIM`（IM SDK 实例，被页面用 Proxy 包了一层）、`sendMessageWithAuth`、`reportAction`、`conversationList`、`strangerConversationList`、`conversation` 等。`createMessage` 字段是 `undefined`。
+- 编辑框按回车或点「发送」时，页面这样调：
+  1. `checkIMPermisstion(is_confer_login)`：只有代运营登录才去查代运营权限，本人登录直接通过。
+  2. `bytedIM.createMessage({ type: 7, content: JSON.stringify({ text, aweType: 774 }), conversation })`：只在本地建消息（`flightStatus = Created`）。`type` 7 是 `MessageType.TEXT`。
+  3. `reportAction({ conversationId, messageClientId, content, actionParams: {}, msgType })`：不等它返回。
+  4. `sendMessageWithAuth({ message, isRetry: false })`：先 `IdentitySecurityToken.getIdentitySecurityToken({ scene: "im_send_msg" })`，把 `identity_security_token` 等加到发送头（`updateSendMessageHeaders`），再 `bytedIM.sendMessage({ message })`。取 token 超时时不发，返回 `undefined`，并提示「系统繁忙」。
+  5. 成功的判断：`success === true`，并且 `body.status` 缺失或为 0。SDK 在 `status = 0` 时把 `server_message_id` 写进 `message.serverId`。`status` 的含义：1 不在会话里，2 会话校验没过，3 消息校验没过，4 消息校验没过但自己可见。
+- SDK 的 `sendMessage` 内部用会话的 `ticket` 拼 protobuf 请求（`SendMessage`），走 `imapi.douyin.com`。这些都在 SDK 里，**Node 里不拼 protobuf、不拼签名**。
+- 拉消息：`bytedIM.getMessagesByConversation({ conversation, cursor, direction, limit })` → `{ messages, hasMore, cursor }`。`direction` 的取值：1 是 `OLDER`，2 是 `NEWER`，3 是 `FROM_LATEST`。页面自己翻历史时用 `OLDER` 加游标。我们发前重读、发后回读都用 `FROM_LATEST` 拉最新 20 条。
 
 ### 视频号（主动读请求共 1 次）
 
@@ -100,10 +119,9 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi false  # �
   - 地址：`POST .../comment/create_comment`；
   - 成功的判断：`errCode=0` 并且有 `data.comment`。`data.baseResp.errcode=-4300` 表示要验证手机。
 - 私信：
-  - 视频号的发送服务是 `/private-msg/send-private-msg`，但入参没摸清；
-  - 抖音私信走 IM 长连接（`/v1/message/send`，protobuf）；
-  - 小红书见上一节。
-  - 这三个都继续用 DOM。
+  - 抖音：调私信页 Context 上的 `sendMessageWithAuth`，流程见第 4 节「抖音私信」。代码在 `src/ops/engage/writers/api-dm.mjs`，能力位 `writeDmViaApi`。
+  - 视频号的发送服务是 `/private-msg/send-private-msg`，但入参没摸清，继续用 DOM；
+  - 小红书见上一节，继续用 DOM。
 
 ## 6. 护栏
 
@@ -121,6 +139,14 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi false  # �
 - 返回不是第 5 节写的成功形状（包括调用抛错），**一律不当成功也不当失败**：不设 `sendError`，框架记 `needs_readback`。发后回读到了也一样。
 - 发后回读：恰好 1 条新的、我发的、正文一样，并且就是发送接口返回的那个 id，才算回读到，记 `sent`。
 
+抖音私信的接口写法（`src/ops/engage/writers/api-dm.mjs`）和上面一样，只是发前重读、发后回读换成拉会话消息：
+
+- 会话不在私信列表里，返回 `target-not-found`；群聊返回 `cannot-send`；正文超过编辑框上限 500 字，返回 `text-too-long`。
+- 发前用 `FROM_LATEST` 拉最新 20 条。最后一句是我说的，返回 `last-is-me`。拉到的消息里没有会话本地记着的最后一条文字消息，说明拉到的不是最新一页，返回 `precheck-error`，不发。
+- 发送照页面的顺序调一次（建消息、上报、`sendMessageWithAuth`），绝不重试。抛错、返回 `undefined`、`success` 不是 true、`body.status` 不是 0，都交给框架记 `needs_readback`。
+- 发后回读再拉一次最新 20 条，只数发前快照里没有的、我发的、正文一样的消息，并且要是发送返回的那个服务端 id。
+- 诊断写在 `readBack.detail`，格式见 S7 第 7 节「抖音私信接口写法首次真发」。只有接口名、返回码、条数、耗时，不带 cookie、token、正文。DOM 写法的 `dmDiagnose` 不变。
+
 ## 7. 首次真发验收（每个平台第一次都要负责人当次同意）
 
 和 S7 第 7 节一样，下面只写接口写法要多做的。以抖音为例，视频号把账号 id 换成 `Channels:<uid>`：
@@ -133,9 +159,13 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeViaApi false  # �
 6. 用同一个 key 再调一次，应该返回 `duplicate`。
 7. 返回 `needs_readback` 时：先去平台上看，关掉 `writeViaApi`，查明原因前不开下一个平台。
 
+抖音私信（`writeDmViaApi`）的首次真发步骤和回撤命令写在 S7 第 7 节「抖音私信接口写法首次真发」。
+
 ## 8. 没验证的
 
 - **所有真实写入都没验证。** 抖音 `multi_publish`、视频号 `create_comment` 的请求和响应只从代码里读到，没有在线上调用过。
+- 抖音私信：`sendMessageWithAuth` 和 `getMessagesByConversation` 都只从代码里读到，一次都没调过，包括读。`FROM_LATEST` 拉最新一页这件事也没在线上跑过：如果方向不对，发前重读的自检会按 `precheck-error` 拦下，不会发出去。
+- 抖音私信：页面在发送前会记录用户操作（`recordAction`，点击、按键），发送时上报（`reportAction`）。接口写法没有点击和按键，风控会不会因此判异常，要靠首次真发和之后的观察。本人登录时页面的代运营权限检查（`checkIMPermisstion`）直接通过，所以接口写法不调它；代运营登录的账号不要开 `writeDmViaApi`。
 - 抖音读评论只核对了 1 个作品的一楼（1 页）和 1 栋楼的楼中楼（1 页）。一楼翻页（`cursor`）、楼中楼翻页没有在真实页面上跑过。
 - 视频号只核对了 1 个作品的一楼第 1 页。一楼续页、楼中楼续页（`rootCommentId`）没在真实页面上跑过。
 - 主动调接口的频率能不能被风控识别，要靠第 7 节第 1 步的只读试跑来观察。

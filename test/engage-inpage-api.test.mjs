@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { locateService, callInPage, countOf, SERVICES } from '../src/ops/engage/inpage-api.mjs';
 import * as dy from '../src/ops/engage/adapters/douyin.mjs';
 import * as ch from '../src/ops/engage/adapters/channels.mjs';
-import { douyinApi, channelsApi, sendAndReadBack, runApiReply } from '../src/ops/engage/writers/api-reply.mjs';
+import { douyinApi, channelsApi, sendAndReadBack, runApiWrite } from '../src/ops/engage/writers/api-reply.mjs';
 import { collect } from '../src/ops/engage/adapters/index.mjs';
 
 const T = Date.UTC(2026, 10, 21, 2, 0) / 1000;
@@ -224,15 +224,15 @@ describe('评审第 1 轮回归：翻页标志缺失、游标停滞、重复、�
     assert.equal(pre2.blocked, 'target-not-found');
   });
 
-  test('runApiReply：发送、回读抛错都返回 sendAttempted:true、没有 sendError；重读抛错是 precheck-error', async () => {
+  test('runApiWrite：发送、回读抛错都返回 sendAttempted:true、没有 sendError；重读抛错是 precheck-error', async () => {
     const page = { cdp: async () => ({}), goto: async () => {}, url: async () => 'https://x.test/a', evaluate: async () => true };
     const task = { pages: async () => [page] };
     const base = { op: 'reply', uid: ME, text: '谢谢', target: {}, timeouts: { readbackMs: 0 } };
     const plat = (api) => ({ api, hook: false, url: () => 'https://x.test/a', login: async () => ({ uid: ME }) });
     const deps = { serviceCaller: async () => async () => ({ ok: true, data: {} }), sleep: noSleep };
-    const r = await runApiReply(task, base, plat({ platform: 'Douyin', precheck: async () => ({ state: {} }), send: async () => { throw new Error('boom'); }, fresh: async () => ({ items: [] }) }), deps);
+    const r = await runApiWrite(task, base, plat({ platform: 'Douyin', op: 'reply', precheck: async () => ({ state: {} }), send: async () => { throw new Error('boom'); }, fresh: async () => ({ items: [] }) }), deps);
     assert.deepEqual([r.sendAttempted, r.readBack.found, 'sendError' in r], [true, false, false]);
-    const r2 = await runApiReply(task, base, plat({ platform: 'Douyin', precheck: async () => { throw new Error('读坏了'); } }), deps);
+    const r2 = await runApiWrite(task, base, plat({ platform: 'Douyin', op: 'reply', precheck: async () => { throw new Error('读坏了'); } }), deps);
     assert.deepEqual([r2.sendAttempted, r2.blocked], [false, 'precheck-error']);
   });
 });
@@ -423,7 +423,7 @@ describe('视频号：接口回复评论', () => {
   });
 });
 
-describe('runApiReply 和开关', () => {
+describe('runApiWrite 和开关', () => {
   function fakeTask({ uid = ME } = {}) {
     const page = { cdp: async () => ({}), goto: async () => {}, url: async () => 'https://creator.douyin.com/x', evaluate: async () => true };
     return { task: { pages: async () => [page] }, plat: (api) => ({ api, hook: true, url: () => 'https://creator.douyin.com/x', login: async () => ({ uid }) }) };
@@ -431,17 +431,17 @@ describe('runApiReply 和开关', () => {
 
   test('页面服务找不到：cannot-send，没尝试发送；账号不符：uid-mismatch', async () => {
     const { task, plat } = fakeTask();
-    const r = await runApiReply(task, { op: 'reply', uid: ME, text: '谢谢', target: {} }, plat(douyinApi), { serviceCaller: async () => null });
+    const r = await runApiWrite(task, { op: 'reply', uid: ME, text: '谢谢', target: {} }, plat(douyinApi), { serviceCaller: async () => null });
     assert.deepEqual([r.blocked, r.sendAttempted], ['cannot-send', false]);
     const other = fakeTask({ uid: 'other' });
-    const r2 = await runApiReply(other.task, { op: 'reply', uid: ME, text: '谢谢', target: {} }, other.plat(douyinApi), { serviceCaller: async () => null });
+    const r2 = await runApiWrite(other.task, { op: 'reply', uid: ME, text: '谢谢', target: {} }, other.plat(douyinApi), { serviceCaller: async () => null });
     assert.equal(r2.blocked, 'uid-mismatch');
   });
 
   test('整条走通：sendAttempted、回读结果原样交给框架', async () => {
     const { task, plat } = fakeTask();
     const f = fakeDouyin(dyWorld());
-    const r = await runApiReply(task, { op: 'reply', uid: ME, text: '谢谢支持', target: { commentId: 'r1', rootId: 'r1', workId: 'w1' }, timeouts: { readbackMs: 0, settleMs: 0 } },
+    const r = await runApiWrite(task, { op: 'reply', uid: ME, text: '谢谢支持', target: { commentId: 'r1', rootId: 'r1', workId: 'w1' }, timeouts: { readbackMs: 0, settleMs: 0 } },
       plat(douyinApi), { serviceCaller: async () => f.call, sleep: noSleep });
     assert.deepEqual([r.sendAttempted, r.readBack.found, r.via, 'sendError' in r], [true, true, 'api', false]);
   });

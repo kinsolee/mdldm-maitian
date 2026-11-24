@@ -354,8 +354,10 @@ export async function engageWrite(db, input, deps = {}) {
   const { account, actionId } = start;
   let r;
   try {
+    // 写法：回复评论看 writeViaApi，发私信看 writeDmViaApi，各自开关、各自回撤
+    const viaCap = req.op === 'sendDM' ? 'writeDmViaApi' : 'writeViaApi';
     const params = { op: req.op, uid: String(account.uid), nickname: account.nickname ?? null, text: req.text, target: start.target,
-      writeVia: account.capabilities.writeViaApi === true ? 'api' : 'dom' };
+      writeVia: account.capabilities[viaCap] === true ? 'api' : 'dom' };
     if (req.spec.family === 'moderate') { delete params.text; params.selfUids = selfUids(db, req.platformCode); }
     r = await runWriter({ account, params });
   } catch (e) { r = { ok: false, reason: 'threw', error: e?.message ?? String(e) }; }

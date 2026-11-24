@@ -8,6 +8,9 @@ import { getAccount, setCapability } from '../src/ops/accounts.mjs';
 import { ingestSnapshot } from '../src/ops/engage/store.mjs';
 import { engageWrite, ROUND_LIMIT, LEASE_TABLE, roundKeyOf } from '../src/ops/engage/write.mjs';
 import { freshDb, tmpDbFile, comment, conv, T0, MIN } from './helpers/engage-fixtures.mjs';
+import { runApiWrite } from '../src/ops/engage/writers/api-reply.mjs';
+import { douyinDmApi } from '../src/ops/engage/writers/api-dm.mjs';
+import { dmWorld } from './helpers/douyin-dm-world.mjs';
 
 const BILI = 'Bili:478358005';
 const HOUR = 60 * MIN;
@@ -628,5 +631,100 @@ describe('S9：writeViaApi', () => {
     const again = await engageWrite(s.db, { op: 'reply', targetId: 'Bili:r1', text: '谢谢', idempotencyKey: 'k-api-1', caller: 'test-bot' }, s.deps(w));
     assert.equal(again.status, 'needs_readback');
     assert.equal(w.calls.length, 2);
+  });
+});
+
+describe('writeDmViaApi：发私信的页面内接口写法', () => {
+  // 真的跑 runApiWrite + douyinDmApi，页面内接口换成假的（不起 runner、不碰页面）
+  const apiWriter = (world, { found = true } = {}) => {
+    const page = { cdp: async () => ({}), goto: async () => {}, url: async () => 'https://creator.douyin.com/x', evaluate: async () => true };
+    const plat = { api: douyinDmApi, hook: false, url: () => 'https://creator.douyin.com/x', login: async () => ({ uid: '478358005' }) };
+    const fn = async ({ params }) => {
+      fn.calls.push(params);
+      const r = await runApiWrite({ pages: async () => [page] }, { ...params, timeouts: { readbackMs: 0, settleMs: 0 } }, plat, { serviceCaller: async () => (found ? world.call : null), sleep: async () => {} });
+      return { ok: true, result: r };
+    };
+    fn.calls = [];
+    return fn;
+  };
+
+  test('能力位分开：writeViaApi 只管回复评论，writeDmViaApi 只管发私信', async () => {
+    const s = setup();
+    const w = fakeWriter(SENT);
+    setCapability(s.db, BILI, 'writeViaApi', true);
+    await engageWrite(s.db, dm(), s.deps(w));
+    await engageWrite(s.db, reply(), s.deps(w));
+    assert.deepEqual(w.calls.map((c) => c.params.writeVia), ['dom', 'api']);
+    setCapability(s.db, BILI, 'writeViaApi', false);
+    setCapability(s.db, BILI, 'writeDmViaApi', true);
+    await engageWrite(s.db, dm({ targetId: 'Bili:c2', idempotencyKey: 'k-dm-2' }), s.deps(w));   // c2 最后一句是我：库里就拦了，没调 writer
+    s.db.prepare("UPDATE conversations SET lastBy = 'peer' WHERE id = 'Bili:c2'").run();
+    await engageWrite(s.db, dm({ targetId: 'Bili:c2', idempotencyKey: 'k-dm-3' }), s.deps(w));
+    await engageWrite(s.db, reply({ targetId: 'Bili:r1', idempotencyKey: 'k-r-2' }), s.deps(w));
+    assert.deepEqual(w.calls.map((c) => [c.params.op, c.params.writeVia]).slice(2), [['sendDM', 'api'], ['reply', 'dom']]);
+  });
+
+  test('发送成功、回读到 → sent；同一个 key 再来 → duplicate，页面内接口零调用', async () => {
+    const s = setup();
+    setCapability(s.db, BILI, 'writeDmViaApi', true);
+    const world = dmWorld();
+    const w = apiWriter(world);
+    const r = await engageWrite(s.db, dm(), s.deps(w));
+    assert.deepEqual([r.status, r.readBack.found, r.readBack.nativeId], ['sent', true, 's-new']);
+    assert.equal(world.count('send'), 1);
+    const n = world.calls.length;
+    const again = await engageWrite(s.db, dm(), s.deps(w));
+    assert.equal(again.status, 'duplicate');
+    assert.deepEqual([w.calls.length, world.calls.length], [1, n]);
+  });
+
+  test('回读没找到 → needs_readback；同 key、换 key 都不再发', async () => {
+    const s = setup();
+    setCapability(s.db, BILI, 'writeDmViaApi', true);
+    const world = dmWorld({ send: 'silent' });
+    const w = apiWriter(world);
+    const r = await engageWrite(s.db, dm(), s.deps(w));
+    assert.deepEqual([r.status, r.reason, r.sendAttempted], ['needs_readback', 'readback-missing', true]);
+    assert.match(r.readBack.detail, /诊断api v1/);
+    const same = await engageWrite(s.db, dm(), s.deps(w));
+    const other = await engageWrite(s.db, dm({ idempotencyKey: 'k-dm-other' }), s.deps(w));
+    assert.deepEqual([same.status, other.status, other.reason], ['needs_readback', 'needs_readback', 'target-needs-readback']);
+    assert.equal(w.calls.length, 1);
+    assert.equal(world.count('send'), 1);
+  });
+
+  test('发送接口报错、返回码不认识 → needs_readback（不是 failed），不重试', async () => {
+    for (const send of ['throw', 'rejected', 'undefined']) {
+      const s = setup();
+      setCapability(s.db, BILI, 'writeDmViaApi', true);
+      const world = dmWorld({ send });
+      const w = apiWriter(world);
+      const r = await engageWrite(s.db, dm(), s.deps(w));
+      assert.deepEqual([r.status, r.sendAttempted], ['needs_readback', true], send);
+      await engageWrite(s.db, dm(), s.deps(w));
+      assert.deepEqual([w.calls.length, world.count('send')], [1, 1], send);
+    }
+  });
+
+  test('页面私信服务找不到 → failed cannot-send、没尝试发送，不退回页面写法', async () => {
+    const s = setup();
+    setCapability(s.db, BILI, 'writeDmViaApi', true);
+    const world = dmWorld();
+    const r = await engageWrite(s.db, dm(), s.deps(apiWriter(world, { found: false })));
+    assert.deepEqual([r.status, r.reason, r.sendAttempted], ['failed', 'cannot-send', false]);
+    assert.equal(world.calls.length, 0);
+  });
+
+  test('连续 2 轮失败自动关 sendDM（writeDmViaApi 不用另外关）', async () => {
+    const s = setup();
+    setCapability(s.db, BILI, 'writeDmViaApi', true);
+    const w = apiWriter(dmWorld({ send: 'throw' }));
+    await engageWrite(s.db, dm(), s.deps(w));
+    s.tick(HOUR);
+    s.db.prepare("UPDATE conversations SET lastAt = '2026-11-19T05:00:00.000Z' WHERE id = 'Bili:c3'").run();
+    s.db.prepare("UPDATE conversations SET canSend = 1 WHERE id = 'Bili:c3'").run();
+    const r = await engageWrite(s.db, dm({ targetId: 'Bili:c3', idempotencyKey: 'k-dm-c3' }), s.deps(apiWriter(dmWorld({ send: 'throw' }))));
+    assert.equal(r.writeDisabled, true);
+    assert.equal(getAccount(s.db, BILI).capabilities.sendDM, false);
   });
 });

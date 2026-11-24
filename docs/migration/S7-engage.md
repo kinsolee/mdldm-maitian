@@ -174,7 +174,14 @@ sqlite3 data/ops.db "SELECT id, createdAt, op, targetId, status, reason, sendAtt
 | 视频号 | 页面：`textarea.create-input`（在 wujie shadowRoot 里，只认挂在目标 `.comment-item` 里的那个）；发送是同一个 `.comment-create-content` 里 `.create-ft` 下文字为「评论」、class 不带 `disabled` 的 `.tag-wrap` | 页面：`textarea.edit_area` | 评论：2026-11-21 在真实评论页上核对过回复入口、回复框、发送按钮（填一个占位字看它从 disabled 变可点，随即清空，没点）和回读用的 `replyCommentId`；还没真发过。私信只在本地测试页上验证过 |
 | 小红书 | 页面：`textarea.comment-input` | 页面：`div.xhs-im-input-bar-editor` | 只在本地测试页上验证过 |
 
-抖音、视频号的回复评论另有页面内接口写法（调页面自己的接口封装函数，不点按钮），用能力位 `writeViaApi` 打开，默认关，见 [S9-in-page-api.md](S9-in-page-api.md)。
+页面内接口写法（调页面自己的函数，不点按钮、不往框里打字）按能力位选用，默认都关，见 [S9-in-page-api.md](S9-in-page-api.md)：
+
+| 能力位 | 管哪个操作 | 平台 |
+|---|---|---|
+| `writeViaApi` | `reply_comment` | 抖音、视频号 |
+| `writeDmViaApi` | `send_dm` | 抖音 |
+
+两个能力位各自开关、各自回撤，互不影响。它们只选写法，本身不授权：回复仍要 `reply`，私信仍要 `sendDM`。
 
 页面平台用 `Input.insertText` 填写。填完先读回输入框，内容和要发的不一致就清空，返回 `input-mismatch`，不点发送。各平台怎么找目标评论、怎么判断已经回复过、怎么回读，写在 `src/ops/engage/writers/<平台>.mjs` 文件头的注释里。
 
@@ -226,9 +233,41 @@ B站的 csrf（cookie `bili_jct`）只在页面里读取、只在页面里填进
 7. 之后观察 24 小时：没有重复回复，每次写入的 `readBack.found` 都是 `true`。用第 4 节的 SQL 查。
 8. 结果写进 PR 或 Linear（脱敏：昵称、正文都不写）。
 
-B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的流程。页面平台第一次真发时，负责人最好在旁边看着 Ego 里那个 space 的页面。如果返回 `needs_readback`，先去平台上人工确认，查明原因前不要打开下一个平台。
+B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的流程。抖音私信的页面内接口写法（`writeDmViaApi`）另见下面「抖音私信接口写法首次真发」。页面平台第一次真发时，负责人最好在旁边看着 Ego 里那个 space 的页面。如果返回 `needs_readback`，先去平台上人工确认，查明原因前不要打开下一个平台。
 
 关掉写入：`node src/hub.mjs ops accounts set-cap <账号 id> reply false`（`sendDM` 同理）。连续 2 轮失败时会自动关掉，并发飞书提醒。
+
+### 抖音私信接口写法首次真发
+
+只在负责人当次同意后做。步骤和上面相同，下面只写多出来的：
+
+1. 负责人同意本次真发，并指定会话。最好是负责人自己用小号发来私信的会话，**最后一句要是对方说的**。
+2. 打开能力位。负责人在 Ego 里看着 `kinso/Douyin/106707338905` 这个 space 的私信页：
+
+   ```sh
+   node src/hub.mjs ops accounts set-cap Douyin:106707338905 sendDM true
+   node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi true
+   ```
+
+3. 回评官调一次 `send_dm({ conversationId, text, idempotencyKey })`。应该返回 `status: "sent"`、`readBack.found: true`、`readBack.count: 1`，`readBack.nativeId` 不为空。
+4. 在抖音私信页确认：消息只有一条，在正确的会话里，对方能看到（用小号看），页面没有弹安全验证，也没有「消息发送失败」提示。
+5. 用同一个 key 再调一次，应该返回 `duplicate`。
+6. 查 actions 表。`readBack.detail` 里有 `诊断api v1`，记着发送返回码和拉消息的条数：
+
+   ```sh
+   sqlite3 -readonly data/ops.db "SELECT id, createdAt, status, reason, json_extract(readBack,'$.detail') FROM actions WHERE platformCode = 'Douyin' AND op = 'sendDM' ORDER BY createdAt DESC LIMIT 5"
+   ```
+
+   格式：`send=s<成功>,st<statusCode>,b<body.status>,ck<checkCode>,fs<flightStatus>,id<有没有服务端 id>,<毫秒>ms pull=getMessagesByConversation n=<拉到>/<新的>/<我发的>/<同文>,<毫秒>ms`。没有正文、id、cookie、token。
+7. 之后观察：每次 `readBack.found` 都要是 `true`。守护进程 stderr 里出现「页面自己的私信服务（IM SDK）没找到」、`precheck-error`，或者 actions 表里出现 `needs_readback`，马上回撤。
+
+回撤（关掉接口写法，私信回到页面写法）：
+
+```sh
+node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi false
+```
+
+要连私信一起停：再执行 `set-cap Douyin:106707338905 sendDM false`。`needs_readback` 的记录按第 4 节「人工处理 needs_readback」处理。连续 2 轮失败自动关的是 `sendDM`，`writeDmViaApi` 不会被自动关：查明原因前要先手动关掉它，再重新打开 `sendDM`。
 
 ## 8. 处置：删评论、拉黑、删私信会话
 

@@ -73,7 +73,7 @@ describe('账号表与导入', () => {
     const db = freshDb();
     const a = getAccount(db, 'Bili:478358005');
     for (const c of CAPABILITIES) assert.equal(a.capabilities[c], false, c);
-    assert.equal(CAPABILITIES.length, 14);   // S9 加了 readViaApi、writeViaApi
+    assert.equal(CAPABILITIES.length, 15);   // S9 加了 readViaApi、writeViaApi，之后加了 writeDmViaApi
     assert.throws(() => requireCapability(db, 'Bili:478358005', 'reply'), /Bili:478358005.*reply/);
     setCapability(db, 'Bili:478358005', 'reply', true);
     assert.doesNotThrow(() => requireCapability(db, 'Bili:478358005', 'reply'));
