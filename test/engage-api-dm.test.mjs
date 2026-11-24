@@ -108,6 +108,26 @@ describe('抖音私信接口写法：发送和回读', () => {
     assert.match(r.readBack.detail, /cov1,top0/);
   });
 
+  test('边界后另有一条我发的文字消息正文读不出来 → 不算回读到；之后补成同文 → count 2；已知的非文字消息不挡', async () => {
+    const mk = (extra) => { const w = dmWorld(); const base = w.call; w.call = async (m, a) => { const r = await base(m, a); if (m === 'send') w.msgs.push({ sid: '901', mine: true, text: extra.text, idx: String(BigInt(w.msgs.at(-1).idx) + 1n), type: extra.type }); return r; }; return w; };
+    const a = await run(mk({ text: null, type: 7 }));
+    assert.deepEqual([a.readBack.found], [false]);
+    assert.match(a.readBack.detail, /unsure/);
+    const b = await run(mk({ text: null, type: null }));
+    assert.equal(b.readBack.found, false);
+    const c = await run(mk({ text: TEXT, type: 7 }));
+    assert.deepEqual([c.readBack.found, c.readBack.count], [false, 2]);
+    const d = await run(mk({ text: null, type: 27 }));
+    assert.deepEqual([d.readBack.found, d.readBack.count], [true, 1]);   // 已知是图片（type 27）：不是同文候选，不挡
+  });
+
+  test('回读正文和发送原文不严格相等（少了零宽连接符）→ 不算回读到', async () => {
+    const text = '👩\u200d💻 资料发你了';
+    const w = dmWorld({ pullAfter: (msgs) => [...msgs.slice(0, -1), { ...msgs.at(-1), text: text.replace('\u200d', '') }] });
+    const r = await run(w, params({ text }));
+    assert.deepEqual([r.readBack.found, r.readBack.count], [false, 0]);
+  });
+
   test('会话序号超过 2^53 时照常按大整数比较', async () => {
     const r = await run(dmWorld({ msgs: [peerMsg('101', '9007199254740993')] }));
     assert.deepEqual([r.readBack.found, r.readBack.count], [true, 1]);
@@ -307,7 +327,7 @@ describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', ()
     const { calls, conv } = page();
     const r = await dmInPage({ method: 'pull', args: { conversationId: conv.id, limit: 20 } });
     assert.deepEqual(calls[0][1], { conversation: conv, direction: 3, limit: 20 });
-    assert.deepEqual(r.msgs, [{ sid: '7001', mine: false, text: '在吗', idx: '12' }]);
+    assert.deepEqual(r.msgs, [{ sid: '7001', mine: false, text: '在吗', idx: '12', type: 7 }]);
     assert.equal(r.conv.last.sid, '7001');
   });
 

@@ -18,7 +18,6 @@
 // 页面明确还没调 sendMessageWithAuth 就停下的（服务没了、会话没了、建消息出错），返回 notSent，记 cannot-send，不锁目标。
 // 诊断只有固定的接口名、阶段、数字返回码、条数、耗时，不带异常原文（可能含正文）、cookie、token。
 import { idOf } from '../inpage-api.mjs';
-import { norm } from './page-write-lib.mjs';
 
 export const DM_LIMITS = { pull: 20, maxText: 500 };
 
@@ -81,7 +80,8 @@ export async function dmInPage({ method, args = {} }) {
     const msgs = r.messages.filter((m) => m && (m.conversationId == null || String(m.conversationId) === String(conv.id))).map((m) => {
       let text = null;
       try { text = (typeof m.content === 'string' ? JSON.parse(m.content) : m.content)?.text ?? null; } catch { text = null; }
-      return { sid: sidOf(m.serverId), mine: typeof m.isFromMe === 'boolean' ? m.isFromMe : null, text: typeof text === 'string' ? text : null, idx: idxOf(m.indexInConversation) };
+      return { sid: sidOf(m.serverId), mine: typeof m.isFromMe === 'boolean' ? m.isFromMe : null, text: typeof text === 'string' ? text : null, idx: idxOf(m.indexInConversation),
+        type: typeof m.type === 'number' && Number.isInteger(m.type) ? m.type : null };
     });
     // 会话摘要在拉完之后取：SDK 处理拉到的消息时会更新会话的最后一条
     return { ok: true, conv: summary(), msgs, total: r.messages.length, ms: Date.now() - t0 };
@@ -194,12 +194,15 @@ export const douyinDmApi = {
     const covered = p.msgs.some((m) => m.idx != null && big(m.idx) <= b);
     const top = latestOf(p);
     const newer = p.msgs.filter((m) => m.idx != null && big(m.idx) > b), mine = newer.filter((m) => m.mine === true);
-    const eq = mine.filter((m) => m.text != null && norm(m.text) === norm(params.text));
+    // 正文按原文严格相等比（接口能拿到 content.text，不用 DOM 编辑器的 norm，免得零宽连接符一类的差异被抹掉）
+    const want = String(params.text);
+    const eq = mine.filter((m) => m.text === want);
     const detail = `${head(s)} pull=getMessagesByConversation n=${p.msgs.length}/${newer.length}/${mine.length}/${eq.length},cov${+covered},top${+top.ok},${p.ms ?? '-'}ms`;
     // 两头都要证实：这一页覆盖到发送前的边界（没漏中间），也拉到了最新端（拉完时会话的最后一条在页里、是序号最大的）
     if (!covered || !top.ok) return { items: null, detail };
     // 有序号缺失、或边界后有看不出是谁发的消息：分不清，确认不了「恰好 1 条」
-    if (p.msgs.some((m) => m.idx == null) || newer.some((m) => m.mine === null)) return { items: null, detail: `${detail},unsure` };
+    // 边界后我发的文字消息（或类型不明的）正文读不出来：它是不是同文不知道，确认不了「恰好 1 条」
+    if (p.msgs.some((m) => m.idx == null) || newer.some((m) => m.mine === null) || mine.some((m) => m.text == null && (m.type == null || m.type === 7))) return { items: null, detail: `${detail},unsure` };
     return { items: [...new Set(eq.map((m) => m.sid ?? `idx:${m.idx}`))], detail };
   },
 };
