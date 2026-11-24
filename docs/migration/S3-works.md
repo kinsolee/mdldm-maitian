@@ -5,7 +5,7 @@
 ## 命令
 
 ```sh
-hub ops collect [--days N] [platform ...] [--export] [--json]   # 默认 30 天、四个平台；--export 采完接着导出 posts 和 accounts（每天定时用）
+hub ops collect [--days N] [platform ...] [--export] [--json]   # 默认 30 天、四个平台；--export 采完接着导出 posts 和 accounts（每日定时见下面「定时」）
 hub ops export posts    [--out 目录] [--date YYYYMMDD] [--max-age-hours N] [--json]
 hub ops export accounts [--out 目录] [--date YYYYMMDD] [--max-age-hours N] [--json]
 python3 scripts/ops-export-check.py --posts <文件> --accounts <文件>       # 按下游读法检查导出文件（只读，两个参数至少给一个）
@@ -56,6 +56,71 @@ platform 只收 `Douyin`、`XiaoHongShu`、`Bili`、`Channels`。其他平台直
 | 3 | 有平台没导出（过期或从没成功过），文件照写 |
 | 1 | 一个平台都没有，或有记录不合格：**不写文件**（refresh.py 取最新一份，写残缺或空文件会把看板清空） |
 
+## 定时
+
+每天的采集和回填由 Cindy 的一个脚本自动化驱动（2026-11-24 负责人确认，取代迁移记录里「定时抓取由常驻守护进程负责」的写法；守护进程不改）。它不启动 agent，不消耗模型额度。命令是 `integrations/cindy/daily.mjs`，自己不采也不写数据，只调用 `hub ops collect --export` 和库外的收口脚本 `~/.hermes/scripts/content-data-daily.sh`。
+
+```sh
+node integrations/cindy/daily.mjs check  --closer ~/.hermes/scripts/content-data-daily.sh   # 前置检查：exit 0 有事可做，exit 2 跳过本轮，exit 1 出错
+node integrations/cindy/daily.mjs run    --closer ~/.hermes/scripts/content-data-daily.sh   # 把今天能做的做完
+node integrations/cindy/daily.mjs status --closer ~/.hermes/scripts/content-data-daily.sh [--json]   # 只读：今天每一步的情况
+node integrations/cindy/daily.mjs plan   --closer ~/.hermes/scripts/content-data-daily.sh [--json]   # 只读预演：下一次 run 会做什么
+```
+
+不传 `--closer`（也没有 `MAITIAN_DAILY_CLOSER`）时只做采集，摘要写「回填未配置」。
+
+### 每一步「今天做没做」
+
+都从数据本身判断，手动跑过、中途断了重跑、同一天触发多次都不会多写一行。
+
+| 步骤 | 判据 |
+|---|---|
+| 采集（按平台） | `collect_runs` 里今天（东八区）有这个平台的 `ok` |
+| 笔记回填（按平台） | 今天影子导出里这个平台的每条作品，对应数据笔记的 `fetched_at` 都是今天 |
+| 视频号分日 | 有视频号数据笔记的 `daily_fetched_at` 是今天 |
+| 公众号阅读 | 有公众号数据笔记的 `fetched_at` 是今天 |
+| 飞书和看板 | 看板的 `data.js` 今天改过，且上一轮同步没失败 |
+
+上一轮失败的步骤和已经提醒过的事记在状态文件里（默认 `integrations/cindy/data/daily-state.json`，按天重置），下一轮重试到成功为止。
+
+### 一轮 run 做什么
+
+1. 采集今天还没成功的平台：`collect --export --json <平台...>`。`busy`、`user-controlled` 本轮不重试，交给下一轮；评论私信同步正占着某个平台（`sync_jobs` 里 30 分钟内的 `running`）时，前置检查先不放行这个平台。
+2. 影子导出比采集旧（例如手动跑过不带 `--export` 的采集）时重新导出。
+3. 调一次收口脚本：`--posts` 只放今天还没回填的平台的作品（backfill.py 每跑一次就给每条作品的笔记追加一行，不幂等）；`--dashboard-posts` 给今天完整的 `posts-YYYYMMDD.json`，看板始终是四个平台；视频号分日、公众号阅读做完了就加 `--skip-channels`、`--skip-mp`；飞书每次都同步（按键去重，重复跑不多行）；`--source 麦田`。
+
+### 等负责人和通知
+
+- 平台未登录、UID 不符、Ego 里缺 profile、UID 没登记：当天第一次发现的那一轮以失败结束，摘要写明是哪个平台、要做什么。之后前置检查跳过这个平台，直到守护进程的评论私信同步在那次失败之后又成功过（说明已经重新扫码），下一轮自动补上。视频号分日和视频号采集用同一个登录。
+- 公众号后台未登录：提醒一次，之后最多每小时探一次（真跑一轮收口脚本的公众号那步）。还没登录时这一轮不再算失败，但 Cindy 每一次真正运行都会按开关通知。
+- 收口脚本某一步失败、采集 `failed`：这一轮失败，摘要写原因，下一轮只重试没做完的步骤。
+- 子进程的 PATH 里找不到 `python3`、`lark-cli`、`ego-browser`，或收口脚本不存在：失败一次，写明缺什么。
+- 当天的事全部做完的那一轮成功一次；做完之后前置检查一直跳过。
+
+### Cindy 里的自动化
+
+项目配置文件 `integrations/cindy/project/.cindy/automations/schedules.json` 导入不了脚本模式：Cindy 的导入（`scheduleConfigToCreateInput`）不读 `executionMode` 和 `scriptConfig`，写进去会被当成 agent 任务导入、按 prompt 启动 agent。所以这条自动化不写进项目配置，用 Cindy 的接口或界面手动建，参数如下：
+
+| 字段 | 值 |
+|---|---|
+| 名称 | 麦田每日数据流程 |
+| 运行方式 | 脚本（`executionMode: "script"`），能力白名单为空 |
+| 工作目录 | `/Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/cindy/project`（项目工作区） |
+| 时间 | `*/15 10-22 * * *`，时区 `Asia/Taipei`（10:00 到 22:45 每 15 分钟），重复 |
+| 命令 | `/opt/homebrew/bin/node /Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/cindy/daily.mjs run --closer /Users/kinso/.hermes/scripts/content-data-daily.sh` |
+| 整轮超时 | 1200000 毫秒（20 分钟） |
+| 前置检查 | `/opt/homebrew/bin/node /Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/cindy/daily.mjs check --closer /Users/kinso/.hermes/scripts/content-data-daily.sh`，超时 15000 毫秒 |
+| 通知 | 桌面开，飞书关 |
+| worktree、持续会话 | 关（脚本模式不支持） |
+
+Cindy 起脚本时去掉密钥类环境变量，PATH 只有系统目录；命令给子进程的 PATH 是 `~/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`（和麦田常驻服务一样）。成功时 stdout 只有一行 `cindy-script/1` 完成帧；失败时摘要同时写在 stderr 末尾、exit 1，Cindy 的失败通知取 stderr 末尾。
+
+### 手动补和回滚
+
+- 手动补一次：在 Cindy 里点「立即运行」（走前置检查，效果和自动触发一样），或者在终端跑上面的 `run`。连「在等负责人」的平台也想重试一次时加 `--retry-waiting`。
+- 排查：`status` 看每一步，`plan` 看下一次会做什么，都不写任何东西。
+- 回滚：在 Cindy 里暂停这条自动化。命令本身不改库、不改守护进程，停掉就回到手动。
+
 ## 和下游的关系
 
 - 下游现在读小V猫的导出（`vcat-backfill/posts-*.json`、`kinso-dashboard/raw/accounts-*.json`）。麦田的导出先写到 `data/ops-shadow/` 影子目录，不碰下游目录。什么时候把回填和看板切到这里，由主对话决定。
@@ -69,3 +134,5 @@ platform 只收 `Douyin`、`XiaoHongShu`、`Bili`、`Channels`。其他平台直
 | 库 | `data/ops.db` | `MAITIAN_OPS_DB` |
 | 导出 | `data/ops-shadow/` | `MAITIAN_OPS_SHADOW_DIR`（或 `--out`） |
 | space 锁 | `data/ops/locks/` | `MAITIAN_OPS_DIR` |
+| 每日流程状态文件 | `integrations/cindy/data/daily-state.json` | `MAITIAN_DAILY_STATE`（或 `--state`） |
+| 每日流程读的知识库、看板 | `~/Documents/OPC-vault`、`~/code/local-tests/kinso-dashboard/data.js` | `MAITIAN_DAILY_VAULT`、`MAITIAN_DAILY_DASHBOARD`（或 `--vault`、`--dashboard-data`） |
