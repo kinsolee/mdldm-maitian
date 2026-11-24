@@ -200,10 +200,66 @@ describe('B站 delete（假接口）', () => {
       const f = fakeBili({ missingCode: 12006, threads: {} });
       const r = await deleteComment(f.api, P('delete', target));
       assert.equal(r.sendAttempted, false);
-      assert.notEqual(r.blocked, 'already-gone');
-      assert.equal(r.blocked, 'precheck-error');
+      assert.equal(r.blocked, 'target-not-found');
+      assert.ok(r.detail.includes(`up/fulllist 作品 BV1xx 的 0 条评论里也没有 ${target.commentId}`));
       assert.match(r.detail, /code=12006/);
       assert.equal(f.posts.length, 0);
+    }
+  });
+
+  for (const target of [root, sub]) {
+    test(`12006：${target.commentId} 只按作品回读`, async () => {
+      for (const effective of [true, false]) {
+        const node = target === root ? rp(100) : rp(101, { root: 100, parent: 100, mid: '9002' });
+        const f = fakeBili({ missingCode: 12006, threads: {}, hidden: [node], delEffective: effective });
+        const r = await deleteComment(f.api, P('delete', target));
+        assert.equal(f.posts.length, 1);
+        assert.equal(r.readBack.found, effective);
+        assert.equal(f.gets.filter(x => x.endsWith('/reply/reply')).length, 1);
+        assert.equal(f.gets.filter(x => x.endsWith('/fulllist')).length, effective ? 3 : 2);
+      }
+    });
+
+    test(`12006：${target.commentId} 作品列表错误或读不全`, async () => {
+      for (const [reply, reason] of [[{ code: -500 }, 'precheck-error'], [{ code: 0, data: { list: [], page: { total: 2 } } }, 'thread-incomplete']]) {
+        const f = fakeBili({ missingCode: 12006, threads: {}, fulllist: () => reply });
+        const r = await deleteComment(f.api, P('delete', target));
+        assert.deepEqual([r.blocked, r.sendAttempted, f.posts.length], [reason, false, 0]);
+      }
+    });
+  }
+
+  test('读取相邻页时只有 12006 改查作品，其他接口异常不删', async () => {
+    for (const code of [12006, -412, -500, null]) {
+      const replies = Array.from({ length: 20 }, (_, i) => rp(101 + i, { root: 100, parent: 100 }));
+      const f = fakeBili({ threads: { 100: { root: rp(100), replies } } });
+      const get = f.api.get;
+      f.api.get = async (url) => {
+        if (url.includes('reply/reply') && new URL(url).searchParams.get('pn') === '2') {
+          if (code === null) throw new Error('网络断开');
+          return { code };
+        }
+        return get(url);
+      };
+      const r = await deleteComment(f.api, P('delete', { ...sub, commentId: '120', authorUid: '9001' }));
+      if (code === 12006) assert.deepEqual([r.readBack.found, f.posts.length], [true, 1]);
+      else assert.deepEqual([r.blocked, r.sendAttempted, f.posts.length], ['precheck-error', false, 0]);
+    }
+  });
+
+  test('12006：一楼位置、作者、子回复和计数都须核实', async () => {
+    for (const [fields, children, reason] of [
+      [{ root: 1 }, [], 'target-not-found'], [{ parent: 1 }, [], 'target-not-found'],
+      [{ member: {} }, [], 'precheck-error'], [{ member: { mid: ME } }, [], 'self-target'],
+      [{ member: { mid: '888' } }, [], 'target-not-found'],
+      [{ rcount: -1 }, [], 'thread-incomplete'], [{ count: null }, [], 'thread-incomplete'],
+      [{ count: '1' }, [], 'deletes-thread'], [{ rcount: 2 }, [], 'deletes-thread'],
+      [{}, [rp(101, { root: 100 })], 'deletes-thread'], [{}, [rp(101, { parent: 100 })], 'deletes-thread'],
+    ]) {
+      const f = fakeBili({ threads: {}, missingCode: 12006, hidden: [{ ...rp(100), ...fields }, ...children] });
+      const r = await deleteComment(f.api, P('delete', root));
+      assert.deepEqual([r.blocked, r.sendAttempted, f.posts.length], [reason, false, 0]);
+      if (reason === 'deletes-thread') assert.equal(r.rejected, true);
     }
   });
 

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { getAccount, setCapability } from '../src/ops/accounts.mjs';
 import { ingestSnapshot } from '../src/ops/engage/store.mjs';
+import { deleteComment } from '../src/ops/engage/writers/bili-moderate.mjs';
 import { engageWrite } from '../src/ops/engage/write.mjs';
 import { MOD_ROUND_LIMIT, MOD_SUPPORT } from '../src/ops/engage/moderate.mjs';
 import { writerModuleUrl } from '../src/ops/engage/writers/index.mjs';
@@ -61,6 +62,24 @@ const caps = (db) => getAccount(db, BILI).capabilities;
 describe('delete_comment', () => {
   let s;
   beforeEach(() => { s = setup(); });
+
+  for (const [total, reason] of [[0, 'target-not-found'], [1, 'thread-incomplete']]) {
+    test(`12006 经作品核实 → ${reason} 不重试`, async () => {
+      ingestSnapshot(s.db, getAccount(s.db, BILI), snap('comments', [comment('100', { uid: '9001' })]), { now: () => T0 + 2 * MIN });
+      const api = { get: async (url) => {
+        switch (new URL(url).pathname) {
+          case '/x/web-interface/nav': return { code: 0, data: { isLogin: true, mid: ME } };
+          case '/x/web-interface/view': return { code: 0, data: { aid: 555, owner: { mid: ME } } };
+          case '/x/v2/reply/reply': return { code: 12006 };
+          case '/x/v2/reply/up/fulllist': return { code: 0, data: { list: [], page: { total } } };
+          default: throw new Error('意外读取');
+        }
+      } };
+      const writer = async ({ params }) => ({ ok: true, result: await deleteComment(api, params) });
+      const r = await engageWrite(s.db, del({ targetId: 'Bili:100' }), s.deps(writer));
+      assert.deepEqual([r.status, r.reason, r.retryable, r.sendAttempted], ['failed', reason, false, false]);
+    });
+  }
 
   test('回读确认删掉 → sent；actions op=delete、不存正文；事件自动回执 ignored；writer 拿到楼信息和本平台账号 uid、不拿 text', async () => {
     const w = fakeWriter(DONE);
