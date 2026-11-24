@@ -258,7 +258,7 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
    sqlite3 -readonly data/ops.db "SELECT id, createdAt, status, reason, json_extract(readBack,'$.detail') FROM actions WHERE platformCode = 'Douyin' AND op = 'sendDM' ORDER BY createdAt DESC LIMIT 5"
    ```
 
-   格式：`send=s<成功>,st<statusCode>,b<body.status>,ck<checkCode>,fs<flightStatus>,id<有没有服务端 id>,<毫秒>ms pull=getMessagesByConversation n=<拉到>/<新的>/<我发的>/<同文>,<毫秒>ms`。没有正文、id、cookie、token。
+   格式：`send=s<成功>,st<statusCode>,b<body.status>,ck<checkCode>,fs<flightStatus>,id<有没有服务端 id>,<毫秒>ms pull=getMessagesByConversation n=<拉到>/<边界后的>/<我发的>/<同文>,cov<这一页有没有覆盖到发前边界>,<毫秒>ms`。返回码不是整数时记 `x`。出错时是 `send=err:<阶段>:<错误类型>` 或 `pull=err:<错误码>`，不带异常原文。回读到的 id 和发送返回的对不上时末尾加 `idMatch=0`。没有正文、消息 id、cookie、token。
 7. 之后观察：每次 `readBack.found` 都要是 `true`。守护进程 stderr 里出现「页面自己的私信服务（IM SDK）没找到」、`precheck-error`，或者 actions 表里出现 `needs_readback`，马上回撤。
 
 回撤（关掉接口写法，私信回到页面写法）：
@@ -267,7 +267,13 @@ B站私信（`sendDM`）、抖音、视频号、小红书各走一遍同样的�
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi false
 ```
 
-要连私信一起停：再执行 `set-cap Douyin:106707338905 sendDM false`。`needs_readback` 的记录按第 4 节「人工处理 needs_readback」处理。连续 2 轮失败自动关的是 `sendDM`，`writeDmViaApi` 不会被自动关：查明原因前要先手动关掉它，再重新打开 `sendDM`。
+要连私信一起停，再执行：
+
+```sh
+node src/hub.mjs ops accounts set-cap Douyin:106707338905 sendDM false
+```
+
+`needs_readback` 的记录按第 4 节「人工处理 needs_readback」处理。连续 2 轮失败自动关的是 `sendDM`，`writeDmViaApi` 不会被自动关：查明原因前要先手动关掉它，再重新打开 `sendDM`。
 
 ## 8. 处置：删评论、拉黑、删私信会话
 

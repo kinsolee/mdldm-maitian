@@ -141,10 +141,13 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi false  #
 
 抖音私信的接口写法（`src/ops/engage/writers/api-dm.mjs`）和上面一样，只是发前重读、发后回读换成拉会话消息：
 
-- 会话不在私信列表里，返回 `target-not-found`；群聊返回 `cannot-send`；正文超过编辑框上限 500 字，返回 `text-too-long`。
-- 发前用 `FROM_LATEST` 拉最新 20 条。最后一句是我说的，返回 `last-is-me`。拉到的消息里没有会话本地记着的最后一条文字消息，说明拉到的不是最新一页，返回 `precheck-error`，不发。
+- 只有证实是本人登录才发：私信页 `userInfo.is_confer_login` 严格是 `false`，并且 `userInfo.uid` 就是要用的账号。代运营登录或读不到，返回 `cannot-send`；uid 不符返回 `uid-mismatch`。发送前一刻在页面里再核对一次。
+- 给了会话 id 就只认这个会话，找不到返回 `target-not-found`，不按对方 uid 换成别的会话。群聊（`isGroupChat`，没有这个字段时看 `type === 2`，同 DOM 写法）返回 `cannot-send`。正文超过编辑框上限 500 字，返回 `text-too-long`。
+- 发前用 `FROM_LATEST` 拉最新 20 条。拉完时会话的最后一条（要有服务端 id）不在拉到的页里、或者拉到的消息都没有会话序号，返回 `precheck-error`，不发。最后一句是我说的，返回 `last-is-me`。记下这一页最大的会话序号当边界。
 - 发送照页面的顺序调一次（建消息、上报、`sendMessageWithAuth`），绝不重试。抛错、返回 `undefined`、`success` 不是 true、`body.status` 不是 0，都交给框架记 `needs_readback`。
-- 发后回读再拉一次最新 20 条，只数发前快照里没有的、我发的、正文一样的消息，并且要是发送返回的那个服务端 id。
+- 发后回读再拉一次最新 20 条，只数会话序号大于边界的、我发的、正文一样的消息，并且要是发送返回的那个服务端 id。这一页没覆盖到边界（中间新消息超过一页）、或者我发的消息没有序号，都不算回读到。
+- 页面明确还没调 `sendMessageWithAuth` 就停下的（私信服务、会话在发送前一刻没了，建消息出错，登录核对没过），返回 `failed` / `cannot-send`，不锁目标。页面调用本身失败、不知道跑到哪一步的，照旧记 `needs_readback`。
+- 成功只认 `success === true`，并且 `body.status` 缺失或是整数 0。返回码的类型不认识（例如 `false`、空串）一律不算成功。
 - 诊断写在 `readBack.detail`，格式见 S7 第 7 节「抖音私信接口写法首次真发」。只有接口名、返回码、条数、耗时，不带 cookie、token、正文。DOM 写法的 `dmDiagnose` 不变。
 
 ## 7. 首次真发验收（每个平台第一次都要负责人当次同意）
@@ -164,8 +167,8 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi false  #
 ## 8. 没验证的
 
 - **所有真实写入都没验证。** 抖音 `multi_publish`、视频号 `create_comment` 的请求和响应只从代码里读到，没有在线上调用过。
-- 抖音私信：`sendMessageWithAuth` 和 `getMessagesByConversation` 都只从代码里读到，一次都没调过，包括读。`FROM_LATEST` 拉最新一页这件事也没在线上跑过：如果方向不对，发前重读的自检会按 `precheck-error` 拦下，不会发出去。
-- 抖音私信：页面在发送前会记录用户操作（`recordAction`，点击、按键），发送时上报（`reportAction`）。接口写法没有点击和按键，风控会不会因此判异常，要靠首次真发和之后的观察。本人登录时页面的代运营权限检查（`checkIMPermisstion`）直接通过，所以接口写法不调它；代运营登录的账号不要开 `writeDmViaApi`。
+- 抖音私信：`sendMessageWithAuth` 和 `getMessagesByConversation` 都只从代码里读到，一次都没调过，包括读。`FROM_LATEST` 拉最新一页这件事也没在线上跑过。发前自检要求拉完时会话的最后一条（要有服务端 id）出现在拉到的页里，能拦下大部分方向、游标不对的情况，但不能保证全部拦下，首次真发时要人工在平台上核对。
+- 抖音私信：页面在发送前会记录用户操作（`recordAction`，点击、按键），发送时上报（`reportAction`）。接口写法没有点击和按键，风控会不会因此判异常，要靠首次真发和之后的观察。接口写法不调页面的代运营权限检查（`checkIMPermisstion`），改成只在证实本人登录（`is_confer_login === false`，2026-11-24 只读核对这个账号是 `false`）时才发，代运营登录一律不发。
 - 抖音读评论只核对了 1 个作品的一楼（1 页）和 1 栋楼的楼中楼（1 页）。一楼翻页（`cursor`）、楼中楼翻页没有在真实页面上跑过。
 - 视频号只核对了 1 个作品的一楼第 1 页。一楼续页、楼中楼续页（`rootCommentId`）没在真实页面上跑过。
 - 主动调接口的频率能不能被风控识别，要靠第 7 节第 1 步的只读试跑来观察。

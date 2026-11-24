@@ -670,7 +670,7 @@ describe('writeDmViaApi：发私信的页面内接口写法', () => {
     const world = dmWorld();
     const w = apiWriter(world);
     const r = await engageWrite(s.db, dm(), s.deps(w));
-    assert.deepEqual([r.status, r.readBack.found, r.readBack.nativeId], ['sent', true, 's-new']);
+    assert.deepEqual([r.status, r.readBack.found, r.readBack.nativeId], ['sent', true, '900']);
     assert.equal(world.count('send'), 1);
     const n = world.calls.length;
     const again = await engageWrite(s.db, dm(), s.deps(w));

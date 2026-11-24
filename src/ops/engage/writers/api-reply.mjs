@@ -196,9 +196,12 @@ export const channelsApi = {
 /**
  * 发送 + 回读（不碰页面，只用 call）。导出给测试用假接口跑。
  * 返回 { readBack: { found, count, nativeId, detail } }：回读要恰好 1 条，并且发送接口认得、返回的 id 就是它，found 才是 true。
+ * send 返回 notSent（页面确定还没调发送函数就停下了）时不回读，返回 { notSent: detail }。
+ * api.quietIds：detail 里不写消息 id（私信诊断只要固定格式）。
  */
 export async function sendAndReadBack(api, ctx, state, { readbackMs = DEFAULT_TIMEOUTS.readbackMs, stepMs = 2500, sleep = realSleep } = {}) {
   const sent = await api.send(ctx, state);
+  if (!sent.ok && sent.notSent) return { notSent: sent.detail ?? '页面没调发送函数' };
   let got = null;
   for (const end = Date.now() + readbackMs; ;) {
     await sleep(stepMs);
@@ -208,7 +211,7 @@ export async function sendAndReadBack(api, ctx, state, { readbackMs = DEFAULT_TI
   const items = got.items ?? [];
   const count = items.length;
   const found = sent.ok && count === 1 && items[0] === sent.nativeId;
-  const detail = !sent.ok ? sent.detail : got.items == null ? got.detail : count === 1 && !found ? `回读到的 ${items[0]} 不是发送接口返回的 ${sent.nativeId}` : got.detail ?? null;
+  const detail = !sent.ok ? sent.detail : got.items == null ? got.detail : count === 1 && !found ? (api.quietIds ? `${got.detail ?? ''} idMatch=0`.trim() : `回读到的 ${items[0]} 不是发送接口返回的 ${sent.nativeId}`) : got.detail ?? null;
   return { readBack: { found, count, nativeId: sent.ok ? sent.nativeId : items.length === 1 ? items[0] : null, ...(detail ? { detail } : {}) } };
 }
 
@@ -239,10 +242,12 @@ export async function runApiWrite(task, params, plat, deps = {}) {
     const pre = await plat.api.precheck(ctx);
     if (pre.blocked) return { ...out, blocked: pre.blocked, ...(pre.detail ? { detail: redact(pre.detail) } : {}) };
     out.sendAttempted = true;
-    const { readBack } = await sendAndReadBack(plat.api, ctx, pre.state, { readbackMs: t.readbackMs, ...(deps.sleep ? { sleep: deps.sleep } : {}) });
+    const { readBack, notSent } = await sendAndReadBack(plat.api, ctx, pre.state, { readbackMs: t.readbackMs, ...(deps.sleep ? { sleep: deps.sleep } : {}) });
+    // 页面确定没调发送函数（服务、会话在发送前一刻没了，建消息出错）：按没发处理，不锁目标
+    if (notSent) return { ...out, sendAttempted: false, blocked: 'cannot-send', detail: redact(notSent) };
     return { ...out, readBack: { ...readBack, ...(readBack.detail ? { detail: redact(readBack.detail) } : {}) } };
   } catch (e) {
-    if (out.sendAttempted) return { ...out, readBack: { found: false, count: 0, nativeId: null, detail: redact(`发送后出错：${e?.message ?? e}`) } };
+    if (out.sendAttempted) return { ...out, readBack: { found: false, count: 0, nativeId: null, detail: plat.api.quietIds ? `发送后出错（${/^[A-Za-z]{1,40}$/.test(String(e?.name)) ? e.name : 'Error'}）` : redact(`发送后出错：${e?.message ?? e}`) } };
     return { ...out, blocked: 'precheck-error', detail: redact(`发送前出错：${e?.message ?? e}`) };
   }
 }

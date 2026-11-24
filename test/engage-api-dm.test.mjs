@@ -7,23 +7,25 @@ import { runInSpace } from '../src/ops/engage/writers/douyin.mjs';
 import { dmWorld, peerMsg, myMsg } from './helpers/douyin-dm-world.mjs';
 
 const ME = '106707338905';
+const TEXT = '你好，资料发你了';
 const noSleep = async () => {};
+
 function fakeTask({ uid = ME } = {}) {
   const page = { cdp: async () => ({}), goto: async () => {}, url: async () => 'https://creator.douyin.com/creator-micro/data/following/chat', evaluate: async () => true };
   return { task: { pages: async () => [page] }, plat: { api: douyinDmApi, hook: false, url: () => 'https://creator.douyin.com/x', login: async () => ({ uid }) } };
 }
-const params = (extra = {}) => ({ op: 'sendDM', uid: ME, text: '你好，资料发你了', target: { conversationId: 'c1', peerUid: 'p1' }, timeouts: { readbackMs: 0, settleMs: 0 }, ...extra });
+const params = (extra = {}) => ({ op: 'sendDM', uid: ME, text: TEXT, target: { conversationId: 'c1', peerUid: 'p1' }, timeouts: { readbackMs: 0, settleMs: 0 }, ...extra });
 const run = (w, p = params(), o = {}) => { const { task, plat } = fakeTask(o); return runApiWrite(task, p, plat, { serviceCaller: async () => (w ? w.call : null), sleep: noSleep }); };
 
 describe('抖音私信接口写法：发送和回读', () => {
   test('发送成功、回读到恰好 1 条我发的新消息 → found，nativeId 是服务端 id；发送函数只调一次', async () => {
     const w = dmWorld();
     const r = await run(w);
-    assert.deepEqual([r.sendAttempted, r.via, r.readBack.found, r.readBack.count, r.readBack.nativeId], [true, 'api', true, 1, 's-new']);
+    assert.deepEqual([r.sendAttempted, r.via, r.readBack.found, r.readBack.count, r.readBack.nativeId], [true, 'api', true, 1, '900']);
     assert.equal(w.count('send'), 1);
     assert.ok(!('sendError' in r));
-    // 诊断只有接口名、返回码、耗时，不带正文
-    assert.match(r.readBack.detail, /api=sendMessageWithAuth send=s1,st0,b0/);
+    // 诊断只有接口名、返回码、条数、耗时，不带正文
+    assert.match(r.readBack.detail, /api=sendMessageWithAuth send=s1,st0,b0,ck0,fs3,id1,3ms pull=getMessagesByConversation n=2\/1\/1\/1,cov1/);
     assert.ok(!r.readBack.detail.includes('资料'));
   });
 
@@ -31,12 +33,12 @@ describe('抖音私信接口写法：发送和回读', () => {
     const w = dmWorld({ send: 'silent' });
     const r = await run(w);
     assert.deepEqual([r.sendAttempted, r.readBack.found, r.readBack.count], [true, false, 0]);
-    assert.match(r.readBack.detail, /诊断api v1 .*pull=getMessagesByConversation n=1\/0\/0\/0/);
+    assert.match(r.readBack.detail, /诊断api v1 .*n=1\/0\/0\/0,cov1/);
     assert.equal(w.count('send'), 1);
   });
 
-  test('发送接口报错、返回 undefined、被拒、仅自己可见：都不算成功，只调一次，不设 sendError', async () => {
-    for (const send of ['throw', 'undefined', 'rejected', 'self-visible']) {
+  test('发送接口报错、返回 undefined、被拒、仅自己可见、返回码类型不认识：都不算成功，只调一次，不设 sendError', async () => {
+    for (const send of ['throw', 'undefined', 'rejected', 'self-visible', 'status-x']) {
       const w = dmWorld({ send });
       const r = await run(w);
       assert.deepEqual([r.sendAttempted, r.readBack.found, 'sendError' in r], [true, false, false], send);
@@ -45,22 +47,63 @@ describe('抖音私信接口写法：发送和回读', () => {
     }
   });
 
-  test('回读拉消息出错 → found:false，detail 写拉消息失败', async () => {
+  test('返回码类型不认识时，回读到同一个 id 也不算回读到', async () => {
+    const r = await run(dmWorld({ send: 'status-x' }));
+    assert.deepEqual([r.readBack.found, r.readBack.count], [false, 1]);
+    assert.match(r.readBack.detail, /b x|bx/);
+  });
+
+  test('回读拉消息出错 → found:false，detail 只有错误码', async () => {
     const w = dmWorld();
     const pull = w.call;
     let n = 0;
-    w.call = async (m, a) => (m === 'pull' && ++n > 1 ? { ok: false, error: 'getMessagesByConversation 出错：超时' } : pull(m, a));
+    w.call = async (m, a) => (m === 'pull' && ++n > 1 ? { ok: false, code: 'pull:t7' } : pull(m, a));
     const r = await run(w);
     assert.deepEqual([r.readBack.found, r.readBack.count], [false, 0]);
-    assert.match(r.readBack.detail, /pull=err/);
+    assert.match(r.readBack.detail, /pull=err:pull:t7$/);
   });
 
-  test('回读到两条一样的新消息 → count 2，不算回读到', async () => {
-    const w = dmWorld();
-    const send = w.call;
-    w.call = async (m, a) => { const r = await send(m, a); if (m === 'send') w.msgs.push(myMsg('s-dup', 99, a.text)); return r; };
+  test('回读到两条序号在边界后的同文我的消息 → count 2，不算回读到', async () => {
+    const w = dmWorld({ pullAfter: (msgs) => [...msgs, myMsg('901', 99, TEXT)] });
     const r = await run(w);
     assert.deepEqual([r.readBack.found, r.readBack.count], [false, 2]);
+  });
+
+  test('边界前的同文旧消息补上了服务端 id：按序号算，不会被当成新消息', async () => {
+    const old = { sid: null, mine: true, text: TEXT, idx: '1' };
+    const w = dmWorld({ msgs: [old, peerMsg('102', 2)], pullAfter: (msgs) => [{ ...old, sid: '555' }, ...msgs.slice(1)] });
+    const r = await run(w);
+    assert.deepEqual([r.readBack.found, r.readBack.count], [true, 1]);
+  });
+
+  test('回读这一页没覆盖到发送前的边界（中间新消息超过一页）→ 不算回读到', async () => {
+    const w = dmWorld({ pullAfter: (msgs) => [...Array.from({ length: 19 }, (_, i) => peerMsg(String(2000 + i), 10 + i)), msgs.at(-1)] });
+    const r = await run(w);
+    assert.deepEqual([r.readBack.found, r.readBack.count], [false, 0]);
+    assert.match(r.readBack.detail, /cov0/);
+  });
+
+  test('回读时我发的消息没有序号 → 不算回读到', async () => {
+    const w = dmWorld({ pullAfter: (msgs) => [...msgs.slice(0, -1), { ...msgs.at(-1), idx: null }] });
+    const r = await run(w);
+    assert.equal(r.readBack.found, false);
+    assert.match(r.readBack.detail, /noidx/);
+  });
+
+  test('send 时页面确定没调发送函数（服务没了）→ cannot-send，sendAttempted:false，不回读', async () => {
+    const w = dmWorld({ send: 'notSent' });
+    const r = await run(w);
+    assert.deepEqual([r.blocked, r.sendAttempted, r.readBack], ['cannot-send', false, undefined]);
+    assert.equal(w.count('pull'), 1);
+  });
+
+  test('send 时页面调用本身失败（不知道跑到哪一步）→ 仍按点过发送、回读不到处理', async () => {
+    const w = dmWorld();
+    const base = w.call;
+    w.call = async (m, a) => (m === 'send' ? { ok: false, code: 'evaluate-failed' } : base(m, a));
+    const r = await run(w);
+    assert.deepEqual([r.sendAttempted, r.readBack.found], [true, false]);
+    assert.match(r.readBack.detail, /send=err:evaluate-failed/);
   });
 });
 
@@ -71,11 +114,13 @@ describe('抖音私信接口写法：发前重读', () => {
     assert.match(r.detail, /writeDmViaApi/);
   });
 
-  test('会话不在列表 → target-not-found；群聊 → cannot-send；最后一句是我 → last-is-me；发送函数零调用', async () => {
+  test('会话不在列表 → target-not-found；群聊 → cannot-send；最后一句是我 → last-is-me；服务中途没了 → cannot-send；发送函数零调用', async () => {
     const cases = [
-      [dmWorld({ conv: { missing: true } }), 'target-not-found'],
+      [dmWorld({ conv: { notFound: true } }), 'target-not-found'],
+      [dmWorld({ conv: { missing: true } }), 'cannot-send'],
+      [dmWorld({ pull: 'vanish' }), 'cannot-send'],
       [dmWorld({ conv: { group: true } }), 'cannot-send'],
-      [dmWorld({ msgs: [peerMsg('s1', 1), myMsg('s2', 2, '好的')] }), 'last-is-me'],
+      [dmWorld({ msgs: [peerMsg('101', 1), myMsg('102', 2, '好的')] }), 'last-is-me'],
     ];
     for (const [w, want] of cases) {
       const r = await run(w);
@@ -84,19 +129,42 @@ describe('抖音私信接口写法：发前重读', () => {
     }
   });
 
+  test('没能证实本人登录（代运营登录、读不到 is_confer_login）→ cannot-send；userInfo 的 uid 不符 → uid-mismatch；都没发', async () => {
+    for (const [login, want] of [[{ owner: 0 }, 'cannot-send'], [{ owner: -1 }, 'cannot-send'], [{ owner: null }, 'cannot-send'], [{ uidMatch: false }, 'uid-mismatch']]) {
+      const w = dmWorld({ login });
+      const r = await run(w);
+      assert.deepEqual([r.blocked, r.sendAttempted, w.count('pull'), w.count('send')], [want, false, 0, 0], JSON.stringify(login));
+    }
+  });
+
+  test('给了会话 id 时不按 peerUid 找别的会话', async () => {
+    const w = dmWorld();
+    await run(w);
+    assert.deepEqual(w.calls[0][1], { conversationId: 'c1', peerUid: null, uid: ME });
+  });
+
   test('本地记的最后一句不是我、但服务端拉到的最后一句是我 → last-is-me', async () => {
-    const w = dmWorld({ msgs: [peerMsg('s1', 1), myMsg('s2', 2, '好的')], conv: { last: { sid: 's1', type: 7, mine: false } } });
+    const w = dmWorld({ msgs: [peerMsg('101', 1), myMsg('102', 2, '好的')], conv: { last: { sid: '101', idx: '1', mine: false } } });
+    const base = w.call;
+    w.call = async (m, a) => { const r = await base(m, a); if (m === 'pull') r.conv = { ...r.conv, last: { sid: '102', idx: '2', mine: true } }; return r; };
     const r = await run(w);
     assert.equal(r.blocked, 'last-is-me');
     assert.equal(w.count('send'), 0);
   });
 
-  test('拉到的不是最新一页（没有会话最后一条）→ precheck-error；拉消息出错 → precheck-error；都没发', async () => {
-    for (const pull of ['stale', 'throw']) {
-      const w = dmWorld({ pull });
+  test('拉完时会话最后一条（我的 102）不在拉到的页里（页面只到对方的 101）→ precheck-error', async () => {
+    const w = dmWorld({ msgs: [peerMsg('101', 1)] });
+    const base = w.call;
+    w.call = async (m, a) => { const r = await base(m, a); if (m === 'pull') r.conv = { ...r.conv, last: { sid: '102', idx: '2', mine: true } }; return r; };
+    const r = await run(w);
+    assert.deepEqual([r.blocked, w.count('send')], ['precheck-error', 0]);
+  });
+
+  test('拉到的不是最新一页、拉消息出错、最后一条没有服务端 id、空页 → precheck-error；都没发', async () => {
+    const worlds = [dmWorld({ pull: 'stale' }), dmWorld({ pull: 'throw' }), dmWorld({ msgs: [{ sid: null, mine: false, text: '在吗', idx: '1' }] }), dmWorld({ msgs: [] })];
+    for (const w of worlds) {
       const r = await run(w);
-      assert.deepEqual([r.blocked, r.sendAttempted], ['precheck-error', false], pull);
-      assert.equal(w.count('send'), 0, pull);
+      assert.deepEqual([r.blocked, r.sendAttempted, w.count('send')], ['precheck-error', false, 0]);
     }
   });
 
@@ -116,9 +184,9 @@ describe('抖音私信接口写法：发前重读', () => {
 describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', () => {
   afterEach(() => { delete globalThis.document; });
 
-  function page({ sendResult = 'ok', ctx: extra = {} } = {}) {
+  function page({ sendResult = 'ok', ctx: extra = {}, user = { uid: ME, is_confer_login: false }, convs = null } = {}) {
     const calls = [];
-    const conv = { id: '0:1:me:p1', isGroupChat: false, isStrangerChat: false, toParticipantUserId: 'p1', lastMessage: { serverId: '7001', type: 7, isFromMe: false } };
+    const conv = { id: '0:1:me:p1', isGroupChat: false, isStrangerChat: false, toParticipantUserId: 'p1', lastMessage: { serverId: '7001', indexInConversation: { toString: () => '12' }, isFromMe: false } };
     const msg = { clientId: 'cli-1', type: 7, serverId: undefined, flightStatus: 0 };
     const ctx = {
       bytedIM: {
@@ -127,84 +195,115 @@ describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', ()
       },
       sendMessageWithAuth: async (a) => {
         calls.push(['send', a]);
-        if (sendResult === 'throw') throw new Error('IM SDK not initialized');
+        if (sendResult === 'throw') { const e = new Error(`校验失败 content=${a.message.content} token=abc`); e.name = 'Error'; throw e; }
         if (sendResult === 'undefined') return undefined;
+        if (sendResult === 'status-false') { a.message.serverId = '7300'; return { success: true, body: { status: false }, payload: a.message }; }
         a.message.serverId = '7300'; a.message.flightStatus = 3;
         return { success: true, statusCode: 0, body: { status: 0 }, checkCode: { toString: () => '0' }, payload: a.message };
       },
       reportAction: (x) => { calls.push(['report', x]); return Promise.reject(new Error('上报失败不影响')); },
-      conversationList: [conv], strangerConversationList: [], loading: false, ...extra,
+      conversationList: convs ?? [conv], strangerConversationList: [], loading: false, ...extra,
     };
-    // li 往上三层 fiber 才是 Context Provider
-    const fiber = { memoizedProps: {}, return: { memoizedProps: { value: { other: 1 } }, return: { memoizedProps: { value: ctx }, return: null } } };
+    // li 往上：第 2 层是私信 Context，第 3 层是带 userInfo 的 Context
+    const fiber = { memoizedProps: {}, return: { memoizedProps: { value: ctx }, return: { memoizedProps: { value: user ? { userInfo: user } : { other: 1 } }, return: null } } };
     const li = { '__reactFiber$abc': fiber };
     globalThis.document = { querySelectorAll: (sel) => (sel === 'li.semi-list-item' ? [li] : []) };
     return { calls, conv, ctx };
   }
+  const send = (conv, extra = {}) => dmInPage({ method: 'send', args: { conversationId: conv.id, text: '你好', uid: ME, ...extra } });
 
-  test('locate、conv：按会话 id 找，也认 peerUid；找不到给 notFound', async () => {
+  test('locate、conv：按会话 id 精确找；没给会话 id 才认 peerUid；本人登录核对', async () => {
     const { conv } = page();
     assert.deepEqual(await dmInPage({ method: 'locate' }), { ok: true });
-    const c = await dmInPage({ method: 'conv', args: { conversationId: conv.id } });
-    assert.deepEqual(c.conv, { id: conv.id, group: false, stranger: false, last: { sid: '7001', type: 7, mine: false } });
-    assert.equal((await dmInPage({ method: 'conv', args: { conversationId: 'nope', peerUid: 'p1' } })).conv.id, conv.id);
-    assert.equal((await dmInPage({ method: 'conv', args: { conversationId: 'nope' } })).notFound, true);
+    const c = await dmInPage({ method: 'conv', args: { conversationId: conv.id, uid: ME } });
+    assert.deepEqual(c.conv, { id: conv.id, group: false, stranger: false, last: { sid: '7001', idx: '12', mine: false } });
+    assert.deepEqual(c.login, { owner: 1, uidMatch: true });
+    assert.equal((await dmInPage({ method: 'conv', args: { peerUid: 'p1' } })).conv.id, conv.id);
+    const miss = await dmInPage({ method: 'conv', args: { conversationId: 'nope', peerUid: 'p1' } });
+    assert.deepEqual([miss.ok, miss.notFound], [false, true]);
   });
 
-  test('没有 Context：locate 返回 ok:false', async () => {
+  test('群聊判定同 DOM 写法：没有 isGroupChat 时看 type === 2', async () => {
+    const g = { id: 'g1', type: 2, toParticipantUserId: 'p1', lastMessage: null };
+    page({ convs: [g] });
+    assert.equal((await dmInPage({ method: 'conv', args: { conversationId: 'g1' } })).conv.group, true);
+    assert.equal((await dmInPage({ method: 'conv', args: { peerUid: 'p1' } })).ok, false);
+    const r = await dmInPage({ method: 'send', args: { conversationId: 'g1', text: '你好', uid: ME } });
+    assert.deepEqual([r.ok, r.code, r.notSent], [false, 'group', true]);
+  });
+
+  test('没有 Context：locate 返回 ok:false，并标明没发', async () => {
     globalThis.document = { querySelectorAll: () => [] };
+    const r = await dmInPage({ method: 'send', args: {} });
+    assert.deepEqual([r.ok, r.missing, r.notSent], [false, true, true]);
     assert.equal((await dmInPage({ method: 'locate' })).ok, false);
   });
 
-  test('pull：direction 3（FROM_LATEST），只留这个会话的消息，正文从 content JSON 里取', async () => {
+  test('pull：direction 3（FROM_LATEST），只留这个会话的消息，正文从 content JSON 里取，摘要在拉完后取', async () => {
     const { calls, conv } = page();
     const r = await dmInPage({ method: 'pull', args: { conversationId: conv.id, limit: 20 } });
     assert.deepEqual(calls[0][1], { conversation: conv, direction: 3, limit: 20 });
-    assert.deepEqual(r.msgs, [{ key: '7001', sid: '7001', mine: false, text: '在吗', idx: '12', type: 7 }]);
+    assert.deepEqual(r.msgs, [{ sid: '7001', mine: false, text: '在吗', idx: '12' }]);
+    assert.equal(r.conv.last.sid, '7001');
   });
 
   test('send：createMessage（TEXT=7、content 带 aweType 774）→ reportAction → sendMessageWithAuth（isRetry:false）各一次，返回服务端 id', async () => {
     const { calls, conv } = page();
-    const r = await dmInPage({ method: 'send', args: { conversationId: conv.id, text: '你好' } });
+    const r = await send(conv);
     assert.deepEqual(calls.map(([m]) => m), ['create', 'report', 'send']);
     assert.deepEqual(calls[0][1], { type: 7, content: JSON.stringify({ text: '你好', aweType: 774 }), conversation: conv });
     assert.equal(calls[1][1].messageClientId, 'cli-1');
     assert.equal(calls[2][1].isRetry, false);
-    assert.deepEqual(r.res, { success: true, statusCode: 0, bodyStatus: 0, checkCode: 0, sid: '7300', flight: 3 });
+    assert.deepEqual(r.res, { success: 1, statusCode: 0, bodyStatus: 0, checkCode: 0, sid: '7300', flight: 3 });
+  });
+
+  test('send：没能证实本人登录 → 建消息之前就停下（notSent），SDK 零调用', async () => {
+    for (const user of [{ uid: ME, is_confer_login: true }, { uid: ME }, null, { uid: 'other', is_confer_login: false }]) {
+      const { calls, conv } = page({ user });
+      const r = await send(conv);
+      assert.deepEqual([r.ok, r.code, r.notSent, calls.length], [false, 'not-owner-login', true, 0], JSON.stringify(user));
+    }
   });
 
   test('send：Context 上有页面自己的 createMessage 时用它（同页面）', async () => {
     const own = [];
     const { calls, conv } = page({ ctx: { createMessage: async (o) => { own.push(o); return { clientId: 'c2', type: 7 }; } } });
-    await dmInPage({ method: 'send', args: { conversationId: conv.id, text: '你好' } });
+    await send(conv);
     assert.equal(own.length, 1);
     assert.ok(!calls.some(([m]) => m === 'create'));
   });
 
-  test('send：sendMessageWithAuth 抛错 → ok:false stage send；返回 undefined → res:null', async () => {
-    const a = page({ sendResult: 'throw' });
-    const r = await dmInPage({ method: 'send', args: { conversationId: a.conv.id, text: '你好' } });
-    assert.deepEqual([r.ok, r.stage], [false, 'send']);
-    const b = page({ sendResult: 'undefined' });
-    const r2 = await dmInPage({ method: 'send', args: { conversationId: b.conv.id, text: '你好' } });
-    assert.deepEqual([r2.ok, r2.res], [true, null]);
+  test('send：sendMessageWithAuth 抛错 → 只回错误码，不带异常原文（正文、token）', async () => {
+    const { conv } = page({ sendResult: 'throw' });
+    const r = await send(conv);
+    assert.deepEqual([r.ok, r.code, 'notSent' in r], [false, 'send:Error', false]);
+    assert.ok(!JSON.stringify(r).includes('你好') && !JSON.stringify(r).includes('abc'));
+  });
+
+  test('send：返回 undefined → res:null；body.status 是 false → bodyStatus 记 x（不认识）', async () => {
+    const a = page({ sendResult: 'undefined' });
+    assert.equal((await send(a.conv)).res, null);
+    const b = page({ sendResult: 'status-false' });
+    assert.equal((await send(b.conv)).res.bodyStatus, 'x');
   });
 });
 
 describe('dmCaller 节奏和入口分流', () => {
-  test('两次调用至少隔 800ms', async () => {
-    const waits = [];
-    const page = { evaluate: async (_fn, a) => (a.method === 'locate' ? { ok: true } : { ok: true, at: Date.now() }) };
-    const call = await dmCaller(page, 'Douyin', { waitMs: 0, sleep: async (ms) => { waits.push(ms); await new Promise((r) => setTimeout(r, ms)); } });
+  test('定位之后、每两次调用之间都至少隔 800ms', async () => {
+    const at = [];
+    const page = { evaluate: async (_fn, a) => { at.push(Date.now()); return a.method === 'locate' ? { ok: true } : { ok: true }; } };
+    const call = await dmCaller(page, 'Douyin', { waitMs: 0, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) });
     await call('conv', {});
     await call('pull', {});
-    assert.equal(waits.length, 1);
-    assert.ok(waits[0] > 700 && waits[0] <= 800, String(waits[0]));
+    assert.equal(at.length, 3);
+    for (let i = 1; i < at.length; i++) assert.ok(at[i] - at[i - 1] >= 795, `${i}: ${at[i] - at[i - 1]}ms`);
   });
 
-  test('私信服务一直等不到 → null', async () => {
-    const page = { evaluate: async () => ({ ok: false }) };
-    assert.equal(await dmCaller(page, 'Douyin', { waitMs: 0, sleep: noSleep }), null);
+  test('私信服务一直等不到 → null；页面调用失败只回错误码', async () => {
+    assert.equal(await dmCaller({ evaluate: async () => ({ ok: false }) }, 'Douyin', { waitMs: 0, sleep: noSleep }), null);
+    let n = 0;
+    const call = await dmCaller({ evaluate: async () => { if (n++) throw new Error('Target closed token=abc'); return { ok: true }; } }, 'Douyin', { waitMs: 0, gapMs: 0, sleep: noSleep });
+    assert.deepEqual(await call('send', {}), { ok: false, code: 'evaluate-failed' });
   });
 
   test('douyin.runInSpace：writeVia=api 的 sendDM 走接口写法，dom 的走页面写法', async () => {
