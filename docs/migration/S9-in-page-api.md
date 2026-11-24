@@ -141,13 +141,15 @@ node src/hub.mjs ops accounts set-cap Douyin:106707338905 writeDmViaApi false  #
 
 抖音私信的接口写法（`src/ops/engage/writers/api-dm.mjs`）和上面一样，只是发前重读、发后回读换成拉会话消息：
 
-- 只有证实是本人登录才发：私信页 `userInfo.is_confer_login` 严格是 `false`，并且 `userInfo.uid` 就是要用的账号。代运营登录或读不到，返回 `cannot-send`；uid 不符返回 `uid-mismatch`。发送前一刻在页面里再核对一次。
-- 给了会话 id 就只认这个会话，找不到返回 `target-not-found`，不按对方 uid 换成别的会话。群聊（`isGroupChat`，没有这个字段时看 `type === 2`，同 DOM 写法）返回 `cannot-send`。正文超过编辑框上限 500 字，返回 `text-too-long`。
-- 发前用 `FROM_LATEST` 拉最新 20 条。拉完时会话的最后一条（要有服务端 id）不在拉到的页里、或者拉到的消息都没有会话序号，返回 `precheck-error`，不发。最后一句是我说的，返回 `last-is-me`。记下这一页最大的会话序号当边界。
+- 只有证实是本人登录才发：私信服务所在那条 React 祖先链外层最近的 `userInfo`，`is_confer_login` 严格是 `false`，并且 `uid` 就是要用的账号（不借别的组件链上的身份）。代运营登录或读不到，返回 `cannot-send`；uid 不符返回 `uid-mismatch`。发送前一刻在页面里再核对一次。
+- 给了会话 id 就只认这个会话，找不到返回 `target-not-found`，不按对方 uid 换成别的会话。群聊（`isGroupChat` 是 true 或 `type === 2` 任一成立，两个字段矛盾也按群聊）返回 `cannot-send`。正文按原文（不去尾部换行）超过编辑框上限 500 字，返回 `text-too-long`。
+- 发前用 `FROM_LATEST` 拉最新 20 条。拉完时会话的最后一条要有服务端 id 和序号、出现在页里、并且是页里序号最大的，否则返回 `precheck-error`，不发。最后一句是我说的，返回 `last-is-me`；看不出是谁说的，返回 `precheck-error`。这条的序号当边界。
+- 发送前一刻在页面里复核：会话的最后一句还是发前核对的那条、并且是对方说的，否则不建消息、不发（`cannot-send`）。
 - 发送照页面的顺序调一次（建消息、上报、`sendMessageWithAuth`），绝不重试。抛错、返回 `undefined`、`success` 不是 true、`body.status` 不是 0，都交给框架记 `needs_readback`。
-- 发后回读再拉一次最新 20 条，只数会话序号大于边界的、我发的、正文一样的消息，并且要是发送返回的那个服务端 id。这一页没覆盖到边界（中间新消息超过一页）、或者我发的消息没有序号，都不算回读到。
+- 发后回读再拉一次最新 20 条，只数会话序号大于边界的、我发的、正文一样的消息，并且要是发送返回的那个服务端 id。两头都要证实：这一页覆盖到边界（中间新消息没超过一页），并且拉完时会话的最后一条在页里、是序号最大的。页里有消息缺序号、或边界后有看不出是谁发的消息，也不算回读到。
 - 页面明确还没调 `sendMessageWithAuth` 就停下的（私信服务、会话在发送前一刻没了，建消息出错，登录核对没过），返回 `failed` / `cannot-send`，不锁目标。页面调用本身失败、不知道跑到哪一步的，照旧记 `needs_readback`。
-- 成功只认 `success === true`，并且 `body.status` 缺失或是整数 0。返回码的类型不认识（例如 `false`、空串）一律不算成功。
+- 成功只认 `success === true`，并且 `body.status` 缺失（undefined）或是整数 0。显式的 `null`、`false`、空串等一律不算成功。
+- 错误只记 SDK 的数字错误类型或几个固定的内置错误名，异常的 `message`、`name` 原文不进 `actions`。
 - 诊断写在 `readBack.detail`，格式见 S7 第 7 节「抖音私信接口写法首次真发」。只有接口名、返回码、条数、耗时，不带 cookie、token、正文。DOM 写法的 `dmDiagnose` 不变。
 
 ## 7. 首次真发验收（每个平台第一次都要负责人当次同意）

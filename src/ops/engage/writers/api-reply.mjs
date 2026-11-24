@@ -247,7 +247,8 @@ export async function runApiWrite(task, params, plat, deps = {}) {
     if (notSent) return { ...out, sendAttempted: false, blocked: 'cannot-send', detail: redact(notSent) };
     return { ...out, readBack: { ...readBack, ...(readBack.detail ? { detail: redact(readBack.detail) } : {}) } };
   } catch (e) {
-    if (out.sendAttempted) return { ...out, readBack: { found: false, count: 0, nativeId: null, detail: plat.api.quietIds ? `发送后出错（${/^[A-Za-z]{1,40}$/.test(String(e?.name)) ? e.name : 'Error'}）` : redact(`发送后出错：${e?.message ?? e}`) } };
-    return { ...out, blocked: 'precheck-error', detail: redact(`发送前出错：${e?.message ?? e}`) };
+    // quietIds（私信）：异常原文可能带正文，只写固定阶段
+    if (out.sendAttempted) return { ...out, readBack: { found: false, count: 0, nativeId: null, detail: plat.api.quietIds ? '发送后出错（脚本异常）' : redact(`发送后出错：${e?.message ?? e}`) } };
+    return { ...out, blocked: 'precheck-error', detail: plat.api.quietIds ? '发送前出错（脚本异常）' : redact(`发送前出错：${e?.message ?? e}`) };
   }
 }

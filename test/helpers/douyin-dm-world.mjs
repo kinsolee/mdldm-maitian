@@ -9,7 +9,9 @@ export const myMsg = (sid, idx, text) => ({ sid, mine: true, text, idx: String(i
  */
 export function dmWorld({ msgs = [peerMsg('101', 1)], send = 'ok', conv = {}, login = {}, pull = 'ok', pullAfter = null } = {}) {
   const w = { msgs: [...msgs], calls: [], sent: false };
-  const summary = () => { const l = w.msgs.at(-1); return { id: 'c1', group: false, stranger: false, last: l ? { sid: l.sid, idx: l.idx, mine: l.mine } : null, ...conv }; };
+  // 会话摘要的最后一条：序号最大的那条（同 SDK）
+  const top = () => w.msgs.filter((m) => m.idx != null).reduce((a, m) => (!a || BigInt(m.idx) > BigInt(a.idx) ? m : a), null);
+  const summary = () => { const l = top(); return { id: 'c1', group: false, stranger: false, last: l ? { sid: l.sid, idx: l.idx, mine: l.mine } : null, ...conv }; };
   w.call = async (method, args) => {
     w.calls.push([method, args]);
     if (method === 'conv') {
@@ -26,7 +28,9 @@ export function dmWorld({ msgs = [peerMsg('101', 1)], send = 'ok', conv = {}, lo
     }
     if (method === 'send') {
       const sid = '900';
-      const push = () => { w.msgs.push(myMsg(sid, w.msgs.length + 1, args.text)); };
+      // 新消息的序号是会话最后一条 + 1（同 SDK 的 lastMessageIndex + 1）
+      const push = () => { w.msgs.push(myMsg(sid, String((top() ? BigInt(top().idx) : 0n) + 1n), args.text)); };
+      if (send === 'last-changed') return { ok: false, code: 'last-changed', notSent: true };
       if (send === 'notSent') return { ok: false, code: 'service-missing', missing: true, notSent: true };
       w.sent = true;
       if (send === 'throw') return { ok: false, code: 'send:Error', ms: 3 };
@@ -34,6 +38,7 @@ export function dmWorld({ msgs = [peerMsg('101', 1)], send = 'ok', conv = {}, lo
       if (send === 'rejected') return { ok: true, ms: 3, res: { success: 0, statusCode: 3, bodyStatus: 3, checkCode: 1, sid: null, flight: 4 } };
       if (send === 'self-visible') { push(); return { ok: true, ms: 3, res: { success: 0, statusCode: 4, bodyStatus: 4, checkCode: 0, sid: null, flight: 5 } }; }
       // 返回码类型不认识（例如 body.status 是 false），但 success、id 都在，回读也能找到
+      if (send === 'status-null') { push(); return { ok: true, ms: 3, res: { success: 1, statusCode: 0, bodyStatus: 'x', checkCode: 0, sid, flight: 3 } }; }
       if (send === 'status-x') { push(); return { ok: true, ms: 3, res: { success: 1, statusCode: 0, bodyStatus: 'x', checkCode: 0, sid, flight: 3 } }; }
       if (send !== 'silent') push();
       return { ok: true, ms: 3, res: { success: 1, statusCode: 0, bodyStatus: 0, checkCode: 0, sid, flight: 3 } };

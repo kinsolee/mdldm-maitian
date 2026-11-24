@@ -38,7 +38,7 @@ describe('抖音私信接口写法：发送和回读', () => {
   });
 
   test('发送接口报错、返回 undefined、被拒、仅自己可见、返回码类型不认识：都不算成功，只调一次，不设 sendError', async () => {
-    for (const send of ['throw', 'undefined', 'rejected', 'self-visible', 'status-x']) {
+    for (const send of ['throw', 'undefined', 'rejected', 'self-visible', 'status-x', 'status-null']) {
       const w = dmWorld({ send });
       const r = await run(w);
       assert.deepEqual([r.sendAttempted, r.readBack.found, 'sendError' in r], [true, false, false], send);
@@ -64,7 +64,9 @@ describe('抖音私信接口写法：发送和回读', () => {
   });
 
   test('回读到两条序号在边界后的同文我的消息 → count 2，不算回读到', async () => {
-    const w = dmWorld({ pullAfter: (msgs) => [...msgs, myMsg('901', 99, TEXT)] });
+    const w = dmWorld();
+    const base = w.call;
+    w.call = async (m, a) => { const r = await base(m, a); if (m === 'send') w.msgs.push(myMsg('901', 99, TEXT)); return r; };
     const r = await run(w);
     assert.deepEqual([r.readBack.found, r.readBack.count], [false, 2]);
   });
@@ -77,17 +79,45 @@ describe('抖音私信接口写法：发送和回读', () => {
   });
 
   test('回读这一页没覆盖到发送前的边界（中间新消息超过一页）→ 不算回读到', async () => {
-    const w = dmWorld({ pullAfter: (msgs) => [...Array.from({ length: 19 }, (_, i) => peerMsg(String(2000 + i), 10 + i)), msgs.at(-1)] });
+    const w = dmWorld({ pullAfter: (msgs) => [...Array.from({ length: 19 }, (_, i) => peerMsg(String(2000 + i), 10 + i)), { ...msgs.at(-1), idx: '30' }] });
+    const base = w.call;
+    w.call = async (m, a) => { const r = await base(m, a); if (m === 'pull' && w.sent) r.conv = { ...r.conv, last: { sid: '900', idx: '30', mine: true } }; return r; };
     const r = await run(w);
     assert.deepEqual([r.readBack.found, r.readBack.count], [false, 0]);
     assert.match(r.readBack.detail, /cov0/);
   });
 
-  test('回读时我发的消息没有序号 → 不算回读到', async () => {
-    const w = dmWorld({ pullAfter: (msgs) => [...msgs.slice(0, -1), { ...msgs.at(-1), idx: null }] });
+  test('回读时有消息没有序号、或边界后有看不出是谁发的 → 不算回读到', async () => {
+    const a = await run(dmWorld({ msgs: [peerMsg('100', 1), peerMsg('101', 2)], pullAfter: (msgs) => [{ ...msgs[0], idx: null }, ...msgs.slice(1)] }));
+    assert.equal(a.readBack.found, false);
+    assert.match(a.readBack.detail, /unsure/);
+    const w = dmWorld();
+    const base = w.call;
+    w.call = async (m, x) => { const r = await base(m, x); if (m === 'pull' && w.sent) r.msgs = [...r.msgs.slice(0, -1), { sid: '950', mine: null, text: '?', idx: '2' }, { ...r.msgs.at(-1), idx: '3' }]; if (m === 'pull' && w.sent) r.conv = { ...r.conv, last: { sid: '900', idx: '3', mine: true } }; return r; };
+    const b = await run(w);
+    assert.equal(b.readBack.found, false);
+    assert.match(b.readBack.detail, /unsure/);
+  });
+
+  test('回读页覆盖到边界、但没拉到最新端（拉完时会话最后一条是另一条同文的 12，页里只到 11）→ 不算回读到', async () => {
+    const w = dmWorld({ msgs: [peerMsg('101', 10)] });
+    const base = w.call;
+    w.call = async (m, a) => { const r = await base(m, a); if (m === 'pull' && w.sent) r.conv = { ...r.conv, last: { sid: '999', idx: '12', mine: true } }; return r; };
     const r = await run(w);
-    assert.equal(r.readBack.found, false);
-    assert.match(r.readBack.detail, /noidx/);
+    assert.deepEqual([r.readBack.found, r.readBack.count], [false, 0]);
+    assert.match(r.readBack.detail, /cov1,top0/);
+  });
+
+  test('会话序号超过 2^53 时照常按大整数比较', async () => {
+    const r = await run(dmWorld({ msgs: [peerMsg('101', '9007199254740993')] }));
+    assert.deepEqual([r.readBack.found, r.readBack.count], [true, 1]);
+  });
+
+  test('发前重读之后会话最后一句变了 → 页面不发（last-changed）→ cannot-send，没尝试发送', async () => {
+    const w = dmWorld({ send: 'last-changed' });
+    const r = await run(w);
+    assert.deepEqual([r.blocked, r.sendAttempted], ['cannot-send', false]);
+    assert.equal(w.calls.find(([m]) => m === 'send')[1].lastSid, '101');
   });
 
   test('send 时页面确定没调发送函数（服务没了）→ cannot-send，sendAttempted:false，不回读', async () => {
@@ -160,18 +190,26 @@ describe('抖音私信接口写法：发前重读', () => {
     assert.deepEqual([r.blocked, w.count('send')], ['precheck-error', 0]);
   });
 
-  test('拉到的不是最新一页、拉消息出错、最后一条没有服务端 id、空页 → precheck-error；都没发', async () => {
-    const worlds = [dmWorld({ pull: 'stale' }), dmWorld({ pull: 'throw' }), dmWorld({ msgs: [{ sid: null, mine: false, text: '在吗', idx: '1' }] }), dmWorld({ msgs: [] })];
+  test('拉到的不是最新一页、拉消息出错、最后一条没有服务端 id 或序号、看不出谁说的、空页 → precheck-error；都没发', async () => {
+    const unknownAuthor = dmWorld();
+    const base = unknownAuthor.call;
+    unknownAuthor.call = async (m, a) => { const r = await base(m, a); if (m === 'pull') { r.msgs = r.msgs.map((x) => ({ ...x, mine: null })); r.conv = { ...r.conv, last: { ...r.conv.last, mine: null } }; } return r; };
+    const noIdx = dmWorld();
+    const b2 = noIdx.call;
+    noIdx.call = async (m, a) => { const r = await b2(m, a); if (m === 'pull') r.conv = { ...r.conv, last: { ...r.conv.last, idx: null } }; return r; };
+    const worlds = [dmWorld({ pull: 'stale' }), dmWorld({ pull: 'throw' }), dmWorld({ msgs: [{ sid: null, mine: false, text: '在吗', idx: '1' }] }), dmWorld({ msgs: [] }), unknownAuthor, noIdx];
     for (const w of worlds) {
       const r = await run(w);
       assert.deepEqual([r.blocked, r.sendAttempted, w.count('send')], ['precheck-error', false, 0]);
     }
   });
 
-  test('超过编辑框上限 500 字 → text-too-long，不调接口', async () => {
-    const w = dmWorld();
-    const r = await run(w, params({ text: '字'.repeat(501) }));
-    assert.deepEqual([r.blocked, w.calls.length], ['text-too-long', 0]);
+  test('超过编辑框上限 500 字（按原文计，尾部换行也算）→ text-too-long，不调接口', async () => {
+    for (const text of ['字'.repeat(501), '字'.repeat(500) + '\n']) {
+      const w = dmWorld();
+      const r = await run(w, params({ text }));
+      assert.deepEqual([r.blocked, w.calls.length], ['text-too-long', 0]);
+    }
   });
 
   test('页面登录的不是这个账号 → uid-mismatch，不调接口', async () => {
@@ -184,7 +222,7 @@ describe('抖音私信接口写法：发前重读', () => {
 describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', () => {
   afterEach(() => { delete globalThis.document; });
 
-  function page({ sendResult = 'ok', ctx: extra = {}, user = { uid: ME, is_confer_login: false }, convs = null } = {}) {
+  function page({ sendResult = 'ok', ctx: extra = {}, user = { uid: ME, is_confer_login: false }, convs = null, decoy = null } = {}) {
     const calls = [];
     const conv = { id: '0:1:me:p1', isGroupChat: false, isStrangerChat: false, toParticipantUserId: 'p1', lastMessage: { serverId: '7001', indexInConversation: { toString: () => '12' }, isFromMe: false } };
     const msg = { clientId: 'cli-1', type: 7, serverId: undefined, flightStatus: 0 };
@@ -195,9 +233,10 @@ describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', ()
       },
       sendMessageWithAuth: async (a) => {
         calls.push(['send', a]);
-        if (sendResult === 'throw') { const e = new Error(`校验失败 content=${a.message.content} token=abc`); e.name = 'Error'; throw e; }
+        if (sendResult === 'throw') { const e = new Error(`校验失败 content=${a.message.content} token=abc`); e.name = 'PrivateMessageText'; throw e; }
         if (sendResult === 'undefined') return undefined;
         if (sendResult === 'status-false') { a.message.serverId = '7300'; return { success: true, body: { status: false }, payload: a.message }; }
+        if (sendResult === 'status-null') { a.message.serverId = '7300'; return { success: true, body: { status: null }, payload: a.message }; }
         a.message.serverId = '7300'; a.message.flightStatus = 3;
         return { success: true, statusCode: 0, body: { status: 0 }, checkCode: { toString: () => '0' }, payload: a.message };
       },
@@ -207,10 +246,12 @@ describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', ()
     // li 往上：第 2 层是私信 Context，第 3 层是带 userInfo 的 Context
     const fiber = { memoizedProps: {}, return: { memoizedProps: { value: ctx }, return: { memoizedProps: { value: user ? { userInfo: user } : { other: 1 } }, return: null } } };
     const li = { '__reactFiber$abc': fiber };
-    globalThis.document = { querySelectorAll: (sel) => (sel === 'li.semi-list-item' ? [li] : []) };
+    // decoy：排在前面的另一条链，只有 userInfo、没有私信服务
+    const other = decoy ? [{ '__reactFiber$abc': { memoizedProps: { value: { userInfo: decoy } }, return: null } }] : [];
+    globalThis.document = { querySelectorAll: (sel) => (sel === 'li.semi-list-item' ? [...other, li] : []) };
     return { calls, conv, ctx };
   }
-  const send = (conv, extra = {}) => dmInPage({ method: 'send', args: { conversationId: conv.id, text: '你好', uid: ME, ...extra } });
+  const send = (conv, extra = {}) => dmInPage({ method: 'send', args: { conversationId: conv.id, text: '你好', uid: ME, lastSid: '7001', ...extra } });
 
   test('locate、conv：按会话 id 精确找；没给会话 id 才认 peerUid；本人登录核对', async () => {
     const { conv } = page();
@@ -230,6 +271,29 @@ describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', ()
     assert.equal((await dmInPage({ method: 'conv', args: { peerUid: 'p1' } })).ok, false);
     const r = await dmInPage({ method: 'send', args: { conversationId: 'g1', text: '你好', uid: ME } });
     assert.deepEqual([r.ok, r.code, r.notSent], [false, 'group', true]);
+    // 两个字段矛盾（isGroupChat:false、type:2）也按群聊
+    page({ convs: [{ ...g, isGroupChat: false }] });
+    assert.equal((await dmInPage({ method: 'conv', args: { conversationId: 'g1' } })).conv.group, true);
+  });
+
+  test('身份只认私信服务同一条祖先链外层的 userInfo：前面另一条链上本人登录的身份不借用', async () => {
+    const { calls, conv } = page({ user: { uid: ME, is_confer_login: true }, decoy: { uid: ME, is_confer_login: false } });
+    assert.equal((await dmInPage({ method: 'conv', args: { conversationId: conv.id, uid: ME } })).login.owner, 0);
+    const r = await send(conv);
+    assert.deepEqual([r.code, r.notSent, calls.length], ['not-owner-login', true, 0]);
+    const b = page({ user: null, decoy: { uid: ME, is_confer_login: false } });
+    assert.equal((await send(b.conv)).code, 'not-owner-login');
+  });
+
+  test('send：会话最后一句不是发前核对的那条、或是我说的 → last-changed，SDK 零调用', async () => {
+    for (const extra of [{ lastSid: '6999' }]) {
+      const { calls, conv } = page();
+      const r = await send(conv, extra);
+      assert.deepEqual([r.code, r.notSent, calls.length], ['last-changed', true, 0]);
+    }
+    const { calls, conv } = page();
+    conv.lastMessage.isFromMe = true;
+    assert.deepEqual([(await send(conv)).code, calls.length], ['last-changed', 0]);
   });
 
   test('没有 Context：locate 返回 ok:false，并标明没发', async () => {
@@ -277,7 +341,7 @@ describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', ()
     const { conv } = page({ sendResult: 'throw' });
     const r = await send(conv);
     assert.deepEqual([r.ok, r.code, 'notSent' in r], [false, 'send:Error', false]);
-    assert.ok(!JSON.stringify(r).includes('你好') && !JSON.stringify(r).includes('abc'));
+    assert.ok(!JSON.stringify(r).includes('你好') && !JSON.stringify(r).includes('abc') && !JSON.stringify(r).includes('PrivateMessageText'));
   });
 
   test('send：返回 undefined → res:null；body.status 是 false → bodyStatus 记 x（不认识）', async () => {
@@ -285,6 +349,8 @@ describe('dmInPage：照页面的顺序调 IM SDK（假 document / fiber）', ()
     assert.equal((await send(a.conv)).res, null);
     const b = page({ sendResult: 'status-false' });
     assert.equal((await send(b.conv)).res.bodyStatus, 'x');
+    const c = page({ sendResult: 'status-null' });
+    assert.equal((await send(c.conv)).res.bodyStatus, 'x');
   });
 });
 

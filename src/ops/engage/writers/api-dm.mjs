@@ -35,23 +35,28 @@ export async function dmInPage({ method, args = {} }) {
   const isSvc = (v) => !!v && typeof v === 'object' && !!v.bytedIM && typeof v.bytedIM.createMessage === 'function'
     && typeof v.bytedIM.getMessagesByConversation === 'function' && typeof v.sendMessageWithAuth === 'function' && Array.isArray(v.conversationList);
   const isUser = (v) => !!v && typeof v === 'object' && !!v.userInfo && typeof v.userInfo === 'object';
+  // 身份要和私信服务在同一条祖先链上：先找到服务，再从服务那一层往外找最近的 userInfo；
+  // 第一条有服务的链就是用的那条，它外面没有 userInfo 就当读不到（不借别的链上的身份）
   let svc = null, user = null;
   const starts = [...document.querySelectorAll('li.semi-list-item'), ...document.querySelectorAll('[class*=chat-]')].slice(0, 30);
   for (const el of starts) {
-    for (let f = fiberOf(el), d = 0; f && d < 200 && !(svc && user); f = f.return, d++) {
+    for (let f = fiberOf(el), d = 0; f && d < 200; f = f.return, d++) {
       const v = f.memoizedProps?.value;
       if (!svc && isSvc(v)) svc = v;
-      if (!user && isUser(v)) user = v.userInfo;
+      if (svc && isUser(v)) { user = v.userInfo; break; }
     }
-    if (svc && user) break;
+    if (svc) break;
   }
   if (!svc) return { ok: false, code: 'service-missing', missing: true, notSent: true };
   if (method === 'locate') return svc.conversationList.length > 0 || svc.loading === false ? { ok: true } : { ok: false, code: 'list-loading' };
 
-  const codeOf = (e) => (typeof e?.type === 'number' && Number.isInteger(e.type) ? `t${e.type}` : /^[A-Za-z]{1,40}$/.test(String(e?.name ?? '')) ? e.name : 'Error');
+  // 错误只报 SDK 的数字错误类型或几个固定的内置错误名，别的一律记 Error（name 也可能被塞进业务数据）
+  const NAMES = ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'AbortError', 'TimeoutError', 'NetworkError'];
+  const codeOf = (e) => (typeof e?.type === 'number' && Number.isInteger(e.type) ? `t${e.type}` : NAMES.includes(e?.name) ? e.name : 'Error');
   const sidOf = (v) => (v != null && /^\d{1,30}$/.test(String(v)) && String(v) !== '0' ? String(v) : null);
   const idxOf = (v) => (v != null && /^\d{1,25}$/.test(String(v)) ? String(v) : null);
-  const isGroup = (c) => !!(c.isGroupChat ?? c.type === 2);
+  // 群聊：isGroupChat 是 true 或 type 是 2 任一成立就算（两个字段矛盾时按群聊，不发）
+  const isGroup = (c) => c.isGroupChat === true || c.type === 2;
   // 本人登录：is_confer_login 严格是 false，并且 userInfo 的 uid 就是要用的账号
   const login = { owner: user ? (user.is_confer_login === false ? 1 : user.is_confer_login === true ? 0 : -1) : null,
     uidMatch: !!user && args.uid != null && String(user.uid) === String(args.uid) };
@@ -76,7 +81,7 @@ export async function dmInPage({ method, args = {} }) {
     const msgs = r.messages.filter((m) => m && (m.conversationId == null || String(m.conversationId) === String(conv.id))).map((m) => {
       let text = null;
       try { text = (typeof m.content === 'string' ? JSON.parse(m.content) : m.content)?.text ?? null; } catch { text = null; }
-      return { sid: sidOf(m.serverId), mine: m.isFromMe === true, text: typeof text === 'string' ? text : null, idx: idxOf(m.indexInConversation) };
+      return { sid: sidOf(m.serverId), mine: typeof m.isFromMe === 'boolean' ? m.isFromMe : null, text: typeof text === 'string' ? text : null, idx: idxOf(m.indexInConversation) };
     });
     // 会话摘要在拉完之后取：SDK 处理拉到的消息时会更新会话的最后一条
     return { ok: true, conv: summary(), msgs, total: r.messages.length, ms: Date.now() - t0 };
@@ -86,6 +91,9 @@ export async function dmInPage({ method, args = {} }) {
     // 下面这几种都在调 sendMessageWithAuth 之前停下，页面确定没发
     if (login.owner !== 1 || !login.uidMatch) return { ok: false, code: 'not-owner-login', notSent: true };
     if (isGroup(conv)) return { ok: false, code: 'group', notSent: true };
+    // 发前重读之后会话又有了新的最后一句（对方又说了、或别处回过了）：不发
+    const lm = conv.lastMessage;
+    if (!lm || sidOf(lm.serverId) !== String(args.lastSid) || lm.isFromMe !== false) return { ok: false, code: 'last-changed', notSent: true };
     const content = JSON.stringify({ text: String(args.text), aweType: 774 });
     const o = { type: 7, content, conversation: conv };
     let msg;
@@ -96,11 +104,11 @@ export async function dmInPage({ method, args = {} }) {
     let r;
     try { r = await svc.sendMessageWithAuth({ message: msg, isRetry: false }); }
     catch (e) { return { ok: false, code: `send:${codeOf(e)}`, ms: Date.now() - t0 }; }
-    // 返回码只认整数；缺失记 null，其余类型（false、空串、对象…）记 'x'，Node 侧按不认识处理
-    const int = (v) => (v == null ? null : typeof v === 'number' && Number.isInteger(v) ? v : 'x');
-    const long = (v) => (v == null ? null : typeof v === 'number' && Number.isInteger(v) ? v : typeof v?.toString === 'function' && /^-?\d{1,12}$/.test(String(v)) ? Number(String(v)) : 'x');
+    // 返回码只认整数；缺失（undefined）记 null，其余（null、false、空串、对象…）记 'x'，Node 侧按不认识处理
+    const int = (v) => (v === undefined ? null : typeof v === 'number' && Number.isInteger(v) ? v : 'x');
+    const long = (v) => (v === undefined ? null : v === null ? 'x' : typeof v === 'number' && Number.isInteger(v) ? v : typeof v?.toString === 'function' && /^-?\d{1,12}$/.test(String(v)) ? Number(String(v)) : 'x');
     return { ok: true, ms: Date.now() - t0, res: r == null ? null : {
-      success: r.success === true ? 1 : r.success === false ? 0 : 'x', statusCode: int(r.statusCode), bodyStatus: int(r.body?.status), checkCode: long(r.checkCode),
+      success: r.success === true ? 1 : r.success === false ? 0 : 'x', statusCode: int(r.statusCode), bodyStatus: r.body === undefined ? null : r.body === null || typeof r.body !== 'object' ? 'x' : int(r.body.status), checkCode: long(r.checkCode),
       sid: sidOf(msg.serverId), flight: int(msg.flightStatus),
     } };
   }
@@ -127,6 +135,15 @@ export async function dmCaller(page, _platform, { waitMs = 60000, stepMs = 1500,
 }
 
 const big = (s) => BigInt(s);
+/** 拉到的页里最新的一条：拉完时会话的最后一条（服务端 id、序号都有）在页里，并且序号是页里最大的。 */
+function latestOf(p) {
+  const last = p.conv?.last;
+  if (!last?.sid || last.idx == null) return { ok: false, why: '，会话的最后一条没有服务端 id 或序号' };
+  const msg = p.msgs.find((m) => m.sid === last.sid);
+  if (!msg || msg.idx == null || msg.idx !== last.idx) return { ok: false, why: '里没有会话的最后一条' };
+  if (p.msgs.some((m) => m.idx != null && big(m.idx) > big(msg.idx))) return { ok: false, why: '里有比会话最后一条更新的消息' };
+  return { ok: true, msg };
+}
 const sendDiag = (r) => (!r.ok ? `send=err:${r.code ?? '-'}` : !r.res ? 'send=undefined'
   : `send=s${r.res.success},st${r.res.statusCode ?? '-'},b${r.res.bodyStatus ?? '-'},ck${r.res.checkCode ?? '-'},fs${r.res.flight ?? '-'},id${+(r.res.sid != null)}`) + `,${r.ms ?? '-'}ms`;
 const head = (s) => `诊断api v1 api=sendMessageWithAuth ${s.diag ?? 'send=-'}`;
@@ -140,7 +157,8 @@ export const douyinDmApi = {
   caller: dmCaller,
   async precheck({ call, params }) {
     const t = params.target ?? {};
-    if ([...norm(params.text)].length > DM_LIMITS.maxText) return { blocked: 'text-too-long', detail: `私信页编辑框最多 ${DM_LIMITS.maxText} 字` };
+    // 按实际送进 content.text 的原文计数（不去尾部换行）
+    if ([...String(params.text)].length > DM_LIMITS.maxText) return { blocked: 'text-too-long', detail: `私信页编辑框最多 ${DM_LIMITS.maxText} 字` };
     const c = await call('conv', { conversationId: t.conversationId ?? null, peerUid: t.conversationId == null ? t.peerUid ?? null : null, uid: params.uid });
     if (!c.ok) {
       if (c.missing) return { blocked: 'cannot-send', detail: '页面自己的私信服务（IM SDK）不见了，没发' };
@@ -153,16 +171,15 @@ export const douyinDmApi = {
     if (c.conv.last?.mine === true) return { blocked: 'last-is-me', detail: '会话最后一句是我说的' };
     const p = await call('pull', { conversationId: c.conv.id, limit: DM_LIMITS.pull });
     if (!p.ok) return p.missing ? { blocked: 'cannot-send', detail: '页面自己的私信服务（IM SDK）不见了，没发' } : { blocked: 'precheck-error', detail: `发前拉会话消息失败（${p.code ?? '-'}）` };
-    // 拉到的要是最新一页：拉完时会话的最后一条（要有服务端 id）得在里面，否则确认不了最后一句是谁说的
-    const last = p.conv?.last;
-    if (!last?.sid || !p.msgs.some((m) => m.sid === last.sid)) return { blocked: 'precheck-error', detail: `发前拉到的 ${p.msgs.length} 条里没有会话的最后一条（或最后一条没有服务端 id），确认不了最后一句是谁说的，没发` };
-    const top = p.msgs.filter((m) => m.idx != null).sort((a, b) => (big(a.idx) < big(b.idx) ? -1 : big(a.idx) > big(b.idx) ? 1 : 0)).at(-1);
-    if (!top) return { blocked: 'precheck-error', detail: '发前拉到的消息都没有会话序号，没发' };
-    if (last.mine === true || top.mine) return { blocked: 'last-is-me', detail: '拉到的最后一句是我说的' };
-    return { state: { conversationId: c.conv.id, boundary: top.idx, diag: null } };
+    // 拉到的要是最新一页：拉完时会话的最后一条（要有服务端 id、序号）在页里，并且就是页里序号最大的那条
+    const top = latestOf(p);
+    if (!top.ok) return { blocked: 'precheck-error', detail: `发前拉到的 ${p.msgs.length} 条${top.why}，确认不了最后一句是谁说的，没发` };
+    if (top.msg.mine === true || p.conv.last.mine === true) return { blocked: 'last-is-me', detail: '拉到的最后一句是我说的' };
+    if (top.msg.mine !== false || p.conv.last.mine === null) return { blocked: 'precheck-error', detail: '拉到的最后一句看不出是谁说的，没发' };
+    return { state: { conversationId: c.conv.id, boundary: top.msg.idx, lastSid: top.msg.sid, diag: null } };
   },
   async send({ call, params }, s) {
-    const r = await call('send', { conversationId: s.conversationId, text: params.text, uid: params.uid });
+    const r = await call('send', { conversationId: s.conversationId, text: params.text, uid: params.uid, lastSid: s.lastSid });
     s.diag = sendDiag(r);
     if (!r.ok && r.notSent) return { ok: false, notSent: true, detail: `${head(s)}，页面没调发送函数` };
     const x = r.ok ? r.res : null;
@@ -175,13 +192,14 @@ export const douyinDmApi = {
     if (!p.ok) return { items: null, detail: `${head(s)} pull=err:${p.code ?? '-'}` };
     const b = big(s.boundary);
     const covered = p.msgs.some((m) => m.idx != null && big(m.idx) <= b);
-    const newer = p.msgs.filter((m) => m.idx != null && big(m.idx) > b), mine = newer.filter((m) => m.mine);
+    const top = latestOf(p);
+    const newer = p.msgs.filter((m) => m.idx != null && big(m.idx) > b), mine = newer.filter((m) => m.mine === true);
     const eq = mine.filter((m) => m.text != null && norm(m.text) === norm(params.text));
-    const detail = `${head(s)} pull=getMessagesByConversation n=${p.msgs.length}/${newer.length}/${mine.length}/${eq.length},cov${+covered},${p.ms ?? '-'}ms`;
-    // 这一页没覆盖到发送前的边界：中间可能还有没拉到的新消息，确认不了「恰好 1 条」
-    if (!covered) return { items: null, detail };
-    // 我发的消息没有序号：分不清它在边界前还是后
-    if (p.msgs.some((m) => m.mine && m.idx == null)) return { items: null, detail: `${detail},noidx` };
+    const detail = `${head(s)} pull=getMessagesByConversation n=${p.msgs.length}/${newer.length}/${mine.length}/${eq.length},cov${+covered},top${+top.ok},${p.ms ?? '-'}ms`;
+    // 两头都要证实：这一页覆盖到发送前的边界（没漏中间），也拉到了最新端（拉完时会话的最后一条在页里、是序号最大的）
+    if (!covered || !top.ok) return { items: null, detail };
+    // 有序号缺失、或边界后有看不出是谁发的消息：分不清，确认不了「恰好 1 条」
+    if (p.msgs.some((m) => m.idx == null) || newer.some((m) => m.mine === null)) return { items: null, detail: `${detail},unsure` };
     return { items: [...new Set(eq.map((m) => m.sid ?? `idx:${m.idx}`))], detail };
   },
 };
