@@ -4,71 +4,248 @@
 <body>
 <wujie-app></wujie-app>
 <script>
-// 模式（?mode=）：ok | fail | silent | mangle | lastme | nobox | nouid
+// 模式（?mode=）：ok | scroll | swap | swap-header | swap-list | pending | fail | phonecheck | fail-history | locked | lastme | nobox | mangle | silent | nouid
 const mode = new URLSearchParams(location.search).get('mode') || 'ok';
 if (mode !== 'nouid') window.__loginUser = { uniqId: 'v2_me', nickname: '麦田测试号' };
 const ME_USER = 'me_finder';
-let sendClicks = 0, seq = 0, openId = null;
+let sendClicks = 0, seq = 0, listSid = '', headerSid = '', scrollLoads = 0, sawPending = false;
+let page2Loaded = false, page2Loading = false;
 const sr = document.querySelector('wujie-app').attachShadow({ mode: 'open' });
 sr.innerHTML = `<style>
-  .session-item { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
-  textarea { width: 300px; }
+  .private-msg-wrapper { display: flex; gap: 12px; font-family: sans-serif; }
+  .session-container { width: 220px; height: 220px; overflow-y: auto; border: 1px solid #ddd; }
+  .session-wrap { box-sizing: border-box; height: 44px; padding: 10px 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+  .session-wrap.active-session { background: #eef6ff; }
+  .session-dialog { flex: 1; min-width: 320px; }
+  .session-dialog .header { padding: 8px; border-bottom: 1px solid #ddd; font-weight: bold; }
+  .session-dialog .message-list { min-height: 120px; padding: 8px; }
+  textarea.edit_area { width: 300px; height: 60px; }
+  .weui-desktop-btn_disabled { opacity: 0.5; pointer-events: none; }
+  .phone-check-dialog { position: fixed; top: 40px; left: 40px; width: 240px; padding: 16px; background: #fff; border: 1px solid #c00; }
   .weui-desktop-toast { position: fixed; top: 4px; right: 4px; }
-</style><div class="session-wrap"><div class="session-list"></div></div><div class="chat-panel"></div><div class="toast-holder"></div>`;
+</style>
+<div class="private-msg-wrapper">
+  <div class="session-container"><div class="session-tg"></div></div>
+  <div class="session-dialog"></div>
+  <div class="phone-check-dialog" style="display:none">请先完成手机号安全验证</div>
+  <div class="toast-holder"></div>
+</div>`;
 const ts = Math.floor(Date.now() / 1000) - 3600;
-// 仿 S0：messageList 新到旧
-const msg = (msgId, from, to, t, text) => ({ message: { msgId, fromUsername: from, toUsername: to, ts: t, msgType: 1, textMsg: { content: text } } });
-const sessionList = [
-  ['s_1', { sessionInfo: { sessionId: 's_1', username: 'peer_a', nickname: '甲' }, messageList: [msg('m2', 'peer_a', ME_USER, ts + 10, '在吗'), msg('m1', ME_USER, 'peer_a', ts, '你好')], newMsgCount: 1, sessionIsUnread: true, sessionType: 1 }],
-  ['s_2', { sessionInfo: { sessionId: 's_2', username: 'peer_b', nickname: '乙' }, messageList: [msg('m3', 'peer_b', ME_USER, ts, '哈喽')], newMsgCount: 0, sessionIsUnread: false, sessionType: 1 }],
+// 仿真实视频号私信页：messageList 新到旧，带 currentMsgStatus（0=None, 1=Pending, 2=Success, 3=Failure）与服务端 svrMsgId
+const histMsg = (msgId, svrMsgId, from, to, t, text) => ({
+  currentMsgStatus: 0,
+  outLimitWarn: false,
+  message: { msgId, svrMsgId, sendMsgFlag: false, fromUsername: from, toUsername: to, ts: t, msgType: 1, textMsg: { content: text } },
+});
+const makeFiller = (idx) => {
+  const id = `s_f${String(idx).padStart(2, '0')}`;
+  const user = `peer_f${idx}`;
+  return [id, {
+    sessionInfo: { sessionId: id, username: user, nickname: `路人${idx}` },
+    messageList: [histMsg(`mf_${idx}`, `73800000000000010${String(idx).padStart(2, '0')}`, user, ME_USER, ts - idx * 60, `你好${idx}`)],
+    newMsgCount: 0, sessionIsUnread: false, sessionType: 1,
+  }];
+};
+const targetSessions = [
+  ['s_1', {
+    sessionInfo: { sessionId: 's_1', username: 'peer_a', nickname: '甲' },
+    messageList: [
+      histMsg('m2', '7380000000000000002', 'peer_a', ME_USER, ts + 10, '在吗'),
+      histMsg('m1', '7380000000000000001', ME_USER, 'peer_a', ts, '你好'),
+    ],
+    newMsgCount: 1, sessionIsUnread: true, sessionType: 1,
+  }],
+  ['s_2', {
+    sessionInfo: { sessionId: 's_2', username: 'peer_b', nickname: '乙' },
+    messageList: [histMsg('m3', '7380000000000000003', 'peer_b', ME_USER, ts, '哈喽')],
+    newMsgCount: 0, sessionIsUnread: false, sessionType: 1,
+  }],
 ];
-if (mode === 'lastme') sessionList[0][1].messageList.unshift(msg('m9', ME_USER, 'peer_a', ts + 20, '稍等'));
-sr.querySelector('.session-wrap').__vue__ = { $data: { sessionList } };
+if (mode === 'lastme') {
+  targetSessions[0][1].messageList.unshift(histMsg('m9', '7380000000000000009', ME_USER, 'peer_a', ts + 20, '稍等'));
+}
+if (mode === 'fail-history') {
+  targetSessions[0][1].messageList.unshift({
+    currentMsgStatus: 3,
+    outLimitWarn: false,
+    message: { msgId: 'old-fail-uuid', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 20, msgType: 1, textMsg: { content: '上次没发出去' } },
+  });
+}
+
+const sessionList = mode === 'scroll'
+  ? Array.from({ length: 12 }, (_, idx) => makeFiller(idx + 1))
+  : [...targetSessions];
+
+const wrapperEl = sr.querySelector('.private-msg-wrapper');
+const containerEl = sr.querySelector('.session-container');
+const tgEl = sr.querySelector('.session-tg');
+const dialogEl = sr.querySelector('.session-dialog');
+
+const tgVm = {
+  $options: { name: 'transition-group', _componentTag: 'transition-group' },
+  children: [],
+  _vnode: { children: [] },
+  $children: [],
+};
+const scrollListVm = {
+  $options: { name: 'CommonScrollList' },
+  $children: [tgVm],
+};
+const listVm = {
+  $data: { sessionList },
+  get currentSessionId() { return listSid; },
+  $children: [scrollListVm],
+};
+wrapperEl.__vue__ = listVm;
+containerEl.__vue__ = scrollListVm;
+tgEl.__vue__ = tgVm;
+
+const headerVm = {
+  $props: {},
+  $data: {},
+  get sessionInfo() {
+    const hit = sessionList.find(([id]) => id === headerSid);
+    return hit ? hit[1].sessionInfo : null;
+  },
+  $children: [],
+};
+const editorVm = { $props: {}, $data: {}, $children: [] };
+dialogEl.__vue__ = { $props: {}, $data: {}, $children: [headerVm, editorVm] };
+
+containerEl.addEventListener('scroll', () => {
+  if (mode !== 'scroll' || page2Loaded || page2Loading) return;
+  if (containerEl.scrollTop + containerEl.clientHeight < containerEl.scrollHeight - 20) return;
+  page2Loading = true;
+  setTimeout(() => {
+    page2Loaded = true;
+    page2Loading = false;
+    scrollLoads++;
+    for (let idx = 13; idx <= 18; idx++) sessionList.push(makeFiller(idx));
+    sessionList.push(...targetSessions);
+    renderList();
+  }, 150);
+});
 
 function renderList() {
-  const l = sr.querySelector('.session-list');
-  l.innerHTML = '';
+  tgEl.innerHTML = '';
+  const vnodes = [];
   for (const [id, s] of sessionList) {
     const el = document.createElement('div');
-    el.className = 'session-item';
-    el.textContent = s.sessionInfo.nickname + '：' + s.messageList[0].message.textMsg.content;
-    el.__vue__ = { $props: { session: s.sessionInfo } };
-    el.onclick = () => { openId = mode === 'swap' ? sessionList[1][0] : id; renderPanel(); };
-    l.appendChild(el);
+    el.className = 'session-wrap' + (id === listSid ? ' active-session' : '');
+    el.textContent = s.sessionInfo.nickname + '：' + (s.messageList[0]?.message?.textMsg?.content ?? '');
+    // 真实页面中 .session-wrap 是普通元素，不挂 __vue__
+    el.onclick = () => {
+      if (mode === 'swap') { listSid = 's_2'; headerSid = 's_2'; }
+      else if (mode === 'swap-header') { listSid = id; headerSid = 's_2'; }
+      else if (mode === 'swap-list') { listSid = 's_2'; headerSid = id; }
+      else { listSid = id; headerSid = id; }
+      renderList();
+      renderPanel();
+    };
+    tgEl.appendChild(el);
+    vnodes.push({ key: id, elm: el });
   }
+  tgVm.children = vnodes;
+  tgVm._vnode = { children: vnodes };
 }
 
 function renderPanel() {
-  const s = sessionList.find(([id]) => id === openId)[1];
-  const p = sr.querySelector('.chat-panel');
-  p.innerHTML = '';
-  // 仿 Vue：聊天区组件的 props 里带当前会话
-  p.__vue__ = { $props: { session: s.sessionInfo } };
-  for (const m of [...s.messageList].reverse()) { const d = document.createElement('div'); d.textContent = m.message.textMsg.content; p.appendChild(d); }
-  if (mode === 'nobox') return;
-  const f = document.createElement('div');
-  f.className = 'footer';
-  f.innerHTML = '<textarea class="edit_area"></textarea><div class="op"><button class="weui-desktop-btn">发送</button></div>';
-  p.appendChild(f);
-  const ta = f.querySelector('textarea');
-  if (mode === 'mangle') ta.addEventListener('input', () => { if (!ta.dataset.m) { ta.dataset.m = '1'; ta.value = ta.value.slice(0, -1); } });
-  f.querySelector('button').onclick = () => onSend(s, ta);
-}
+  const activeId = headerSid || listSid;
+  const hit = sessionList.find(([id]) => id === activeId);
+  dialogEl.innerHTML = '';
+  if (!hit) return;
+  const s = hit[1];
+  const header = document.createElement('div');
+  header.className = 'header';
+  header.textContent = s.sessionInfo.nickname;
+  header.__vue__ = headerVm;
+  dialogEl.appendChild(header);
 
-function toast(m) { sr.querySelector('.toast-holder').innerHTML = `<div class="weui-desktop-toast"><span>${m}</span></div>`; }
+  const msgBox = document.createElement('div');
+  msgBox.className = 'message-list';
+  for (const m of [...s.messageList].reverse()) {
+    const d = document.createElement('div');
+    d.textContent = m.message.textMsg.content;
+    msgBox.appendChild(d);
+  }
+  dialogEl.appendChild(msgBox);
+
+  if (mode === 'nobox') return;
+  const footer = document.createElement('div');
+  footer.className = 'footer';
+  footer.__vue__ = editorVm;
+  footer.innerHTML = '<textarea class="edit_area"></textarea><div class="weui-desktop-btn_wrp"><button class="weui-desktop-btn weui-desktop-btn_disabled" disabled>发送</button></div>';
+  dialogEl.appendChild(footer);
+
+  const ta = footer.querySelector('textarea');
+  const btn = footer.querySelector('button');
+  const syncBtn = () => {
+    const canSend = mode !== 'locked' && ta.value.trim().length > 0;
+    btn.disabled = !canSend;
+    btn.classList.toggle('weui-desktop-btn_disabled', !canSend);
+  };
+  ta.addEventListener('input', () => {
+    if (mode === 'mangle' && !ta.dataset.m) { ta.dataset.m = '1'; ta.value = ta.value.slice(0, -1); }
+    syncBtn();
+  });
+  btn.onclick = () => { if (!btn.disabled) onSend(s, ta); };
+}
 
 function onSend(s, ta) {
   sendClicks++;
   const text = ta.value;
-  if (mode === 'fail') { setTimeout(() => toast('发送失败'), 200); return; }
   if (mode === 'silent') return;
-  setTimeout(() => { s.messageList.unshift(msg('nm' + (++seq), ME_USER, s.sessionInfo.username, Math.floor(Date.now() / 1000), text)); renderList(); renderPanel(); }, 300);
+  const localId = 'local-uuid-' + (++seq);
+  const entry = {
+    currentMsgStatus: 1,
+    outLimitWarn: false,
+    message: {
+      msgId: localId,
+      svrMsgId: null,
+      sendMsgFlag: true,
+      fromUsername: ME_USER,
+      toUsername: s.sessionInfo.username,
+      ts: Math.floor(Date.now() / 1000),
+      msgType: 1,
+      textMsg: { content: text },
+    },
+  };
+  s.messageList.unshift(entry);
+  sawPending = true;
+  renderList();
+  renderPanel();
+
+  if (mode === 'pending') return;
+  if (mode === 'fail') {
+    setTimeout(() => { entry.currentMsgStatus = 3; }, 200);
+    return;
+  }
+  if (mode === 'phonecheck') {
+    setTimeout(() => {
+      entry.currentMsgStatus = 3;
+      sr.querySelector('.phone-check-dialog').style.display = 'block';
+    }, 200);
+    return;
+  }
+  setTimeout(() => {
+    entry.currentMsgStatus = 2;
+    entry.message.svrMsgId = '739000000000000000' + seq;
+    renderList();
+    renderPanel();
+  }, 350);
 }
 
 window.__probe = () => ({
-  sendClicks, openId,
+  sendClicks,
+  openId: listSid,
+  headerId: headerSid,
+  scrollLoads,
+  sawPending,
+  rowHasVue: [...sr.querySelectorAll('.session-wrap')].some((el) => '__vue__' in el),
   boxes: [...sr.querySelectorAll('textarea.edit_area')].map((b) => b.value),
-  mine: sessionList.flatMap(([id, s]) => s.messageList.filter((m) => m.message.msgId.startsWith('nm')).map((m) => ({ session: id, text: m.message.textMsg.content }))),
+  mine: sessionList.flatMap(([id, s]) => s.messageList
+    .filter((m) => m.currentMsgStatus === 2 && m.message?.svrMsgId)
+    .map((m) => ({ session: id, svrMsgId: m.message.svrMsgId, text: m.message.textMsg.content }))),
 });
 renderList();
 </script>

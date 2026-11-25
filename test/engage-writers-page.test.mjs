@@ -378,12 +378,50 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
     // 2026-11-21 真实页面：发送按钮是 .create-ft 里文字「评论」的 tag-wrap，没字时带 disabled class
     test('输入后「评论」仍是 disabled：cannot-send，框已清空，不点', async () => { const x = await reply('locked'); assertNoSend(x, 'cannot-send'); assertCleared(x); assert.equal(x.probe.hiddenClicks, 0); });
 
-    test('私信：只点一次发送、回读到一条', async () => {
+    test('私信：无 __vue__ 会话行 + 乐观 Pending 后转 Success+svrMsgId，只点一次并回读到服务端 svrMsgId', async () => {
       const x = await dm('ok');
-      assertSent(x, 'nm1');
-      assert.deepEqual(x.probe.mine, [{ session: 's_1', text: '你好，在的' }]);
+      assertSent(x, '7390000000000000001');
+      assert.equal(x.probe.rowHasVue, false);
+      assert.equal(x.probe.sawPending, true);
+      assert.deepEqual(x.probe.mine, [{ session: 's_1', svrMsgId: '7390000000000000001', text: '你好，在的' }]);
+    });
+    test('私信：目标在长列表下一页 → 滚动懒加载后定位、滚动到可视区并发送成功', async () => {
+      const x = await dm('scroll');
+      assertSent(x, '7390000000000000001');
+      assert.equal(x.probe.scrollLoads, 1);
+      assert.deepEqual(x.probe.mine, [{ session: 's_1', svrMsgId: '7390000000000000001', text: '你好，在的' }]);
     });
     test('私信：点开的不是目标会话 → target-not-found，不发', async () => assertNoSend(await dm('swap'), 'target-not-found'));
+    test('私信：SessionHeader 与目标会话不一致 → target-not-found，不发', async () => assertNoSend(await dm('swap-header'), 'target-not-found'));
+    test('私信：列表 currentSessionId 与目标会话不一致 → target-not-found，不发', async () => assertNoSend(await dm('swap-list'), 'target-not-found'));
+    test('私信：乐观写入停在 Pending(1) 无 svrMsgId → 不误报 sent，超时并给出 Pending 诊断', async () => {
+      const x = await dm('pending');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+      assert.match(x.r.readBack.detail, /Pending/);
+      assert.doesNotMatch(x.r.readBack.detail, /你好，在的/);
+    });
+    test('私信：乐观写入变为 Failure(3) → 不误报 sent，返回脱敏 sendError', async () => {
+      const x = await dm('fail');
+      assertNotReadBack(x);
+      assert.match(x.r.sendError, /Failure/);
+      assert.doesNotMatch(x.r.sendError, /你好，在的/);
+    });
+    test('私信：触发 .phone-check-dialog 手机验证弹窗 → 返回脱敏 sendError', async () => {
+      const x = await dm('phonecheck');
+      assertNotReadBack(x);
+      assert.match(x.r.sendError, /手机验证|phone-check-dialog/);
+      assert.doesNotMatch(x.r.sendError, /你好，在的/);
+    });
+    test('私信：历史存在旧 Failure(3) 消息 → 不触发 last-is-me 也不误报 sendError，正常发送成功', async () => {
+      const x = await dm('fail-history');
+      assertSent(x, '7390000000000000001');
+    });
+    test('私信：输入后发送按钮仍是 disabled → cannot-send，框已清空，不点', async () => {
+      const x = await dm('locked');
+      assertNoSend(x, 'cannot-send');
+      assertCleared(x);
+    });
     test('私信：最后一句是我 → last-is-me', async () => assertNoSend(await dm('lastme'), 'last-is-me'));
     test('私信：没有输入框 → no-input-box', async () => assertNoSend(await dm('nobox'), 'no-input-box'));
     test('私信：回读不到', async () => assertNotReadBack(await dm('silent')));
