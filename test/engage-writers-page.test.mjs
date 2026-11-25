@@ -403,13 +403,28 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
     test('私信：SessionHeader 与目标会话不一致 → target-not-found，不发', async () => assertNoSend(await dm('swap-header'), 'target-not-found'));
     test('私信：列表 currentSessionId 与目标会话不一致 → target-not-found，不发', async () => assertNoSend(await dm('swap-list'), 'target-not-found'));
     test('私信：无关组件带目标 ID 且祖先数据冲突 → target-not-found，不发', async () => assertNoSend(await dm('ancestor-conflict'), 'target-not-found'));
+    test('私信：列表切到目标、header 读不到、编辑器祖先仍绑定另一会话 → target-not-found，不发', async () => assertNoSend(await dm('editor-ancestor-mismatch'), 'target-not-found'));
+    test('私信：目标会话 messageList 未加载 → precheck-error，不以空基线发送', async () => assertNoSend(await dm('missing-msglist'), 'precheck-error'));
     test('私信：输入文字期间会话被切换 → 不点发送、清空输入框', async () => {
       const x = await dm('swap-during-type');
       assertNoSend(x, 'cannot-send');
       assertCleared(x);
     });
+    test('私信：点击发送瞬间切到另一会话并复用按钮 → capture guard 拦截，0 点击发送，返回脱敏 sendError', async () => {
+      const x = await dm('swap-before-click');
+      assert.equal(x.r.sendAttempted, true);
+      assert.equal(x.r.readBack?.found, false);
+      assert.equal(x.probe.sendClicks, 0);
+      assert.match(x.r.sendError, /已拦截未发出/);
+      assert.doesNotMatch(x.r.sendError, /你好，在的/);
+    });
     test('私信：旧 Pending 转 Success+svrMsgId 而本次 silent → 不误报 sent', async () => {
       const x = await dm('old-pending-promote');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+    });
+    test('私信：点击前已带 svrMsgId 的旧 Pending 转 Success 且本次 silent → 不误报 sent', async () => {
+      const x = await dm('old-pending-with-svr-promote');
       assertNotReadBack(x);
       assert.equal(x.r.sendError, undefined);
     });
@@ -446,10 +461,21 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
       assertNotReadBack(x);
       assert.equal(x.r.sendError, undefined);
     });
-    test('私信：无 msgId 旧 Pending 转 Failure 且本次 silent → 不误报 sendError', async () => {
+    test('私信：点击前存在无 msgId 旧 Pending → 点击前 precheck-error 拦截不发，框已清空', async () => {
       const x = await dm('anon-pending-fail');
+      assertNoSend(x, 'precheck-error');
+      assertCleared(x);
+    });
+    test('私信：无 msgId 旧 Failure 补齐 ID 同时本次变匿名 Pending（匿名数相等交换）→ 不误报 sendError', async () => {
+      const x = await dm('anon-failure-swap');
       assertNotReadBack(x);
       assert.equal(x.r.sendError, undefined);
+    });
+    test('私信：异步新增不同正文的匿名 Pending 且本次 silent → 不污染 Pending 诊断', async () => {
+      const x = await dm('other-text-anon-pending');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+      assert.doesNotMatch(x.r.readBack.detail, /Pending/);
     });
     test('私信：点击前已显示的手机验证弹窗且本次 silent → 不误报 sendError', async () => {
       const x = await dm('phonecheck-preexisting');
@@ -462,11 +488,23 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
       assert.match(x.r.sendError, /私信发送/);
       assert.doesNotMatch(x.r.sendError, /你好，在的/);
     });
+    test('私信：公共 pageError 回退竞态抓到含私信正文 toast → sendError 仍在出口脱敏不含原文', async () => {
+      const x = await dm('toast-race-leak');
+      assertNotReadBack(x);
+      assert.ok(x.probe.toastRaceReads >= 2, `应触发公共 toast 回退，实际读取次数 ${x.probe.toastRaceReads}`);
+      assert.match(x.r.sendError, /私信发送/);
+      assert.doesNotMatch(x.r.sendError, /你好，在的/);
+    });
     test('私信：footer 缺发送按钮但聊天记录里有正文「发送」→ cannot-send，不点聊天正文，框已清空', async () => {
       const x = await dm('nobtn-msg-send');
       assertNoSend(x, 'cannot-send');
       assertCleared(x);
       assert.equal(x.probe.msgTextClicks, 0);
+    });
+    test('私信：.session-dialog 外层挂 aria-disabled 且内有自定义发送控件 → cannot-send，框已清空，不点', async () => {
+      const x = await dm('dialog-disabled');
+      assertNoSend(x, 'cannot-send');
+      assertCleared(x);
     });
     test('私信：输入后发送按钮仍是 disabled → cannot-send，框已清空，不点', async () => {
       const x = await dm('locked');

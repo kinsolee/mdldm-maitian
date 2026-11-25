@@ -28,9 +28,24 @@ export const PAGES = {
 export const LIMITS = { maxExpand: 15, maxScroll: 6 };
 
 // S9：writeVia='api'（能力位 writeViaApi）时回复评论走页面内接口，见 ./api-reply.mjs；私信照旧用页面写法
-export function runInSpace(task, params) {
+export async function runInSpace(task, params) {
   if (params.writeVia === 'api' && params.op === 'reply') return runApiWrite(task, params, { api: channelsApi, hook: false, url, login });
-  return runWrite(task, params, { hook: false, url, login, prepareReply, prepareDM });
+  let dmPage = null;
+  try {
+    const res = await runWrite(task, params, {
+      hook: false,
+      url,
+      login,
+      prepareReply,
+      prepareDM: (ctx) => { dmPage = ctx.page; return prepareDM(ctx); },
+    });
+    if (params.op === 'sendDM' && res?.sendError) {
+      return { ...res, sendError: sanitizeDmSendError(res.sendError) };
+    }
+    return res;
+  } finally {
+    if (dmPage) await clearDmClickGuard(dmPage);
+  }
 }
 
 const url = (p) => (p.op === 'reply' ? p.urls?.comments ?? PAGES.comments : p.urls?.dms ?? PAGES.dms);
@@ -139,9 +154,7 @@ const FIND_SESSION_VM = `let v = null;
   for (let x = sr.querySelector('.session-wrap'), i = 0; x && i < 8 && !v; x = x.parentElement, i++) if (Array.isArray(x.__vue__?.$data?.sessionList)) v = x.__vue__;
   if (!v) for (const e of sr.querySelectorAll('*')) if (Array.isArray(e.__vue__?.$data?.sessionList)) { v = e.__vue__; break; }`;
 
-const DM_SESSIONS_SRC = `${FIND_SESSION_VM}
-  if (!v) return null;
-  return v.$data.sessionList.map(([id, s]) => ({
+const DM_SESSIONS_MAP_BODY = `const mapSessions = (list) => list.map(([id, s]) => ({
     sessionId: id,
     sessionType: s?.sessionType ?? null,
     newMsgCount: s?.newMsgCount ?? 0,
@@ -152,7 +165,8 @@ const DM_SESSIONS_SRC = `${FIND_SESSION_VM}
       nickname: s?.sessionInfo?.nickname,
       fromUserType: s?.sessionInfo?.fromUserType ?? null,
     },
-    messageList: (s?.messageList ?? []).filter(Boolean).map((m) => ({
+    hasMessageList: Array.isArray(s?.messageList),
+    messageList: Array.isArray(s?.messageList) ? s.messageList.filter(Boolean).map((m) => ({
       currentMsgStatus: typeof m.currentMsgStatus === 'number' ? m.currentMsgStatus : null,
       outLimitWarn: !!m.outLimitWarn,
       message: m.message ? {
@@ -165,8 +179,13 @@ const DM_SESSIONS_SRC = `${FIND_SESSION_VM}
         msgType: m.message.msgType,
         textMsg: m.message.textMsg ? { content: m.message.textMsg.content } : null,
       } : null,
-    })),
+    })) : null,
   }));`;
+
+const DM_SESSIONS_SRC = `${FIND_SESSION_VM}
+  if (!v) return null;
+  ${DM_SESSIONS_MAP_BODY}
+  return mapSessions(v.$data.sessionList);`;
 
 const FIND_ROW_SRC = `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
   ${FIND_SESSION_VM}
@@ -245,7 +264,7 @@ const READ_OPENED_SIDS_BODY = `${FIND_SESSION_VM}
   const ids = [];
   addUnique(ids, listId);
   for (const id of headerIds) addUnique(ids, id);
-  if (!ids.length && box) {
+  if (box) {
     const idOf = (val) => (val && typeof val === 'object' ? val.sessionId ?? val.sessionInfo?.sessionId ?? null : null);
     for (let el = box, depth = 0; el && depth < 12; el = el.parentElement || el.getRootNode()?.host, depth++) {
       const vm = el.__vue__;
@@ -254,6 +273,9 @@ const READ_OPENED_SIDS_BODY = `${FIND_SESSION_VM}
         addUnique(ids, safe(() => vm.currentSessionId));
         break;
       }
+      addUnique(ids, safe(() => vm.sessionInfo?.sessionId));
+      addUnique(ids, safe(() => vm.currentSessionId));
+      addUnique(ids, safe(() => vm.sessionId));
       for (const bag of [vm.$props, vm.$data]) {
         if (!bag || typeof bag !== 'object') continue;
         addUnique(ids, safe(() => idOf(bag)));
@@ -263,8 +285,21 @@ const READ_OPENED_SIDS_BODY = `${FIND_SESSION_VM}
   }
   const openedOk = ids.length > 0 && ids.every((x) => x === targetSid);`;
 
-const READ_OPENED_SIDS_SRC = `const box = __marked('box');
-  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => el.getClientRects().length);
+const IS_VISIBLE_BODY = `const isVisible = (el) => {
+    if (!el || !el.isConnected || !el.getClientRects().length) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    for (let cur = el; cur; cur = cur.parentElement || cur.getRootNode?.()?.host || null) {
+      if (cur.nodeType !== 1) continue;
+      const st = getComputedStyle(cur);
+      if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+    }
+    return true;
+  };`;
+
+const READ_OPENED_SIDS_SRC = `${IS_VISIBLE_BODY}
+  const box = __marked('box');
+  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => isVisible(el));
   if (!box || !box.isConnected || !sr.contains(box) || boxes.length !== 1 || boxes[0] !== box) return { ok: false, ids: [], boxMissing: true };
   const targetSid = arg;
   ${READ_OPENED_SIDS_BODY}
@@ -272,19 +307,12 @@ const READ_OPENED_SIDS_SRC = `const box = __marked('box');
 
 const FIND_DM_SEND_BODY = `const re = /^发送$/;
   const txt = (el) => (el.innerText || el.textContent || '').trim();
-  const isVisible = (el) => {
-    if (!el || !el.isConnected || !el.getClientRects().length) return false;
-    const st = getComputedStyle(el);
-    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const isDisabled = (el, stop) => {
-    for (let cur = el; cur; cur = cur.parentElement) {
-      if (cur.disabled || cur.hasAttribute?.('disabled') || cur.getAttribute?.('aria-disabled') === 'true') return true;
+  const isDisabled = (el) => {
+    for (let cur = el; cur; cur = cur.parentElement || cur.getRootNode?.()?.host || null) {
+      if (cur.nodeType !== 1) continue;
+      if (cur.disabled || cur.inert || cur.hasAttribute?.('disabled') || cur.hasAttribute?.('inert') || cur.getAttribute?.('aria-disabled') === 'true') return true;
       if (cur.classList && [...cur.classList].some((cls) => /disabled/i.test(cls))) return true;
       if (getComputedStyle(cur).pointerEvents === 'none') return true;
-      if (cur === stop) break;
     }
     return false;
   };
@@ -299,13 +327,14 @@ const FIND_DM_SEND_BODY = `const re = /^发送$/;
         && !el.querySelector('textarea, [contenteditable=true]')
         && !box.contains(el));
     const inner = hits.filter((h) => !hits.some((other) => other !== h && h.contains(other)));
-    if (inner.length === 1 && !isDisabled(inner[0], scope)) sendBtn = inner[0];
+    if (inner.length === 1 && !isDisabled(inner[0])) sendBtn = inner[0];
   }
 `;
 
 const dmSendSrc = (sid) => `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
+  ${IS_VISIBLE_BODY}
   const box = __marked('box');
-  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => el.getClientRects().length);
+  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => isVisible(el));
   if (!box || !box.isConnected || !sr.contains(box) || boxes.length !== 1 || boxes[0] !== box) return null;
   const targetSid = ${JSON.stringify(sid)};
   ${READ_OPENED_SIDS_BODY}
@@ -313,24 +342,93 @@ const dmSendSrc = (sid) => `const sr = document.querySelector('wujie-app')?.shad
   ${FIND_DM_SEND_BODY}
   return sendBtn;`;
 
-const PRE_CLICK_VERIFY_SRC = `const box = __marked('box');
-  const markedSend = __marked('send');
-  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => el.getClientRects().length);
-  if (!box || !box.isConnected || !sr.contains(box) || boxes.length !== 1 || boxes[0] !== box) return { ok: false, reason: '点击发送前输入框消失或不唯一' };
-  const targetSid = arg;
-  ${READ_OPENED_SIDS_BODY}
-  if (!openedOk) return { ok: false, reason: ids.length ? '点击发送前会话已切换（期望 ' + targetSid + '，当前 ' + [...new Set(ids)].join('/') + '）' : '点击发送前读不到当前打开的会话' };
-  ${FIND_DM_SEND_BODY}
-  if (!sendBtn || !markedSend || sendBtn !== markedSend) return { ok: false, reason: '点击发送前发送按钮已失效或发生变化' };
-  return { ok: true };`;
+const DM_GUARD_BLOCKED_ERR = '点击发送瞬间会话已切换或按钮失效，已拦截未发出';
 
-const PHONE_DIALOG_SRC = `return __qa('.phone-check-dialog').some((el) => {
-  if (!el.getClientRects().length) return false;
-  const st = getComputedStyle(el);
-  if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
-  const r = el.getBoundingClientRect();
-  return r.width > 0 && r.height > 0;
-});`;
+const PRE_CLICK_SNAPSHOT_SRC = `try { window.__mtChannelsDmGuard?.cleanup?.(); delete window.__mtChannelsDmGuard; } catch {}
+  const sr = document.querySelector('wujie-app')?.shadowRoot;
+  if (!sr) return { ok: false, reason: '点击发送前找不到 wujie shadowRoot' };
+  ${IS_VISIBLE_BODY}
+  ${DM_SESSIONS_MAP_BODY}
+  const normLocal = (val) => {
+    if (val == null) return null;
+    const str = String(val).trim();
+    return str || null;
+  };
+  const isLastMe = (session, peerName) => {
+    const list = Array.isArray(session?.messageList) ? session.messageList : [];
+    let best = null;
+    for (const item of list) {
+      if (!item || item.currentMsgStatus === 3 || !item.message || item.message.ts == null) continue;
+      if (!best || Number(item.message.ts) > Number(best.ts)) best = item.message;
+    }
+    return !!best && best.fromUsername !== peerName;
+  };
+  const verifyState = (targetSid, peerName) => {
+    const box = __marked('box');
+    const markedSend = __marked('send');
+    const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => isVisible(el));
+    if (!box || !box.isConnected || !sr.contains(box) || boxes.length !== 1 || boxes[0] !== box) {
+      return { ok: false, reason: '点击发送前输入框消失或不唯一' };
+    }
+    ${READ_OPENED_SIDS_BODY}
+    if (!openedOk) {
+      return { ok: false, reason: ids.length ? '点击发送前会话已切换（期望 ' + targetSid + '，当前 ' + [...new Set(ids)].join('/') + '）' : '点击发送前读不到当前打开的会话' };
+    }
+    ${FIND_DM_SEND_BODY}
+    if (!sendBtn || !markedSend || sendBtn !== markedSend) {
+      return { ok: false, reason: '点击发送前发送按钮已失效或发生变化' };
+    }
+    const sessions = v ? mapSessions(v.$data.sessionList) : [];
+    const cur = sessions.find((item) => String(item.sessionId) === targetSid) ?? null;
+    if (!cur) return { ok: false, reason: '点击发送前读不到目标会话 ' + targetSid };
+    if (!cur.hasMessageList) return { ok: false, reason: '点击发送前目标会话消息列表未加载，无法核对历史消息' };
+    if (isLastMe(cur, peerName)) return { ok: false, reason: '点击发送前看到会话最后一句已是我说的' };
+    return { ok: true, cur, markedSend };
+  };
+  const check = verifyState(arg.sid, arg.peer);
+  if (!check.ok) return { ok: false, reason: check.reason };
+  let mineAnonPendingCount = 0;
+  for (const raw of check.cur.messageList) {
+    if (typeof raw?.currentMsgStatus === 'number' && raw.message?.fromUsername !== arg.peer && raw.currentMsgStatus === 1 && !normLocal(raw.message?.msgId)) {
+      mineAnonPendingCount++;
+    }
+  }
+  if (mineAnonPendingCount > 0) {
+    return { ok: false, reason: '点击发送前存在无本地 ID 的发送中消息，无法安全核对回读' };
+  }
+  const phoneDialogVisible = __qa('.phone-check-dialog').some((el) => isVisible(el));
+  const toastRe = /失败|错误|异常|频繁|稍后|违规|无法|不能|受限|限制|不支持/;
+  const curToasts = [];
+  for (const el of __qa('[class*=toast], [class*=Toast], [role=alert], [class*=notice], [class*=Notice]')) {
+    const text = (el.innerText || '').trim();
+    if (text && text.length < 80 && toastRe.test(text) && el.getClientRects().length) curToasts.push(text);
+  }
+  const guard = { blockedReason: null, cleanup: null };
+  const onClick = (ev) => {
+    const path = typeof ev.composedPath === 'function' ? ev.composedPath() : [];
+    const hitSend = path.includes(check.markedSend) || (ev.target instanceof Node && check.markedSend.contains(ev.target));
+    if (!hitSend) return;
+    guard.cleanup?.();
+    const live = verifyState(arg.sid, arg.peer);
+    if (!live.ok) {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      guard.blockedReason = ${JSON.stringify(DM_GUARD_BLOCKED_ERR)};
+    }
+  };
+  sr.addEventListener('click', onClick, true);
+  guard.cleanup = () => {
+    sr.removeEventListener('click', onClick, true);
+    guard.cleanup = null;
+  };
+  window.__mtChannelsDmGuard = guard;
+  return { ok: true, cur: check.cur, phoneDialogVisible, toasts: [...new Set(curToasts)] };`;
+
+const PHONE_DIALOG_SRC = `${IS_VISIBLE_BODY}
+  return __qa('.phone-check-dialog').some((el) => isVisible(el));`;
+
+const clearDmClickGuard = (page) => inPage(page, 'try { window.__mtChannelsDmGuard?.cleanup?.(); delete window.__mtChannelsDmGuard; } catch {} return true;').catch(() => {});
+const readDmGuardBlocked = (page) => inPage(page, 'return window.__mtChannelsDmGuard?.blockedReason ?? null;').catch(() => null);
 
 const dmSessions = async (page) => (await inShadow(page, DM_SESSIONS_SRC)) ?? [];
 const lastOf = (s) => [...(s.messageList ?? [])]
@@ -350,6 +448,14 @@ const normLocalId = (val) => {
   return str || null;
 };
 
+const SAFE_DM_ERRORS = new Set([
+  '触发手机验证弹窗(.phone-check-dialog)，发送被风控拦截',
+  '私信发送失败（页面消息状态 Failure，触发条数/频控限制）',
+  '私信发送失败（页面消息状态 Failure）',
+  DM_GUARD_BLOCKED_ERR,
+]);
+const SAFE_TOAST_ERROR_RE = /^私信发送(?:触发平台安全验证提示|触发频控或条数限制提示|触发内容审核限制提示|受限（平台页面提示无法发送）|失败（平台页面弹出错误提示）)(?:（errcode=-?\d{1,6}）)?$/;
+
 function sanitizeToastError(rawToast) {
   const text = String(rawToast ?? '');
   const codeMatch = text.match(/(?:errcode|err_code|错误码)[=:：\s]*(-?\d{1,6})(?!\d)/i);
@@ -359,6 +465,12 @@ function sanitizeToastError(rawToast) {
   if (/违规|敏感|涉政|违禁/.test(text)) return `私信发送触发内容审核限制提示${codeSuffix}`;
   if (/不支持|无法|不能|受限|限制|拒收|拉黑|关闭/.test(text)) return `私信发送受限（平台页面提示无法发送）${codeSuffix}`;
   return `私信发送失败（平台页面弹出错误提示）${codeSuffix}`;
+}
+
+function sanitizeDmSendError(raw) {
+  const text = String(raw ?? '').trim();
+  if (SAFE_DM_ERRORS.has(text) || SAFE_TOAST_ERROR_RE.test(text)) return text;
+  return sanitizeToastError(text);
 }
 
 function countLocalIds(messageList) {
@@ -371,6 +483,7 @@ function countLocalIds(messageList) {
 }
 
 async function prepareDM({ page, params, t }) {
+  await clearDmClickGuard(page);
   const tg = params.target ?? {};
   const wantConvId = tg.conversationId != null && String(tg.conversationId).trim() !== '' ? String(tg.conversationId).trim() : null;
   const wantPeerUid = tg.peerUid != null && String(tg.peerUid).trim() !== '' ? String(tg.peerUid).trim() : null;
@@ -422,7 +535,7 @@ async function prepareDM({ page, params, t }) {
   const peer = s.sessionInfo?.username ?? wantPeerUid;
   if (!peer) return { blocked: 'target-not-found', detail: `会话 ${sid} 缺少对方 username，无法判断收发方` };
   const lastIsMe = (x) => { const m = lastOf(x); return !!m && m.fromUsername !== peer; };
-  if (lastIsMe(s)) return { blocked: 'last-is-me', detail: '会话最后一句是我说的' };
+  if (s.hasMessageList && lastIsMe(s)) return { blocked: 'last-is-me', detail: '会话最后一句是我说的' };
   const row = await mark(page, 'conv', FIND_ROW_SRC, sid);
   if (!row) return { blocked: 'target-not-found', detail: `读到了会话 ${sid} 的数据，但没找到能点开的会话行` };
   await inPage(page, `const el = __marked('conv'); if (!el) return false; el.scrollIntoView({ block: 'center' }); return true;`);
@@ -446,31 +559,34 @@ async function prepareDM({ page, params, t }) {
       };
     }
   }
-  const now = bySid(await dmSessions(page));
-  if (now && lastIsMe(now)) return { blocked: 'last-is-me', detail: '打开会话后看到最后一句是我说的' };
+  let now = bySid(await dmSessions(page));
+  if (now?.hasMessageList && lastIsMe(now)) return { blocked: 'last-is-me', detail: '打开会话后看到最后一句是我说的' };
   if (!box) return { blocked: 'no-input-box', detail: '打开会话后没有唯一的输入框（textarea.edit_area）' };
+  if (!now?.hasMessageList) {
+    await waitFor(async () => {
+      now = bySid(await dmSessions(page));
+      return now?.hasMessageList ? true : null;
+    }, Math.min(t.boxMs, 2000), 200);
+  }
+  if (!now || !now.hasMessageList) {
+    return { blocked: 'precheck-error', detail: `打开会话 ${sid} 后消息列表未加载，无法核对历史消息，没发` };
+  }
+  if (lastIsMe(now)) return { blocked: 'last-is-me', detail: '打开会话后看到最后一句是我说的' };
   const wantText = norm(params.text);
   let baseline = null;
 
   const snapshotBeforeClick = async () => {
-    const verified = await inShadow(page, PRE_CLICK_VERIFY_SRC, sid);
-    if (!verified?.ok) {
+    const snap = await inPage(page, PRE_CLICK_SNAPSHOT_SRC, { sid, peer });
+    if (!snap?.ok) {
       await clearBox(page).catch(() => {});
-      throw new Error(verified?.reason ?? '点击发送前页面状态校验失败');
+      throw new Error(snap?.reason ?? '点击发送前页面状态校验失败');
     }
-    const cur = bySid(await dmSessions(page));
-    if (!cur) {
-      await clearBox(page).catch(() => {});
-      throw new Error(`点击发送前读不到目标会话 ${sid}`);
-    }
-    if (lastIsMe(cur)) {
-      await clearBox(page).catch(() => {});
-      throw new Error('点击发送前看到会话最后一句已是我说的');
-    }
+    const cur = snap.cur;
     const allLocalIds = new Set();
-    const beforeSvrIds = new Set();
+    const beforeAllSvrIds = new Set();
     let minePendingCount = 0;
     let mineAnonPendingCount = 0;
+    let mineSameTextAnonPendingCount = 0;
     let mineAnonUnsettledCount = 0;
     for (const raw of cur.messageList ?? []) {
       const m = raw?.message;
@@ -478,23 +594,27 @@ async function prepareDM({ page, params, t }) {
       const lid = normLocalId(m.msgId);
       if (lid) allLocalIds.add(lid);
       const svrId = validSvrMsgId(m.svrMsgId);
-      if (svrId) beforeSvrIds.add(svrId);
+      if (svrId) beforeAllSvrIds.add(svrId);
       if (typeof raw.currentMsgStatus === 'number' && m.fromUsername !== peer) {
         if (raw.currentMsgStatus === 1) minePendingCount++;
         if (!lid) {
-          if (raw.currentMsgStatus === 1) mineAnonPendingCount++;
+          if (raw.currentMsgStatus === 1) {
+            mineAnonPendingCount++;
+            if (norm(m.textMsg?.content) === wantText) mineSameTextAnonPendingCount++;
+          }
           if (raw.currentMsgStatus === 1 || raw.currentMsgStatus === 3) mineAnonUnsettledCount++;
         }
       }
     }
     baseline = {
       allLocalIds,
-      beforeSvrIds,
+      beforeAllSvrIds,
       minePendingCount,
       mineAnonPendingCount,
+      mineSameTextAnonPendingCount,
       mineAnonUnsettledCount,
-      phoneDialogVisible: Boolean(await inPage(page, PHONE_DIALOG_SRC)),
-      toasts: new Set((await toasts(page)) ?? []),
+      phoneDialogVisible: Boolean(snap.phoneDialogVisible),
+      toasts: new Set(snap.toasts ?? []),
     };
     return cur;
   };
@@ -503,7 +623,9 @@ async function prepareDM({ page, params, t }) {
     send: dmSendSrc(sid),
     items: async () => {
       const isBaselinePass = !baseline;
+      if (!isBaselinePass && await readDmGuardBlocked(page)) return [];
       const cur = isBaselinePass ? await snapshotBeforeClick() : bySid(await dmSessions(page));
+      if (!cur?.hasMessageList) return [];
       const localIdCounts = countLocalIds(cur?.messageList);
       const out = [];
       for (const raw of cur?.messageList ?? []) {
@@ -515,11 +637,13 @@ async function prepareDM({ page, params, t }) {
           const okStatus = st === 2 || (st === 0 && !m.sendMsgFlag);
           const svrId = validSvrMsgId(m.svrMsgId);
           if (!okStatus || !svrId) continue;
-          if (!isBaselinePass && m.fromUsername !== peer && !baseline.beforeSvrIds.has(svrId)) {
+          if (!isBaselinePass && m.fromUsername !== peer) {
+            if (baseline.beforeAllSvrIds.has(svrId)) continue;
             const lid = normLocalId(m.msgId);
             if (lid && baseline.allLocalIds.has(lid)) continue;
             if (lid && (localIdCounts.get(lid) ?? 0) > 1) continue;
             if (!lid && baseline.minePendingCount > 0) continue;
+            if (baseline.mineAnonPendingCount > 0) continue;
           }
           out.push({ id: svrId, mine: m.fromUsername !== peer, rel: true, text: m.textMsg?.content ?? null });
         } else {
@@ -530,12 +654,14 @@ async function prepareDM({ page, params, t }) {
     },
     apiError: async () => {
       if (!baseline) return null;
+      const guardBlocked = await readDmGuardBlocked(page);
+      if (guardBlocked) return guardBlocked;
       const cur = bySid(await dmSessions(page));
       const phoneNow = Boolean(await inPage(page, PHONE_DIALOG_SRC));
       if (!baseline.phoneDialogVisible && phoneNow) {
         return '触发手机验证弹窗(.phone-check-dialog)，发送被风控拦截';
       }
-      if (cur) {
+      if (cur?.hasMessageList) {
         const localIdCounts = countLocalIds(cur.messageList);
         let curAnonUnsettledCount = 0;
         let hasAnonNewMineSuccess = false;
@@ -545,18 +671,19 @@ async function prepareDM({ page, params, t }) {
           const st = raw?.currentMsgStatus;
           if (!m || typeof st !== 'number' || m.fromUsername === peer) continue;
           const lid = normLocalId(m.msgId);
+          const svrId = validSvrMsgId(m.svrMsgId);
           if (!lid) {
             if (st === 1 || st === 3) curAnonUnsettledCount++;
-            const svrId = validSvrMsgId(m.svrMsgId);
-            if ((st === 2 && (!svrId || !baseline.beforeSvrIds.has(svrId))) || (st === 0 && !m.sendMsgFlag && svrId && !baseline.beforeSvrIds.has(svrId))) {
+            if ((st === 2 && (!svrId || !baseline.beforeAllSvrIds.has(svrId))) || (st === 0 && !m.sendMsgFlag && svrId && !baseline.beforeAllSvrIds.has(svrId))) {
               hasAnonNewMineSuccess = true;
             }
             continue;
           }
           if (baseline.allLocalIds.has(lid)) continue;
+          if (svrId && baseline.beforeAllSvrIds.has(svrId)) continue;
           if (norm(m.textMsg?.content) === wantText) sameTextNewMineWithId.push({ raw, lid });
         }
-        const noAnonAmbiguity = curAnonUnsettledCount === baseline.mineAnonUnsettledCount && !hasAnonNewMineSuccess;
+        const noAnonAmbiguity = baseline.mineAnonUnsettledCount === 0 && curAnonUnsettledCount === 0 && !hasAnonNewMineSuccess;
         if (noAnonAmbiguity && sameTextNewMineWithId.length === 1) {
           const { raw, lid } = sameTextNewMineWithId[0];
           if (raw.currentMsgStatus === 3 && (localIdCounts.get(lid) ?? 0) === 1) {
@@ -573,25 +700,25 @@ async function prepareDM({ page, params, t }) {
     diagnose: async () => {
       if (!baseline) return null;
       const cur = bySid(await dmSessions(page));
-      if (!cur) return null;
-      let curAnonPendingCount = 0;
+      if (!cur?.hasMessageList) return null;
+      let curSameTextAnonPendingCount = 0;
       let hasNewPending = false;
       let hasNewNoSvrSuccess = false;
       for (const raw of cur.messageList ?? []) {
         const m = raw?.message;
         const st = raw?.currentMsgStatus;
         if (!m || typeof st !== 'number' || m.fromUsername === peer) continue;
+        if (norm(m.textMsg?.content) !== wantText) continue;
         const lid = normLocalId(m.msgId);
         if (!lid) {
-          if (st === 1) curAnonPendingCount++;
+          if (st === 1) curSameTextAnonPendingCount++;
           continue;
         }
         if (baseline.allLocalIds.has(lid)) continue;
-        if (norm(m.textMsg?.content) !== wantText) continue;
         if (st === 1) hasNewPending = true;
         if (st === 2 && !validSvrMsgId(m.svrMsgId)) hasNewNoSvrSuccess = true;
       }
-      if (hasNewPending || curAnonPendingCount > baseline.mineAnonPendingCount) {
+      if (hasNewPending || curSameTextAnonPendingCount > baseline.mineSameTextAnonPendingCount) {
         return '消息仍处于发送中(Pending)，未拿到服务端 svrMsgId';
       }
       if (hasNewNoSvrSuccess) return '消息状态为 Success 但未拿到有效服务端 svrMsgId';
