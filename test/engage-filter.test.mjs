@@ -1,8 +1,8 @@
-// 推送前的确定过滤：self-author、peer-reply 的命中与不命中，自动回执 skipped，不进 unhandled，不推给订阅方。
+// 推送前的确定过滤：仅保留 self-author 的命中与不命中，自动回执 skipped，不进 unhandled，不推给订阅方；楼中楼网友互回照常推。
 import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { ingestSnapshot, insertEvent } from '../src/ops/engage/store.mjs';
-import { applyEventFilters, filterRuleFor } from '../src/ops/engage/filter.mjs';
+import { FILTER_RULES, applyEventFilters, filterRuleFor } from '../src/ops/engage/filter.mjs';
 import { listEvents, ackEvent } from '../src/ops/engage/query.mjs';
 import { subscribe } from '../src/ops/engage/subscribers.mjs';
 import { deliverPending } from '../src/daemon/outbox.mjs';
@@ -25,53 +25,44 @@ function seed(db, later) {
 const ruleOf = (db, nativeId) => filterRuleFor(db, { type: 'comment.created', subjectId: `Douyin:${nativeId}` });
 
 describe('规则', () => {
-  test('一楼永远不算 peer-reply', () => {
+  test('FILTER_RULES 仅包含 self-author', () => {
+    assert.deepEqual(FILTER_RULES, ['self-author']);
+  });
+
+  test('depth = 0 一楼评论不过滤', () => {
     const db = freshDb();
     seed(db, () => [comment('top', { uid: 'u-x' })]);
     assert.equal(ruleOf(db, 'top'), null);
   });
 
-  test('楼中楼回 Kinso：父评论是 Kinso 的，不过滤', () => {
+  test('楼中楼回 Kinso：父评论是 Kinso 的，或 replyTo 指向 Kinso，不过滤', () => {
     const db = freshDb();
-    seed(db, () => [comment('toMe', { parent: 'me0', uid: 'u-x' })]);
+    seed(db, (me, acc) => [
+      comment('toMe', { parent: 'me0', uid: 'u-x' }),
+      comment('toMe2', { parent: 'r1', uid: 'u-x', replyTo: { uid: acc.uid, nickname: 'Kinso' } }),
+    ]);
     assert.equal(ruleOf(db, 'toMe'), null);
-  });
-
-  test('楼中楼回 Kinso：父评论是网友的，但 replyTo 的 uid 是 Kinso，不过滤', (t) => {
-    const db = freshDb();
-    seed(db, (me, acc) => [comment('toMe2', { parent: 'r1', uid: 'u-x', replyTo: { uid: acc.uid, nickname: 'Kinso' } })]);
     assert.equal(ruleOf(db, 'toMe2'), null);
   });
 
-  test('replyTo 的 uid 是 Kinso 在评论里的 uid（和账号 uid 写法不同）：不过滤', () => {
-    const db = freshDb();
-    const acc = douyin(db);
-    const me = { isMe: true, uid: 'sec-kinso', nick: 'Kinso' };
-    const base = [comment('r1', { uid: 'u-r1' }), comment('mine', { ...me, parent: 'r1' })];
-    ingestSnapshot(db, acc, commentsSnap(base), { now: at(T0) });
-    ingestSnapshot(db, acc, commentsSnap([...base, comment('back', { parent: 'r1', uid: 'u-x', replyTo: { uid: 'sec-kinso', nickname: 'Kinso' } })]), { now: at(T0 + MIN) });
-    assert.equal(ruleOf(db, 'back'), null);
-  });
-
-  test('楼中楼网友互回：父评论是网友的、没有 replyTo → peer-reply', () => {
+  test('depth = 1 挂网友一楼且 replyTo 为空：不过滤（不再按 peer-reply 过滤）', () => {
     const db = freshDb();
     seed(db, () => [comment('peer', { parent: 'r1', uid: 'u-x' })]);
-    assert.equal(ruleOf(db, 'peer'), 'peer-reply');
+    assert.equal(db.prepare("SELECT depth FROM comments WHERE id = 'Douyin:peer'").get().depth, 1);
+    assert.equal(ruleOf(db, 'peer'), null);
   });
 
-  test('楼中楼网友互回：replyTo 是另一个网友的 uid → peer-reply', () => {
+  test('depth ≥ 2 带另一个网友的 replyToUid：不过滤', () => {
     const db = freshDb();
-    seed(db, () => [comment('peer2', { parent: 'r1', uid: 'u-x', replyTo: { uid: 'u-r1', nickname: '昵称r1' } })]);
-    assert.equal(ruleOf(db, 'peer2'), 'peer-reply');
+    seed(db, () => [
+      comment('peer', { parent: 'r1', uid: 'u-x' }),
+      comment('peer2', { parent: 'peer', uid: 'u-y', replyTo: { uid: 'u-x', nickname: '昵称peer' } }),
+    ]);
+    assert.equal(db.prepare("SELECT depth FROM comments WHERE id = 'Douyin:peer2'").get().depth, 2);
+    assert.equal(ruleOf(db, 'peer2'), null);
   });
 
-  test('楼中楼在 Kinso 回复过的楼里、但回的是网友：仍是 peer-reply（看直接回复的那条，不看整楼）', () => {
-    const db = freshDb();
-    seed(db, () => [comment('peer3', { parent: 'r1', uid: 'u-y', replyTo: { uid: 'u-r1', nickname: '昵称r1' } })]);
-    assert.equal(ruleOf(db, 'peer3'), 'peer-reply');
-  });
-
-  test('拿不准的不过滤：replyTo 只有昵称没有 uid；父评论不在库里；评论行不在库里', () => {
+  test('缺行或孤儿评论：不过滤', () => {
     const db = freshDb();
     seed(db, () => [
       comment('nickOnly', { parent: 'r1', uid: 'u-x', replyTo: { uid: null, nickname: 'Kinso' } }),
@@ -82,12 +73,11 @@ describe('规则', () => {
     assert.equal(ruleOf(db, 'nope'), null);
   });
 
-  test('作品的楼中楼拿不全（thread_partial）：不判 peer-reply，照常推', () => {
+  test('作品的楼中楼拿不全（thread_partial）：不过滤，照常推', () => {
     const db = freshDb();
     const acc = douyin(db);
     const base = [comment('r1', { uid: 'u-r1' })];
     ingestSnapshot(db, acc, commentsSnap(base), { now: at(T0) });
-    // 小红书、视频号在被回复的那条拿不到时会改挂到一楼、清掉 replyTo，库里看起来像网友回网友
     ingestSnapshot(db, acc, commentsSnap([...base, comment('b1', { parent: 'r1', uid: 'u-x' })], { scanned: [{ workNativeId: 'w1', complete: false, threadsPartial: true }] }), { now: at(T0 + MIN) });
     assert.equal(ruleOf(db, 'b1'), null);
   });
@@ -112,24 +102,25 @@ describe('规则', () => {
 });
 
 describe('过滤后的事件', () => {
-  test('自动回执 skipped、note 写规则名；不进 unhandled；不带 unhandled 时查得到并带 filteredReason', () => {
+  test('self-author 自动回执 skipped、note 写规则名；不进 unhandled；完整版与 compact 版可见；重复运行幂等', () => {
     const db = freshDb();
     const acc = seed(db, () => [comment('peer', { parent: 'r1', uid: 'u-x' }), comment('toMe', { parent: 'me0', uid: 'u-y' }), comment('top', { uid: 'u-z' })]);
     // 作者是自己的评论入库时不出事件；这里补一条，模拟作者标记后来变了的情况
     insertEvent(db, { id: 'comment.created:Douyin:me0', type: 'comment.created', platformCode: 'Douyin', accountId: acc.id, subjectId: 'Douyin:me0', createdAt: new Date(T0 + MIN).toISOString(), payload: {} });
     const hits = applyEventFilters(db, { now: at(T0 + 2 * MIN) });
-    assert.deepEqual(hits.map((h) => [h.eventId, h.rule]).sort(), [['comment.created:Douyin:me0', 'self-author'], ['comment.created:Douyin:peer', 'peer-reply']]);
+    assert.deepEqual(hits.map((h) => [h.eventId, h.rule]), [['comment.created:Douyin:me0', 'self-author']]);
 
     const unhandled = listEvents(db, { unhandled: true }).items.map((e) => e.id).sort();
-    assert.deepEqual(unhandled, ['comment.created:Douyin:toMe', 'comment.created:Douyin:top']);
+    assert.deepEqual(unhandled, ['comment.created:Douyin:peer', 'comment.created:Douyin:toMe', 'comment.created:Douyin:top']);
 
     const all = Object.fromEntries(listEvents(db, {}).items.map((e) => [e.id, e]));
-    assert.equal(all['comment.created:Douyin:peer'].filteredReason, 'peer-reply');
-    assert.deepEqual({ ...all['comment.created:Douyin:peer'].handled, at: null }, { at: null, outcome: 'skipped', actionId: null, note: 'peer-reply' });
-    assert.equal(all['comment.created:Douyin:me0'].handled.note, 'self-author');
+    assert.equal(all['comment.created:Douyin:me0'].filteredReason, 'self-author');
+    assert.deepEqual({ ...all['comment.created:Douyin:me0'].handled, at: null }, { at: null, outcome: 'skipped', actionId: null, note: 'self-author' });
+    assert.equal('filteredReason' in all['comment.created:Douyin:peer'], false);
     assert.equal('filteredReason' in all['comment.created:Douyin:top'], false);
     const compact = Object.fromEntries(listEvents(db, { compact: true }).items.map((e) => [e.id, e]));
-    assert.equal(compact['comment.created:Douyin:peer'].filteredReason, 'peer-reply');
+    assert.equal(compact['comment.created:Douyin:me0'].filteredReason, 'self-author');
+    assert.equal('filteredReason' in compact['comment.created:Douyin:peer'], false);
     assert.equal('filteredReason' in compact['comment.created:Douyin:top'], false);
 
     // 再跑一遍什么都不做
@@ -138,37 +129,41 @@ describe('过滤后的事件', () => {
 
   test('已经送达过订阅方的事件不再补过滤；已回执的不动', () => {
     const db = freshDb();
-    seed(db, () => [comment('peer', { parent: 'r1', uid: 'u-x' }), comment('peer2', { parent: 'r1', uid: 'u-y' })]);
-    db.prepare("INSERT INTO event_deliveries (eventId, subscriberId, attempts, deliveredAt) VALUES ('comment.created:Douyin:peer', 'bot-a', 1, ?)").run(new Date(T0).toISOString());
-    ackEvent(db, 'comment.created:Douyin:peer2', 'pending_human', '人看', { now: at(T0 + MIN) });
+    const acc = seed(db, () => []);
+    insertEvent(db, { id: 'comment.created:Douyin:me0', type: 'comment.created', platformCode: 'Douyin', accountId: acc.id, subjectId: 'Douyin:me0', createdAt: new Date(T0 + MIN).toISOString(), payload: {} });
+    insertEvent(db, { id: 'comment.created:Douyin:kreply', type: 'comment.created', platformCode: 'Douyin', accountId: acc.id, subjectId: 'Douyin:kreply', createdAt: new Date(T0 + MIN).toISOString(), payload: {} });
+    db.prepare("INSERT INTO event_deliveries (eventId, subscriberId, attempts, deliveredAt) VALUES ('comment.created:Douyin:me0', 'bot-a', 1, ?)").run(new Date(T0).toISOString());
+    ackEvent(db, 'comment.created:Douyin:kreply', 'pending_human', '人看', { now: at(T0 + MIN) });
     assert.deepEqual(applyEventFilters(db, { now: at(T0 + 2 * MIN) }), []);
   });
 
   test('推送失败停了自动重试、之后被过滤自动回执的：不再发「推送失败」提醒', async () => {
     const db = freshDb();
     subscribe(db, { subscriberId: 'bot-a', url: 'http://127.0.0.1:9/maitian/hook', types: ['comment.created'] }, { now: at(T0 - MIN) });
-    seed(db, () => [comment('peer', { parent: 'r1', uid: 'u-x' })]);
-    // 模拟：过滤上线前这条已经推送失败、停了自动重试，提醒还没发出去
-    db.prepare("INSERT INTO event_deliveries (eventId, subscriberId, attempts, gaveUpAt, lastError) VALUES ('comment.created:Douyin:peer', 'bot-a', 4, ?, 'HTTP 500')").run(new Date(T0).toISOString());
+    const acc = seed(db, () => []);
+    insertEvent(db, { id: 'comment.created:Douyin:me0', type: 'comment.created', platformCode: 'Douyin', accountId: acc.id, subjectId: 'Douyin:me0', createdAt: new Date(T0 + MIN).toISOString(), payload: {} });
+    // 模拟：这条之前推送失败、停了自动重试，提醒还没发出去，后来评论标记为本账号自己写的
+    db.prepare("INSERT INTO event_deliveries (eventId, subscriberId, attempts, gaveUpAt, lastError) VALUES ('comment.created:Douyin:me0', 'bot-a', 4, ?, 'HTTP 500')").run(new Date(T0).toISOString());
     const sent = [];
     const r = await deliverPending(db, { now: at(T0 + 2 * MIN), notify: async (t) => { sent.push(t); return true; }, fetchImpl: async () => new Response('{}') });
-    assert.deepEqual(r.filtered.map((f) => f.rule), ['peer-reply']);
+    assert.deepEqual(r.filtered.map((f) => f.rule), ['self-author']);
     assert.ok(!sent.some((t) => t.includes('推送失败')), sent.join('\n'));
   });
 
-  test('deliverPending：被过滤的不推，没命中的照常推、形状不变', async () => {
+  test('deliverPending：self-author 不推，网友回网友的楼中楼和其余事件照常推、形状不变', async () => {
     const db = freshDb();
     const bot = await startFakeBot({ mode: 'ok' });
     bots.push(bot);
     bot.secret = subscribe(db, { subscriberId: 'bot-a', url: bot.url, types: ['comment.created', 'dm.received'] }, { now: at(T0 - MIN) }).secret;
     const acc = seed(db, () => [comment('peer', { parent: 'r1', uid: 'u-x' }), comment('toMe', { parent: 'me0', uid: 'u-y' })]);
+    insertEvent(db, { id: 'comment.created:Douyin:me0', type: 'comment.created', platformCode: 'Douyin', accountId: acc.id, subjectId: 'Douyin:me0', createdAt: new Date(T0 + MIN).toISOString(), payload: {} });
     ingestSnapshot(db, acc, dmsSnap([conv('c1')]), { now: at(T0) });
     ingestSnapshot(db, acc, dmsSnap([conv('c1', { at: '2026-11-19T03:00:00.000Z', text: '在吗' })]), { now: at(T0 + MIN) });
     const r = await deliverPending(db, { now: at(T0 + 2 * MIN), notify: async () => true });
-    assert.deepEqual(r.filtered, [{ eventId: 'comment.created:Douyin:peer', rule: 'peer-reply' }]);
+    assert.deepEqual(r.filtered, [{ eventId: 'comment.created:Douyin:me0', rule: 'self-author' }]);
     const pushed = bot.received.flatMap((x) => x.body.events);
-    assert.deepEqual(pushed.map((e) => e.id).sort(), ['comment.created:Douyin:toMe', 'dm.received:Douyin:c1:2026-11-19T03:00:00.000Z']);
+    assert.deepEqual(pushed.map((e) => e.id).sort(), ['comment.created:Douyin:peer', 'comment.created:Douyin:toMe', 'dm.received:Douyin:c1:2026-11-19T03:00:00.000Z']);
     assert.deepEqual(Object.keys(pushed[0]).sort(), ['accountId', 'createdAt', 'delivery', 'handled', 'id', 'payload', 'platform', 'subjectId', 'type']);
-    assert.equal(db.prepare("SELECT count(*) n FROM event_deliveries WHERE eventId = 'comment.created:Douyin:peer'").get().n, 0);
+    assert.equal(db.prepare("SELECT count(*) n FROM event_deliveries WHERE eventId = 'comment.created:Douyin:me0'").get().n, 0);
   });
 });

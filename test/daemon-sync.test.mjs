@@ -84,11 +84,10 @@ describe('一轮抓取', () => {
     assert.deepEqual(r2.jobs.map((j) => j.status), ['ok']);
     assert.deepEqual(r2.jobs[0].stats, { inserted: 2, updated: 3, gone: 0, events: 2 }, '作品行算在 updated 里');
     assert.deepEqual(events(db, 'comment.created').map((e) => e.subjectId).sort(), ['Douyin:c3', 'Douyin:c4']);
-    // c4 是网友回网友的楼中楼：推送前被 peer-reply 过滤、自动回执，只推 c3
+    // c4 是网友回网友的楼中楼：不再按 peer-reply 过滤，和 c3 一起推给订阅方
     assert.equal(bot.received.length, 1);
-    assert.deepEqual(bot.received[0].body.events.map((e) => e.subjectId), ['Douyin:c3']);
-    assert.equal(r2.delivery.filtered, 1);
-    assert.ok(logs.some((l) => /过滤 1 条（peer-reply 1），已回执 skipped/.test(l)));
+    assert.deepEqual(bot.received[0].body.events.map((e) => e.subjectId).sort(), ['Douyin:c3', 'Douyin:c4']);
+    assert.equal(r2.delivery.filtered, 0);
     assert.ok(verify(secret, bot.received[0].raw, bot.received[0].headers['x-maitian-signature']));
     assert.equal(r2.delivery.batches, 1);
     const jobLog = logs.filter((l) => l.includes('Douyin comments'));
@@ -97,34 +96,17 @@ describe('一轮抓取', () => {
     assert.ok(!logs.join('\n').includes('should-not-leak'), '日志不打印订阅地址的 query');
   });
 
-  test('评论一入库就过滤：同一轮后面的任务还没跑完时，网友互回的楼中楼已经回执 skipped、补漏捞不到', async () => {
+  test('评论一入库就过滤：已有事件的评论在后来的快照里 authorIsMe 变为 1，同一轮后面的任务还没跑完时已经回执 skipped、补漏捞不到，任务完成时已落库', async () => {
     const { db, c, base, logs } = setup({ caps: [[DOUYIN, 'readComments'], [DOUYIN, 'readDM']] });
     let seenDuringRound = null;
     const { collect } = fakeCollect({
-      'Douyin/comments': [commentsSnap([comment('c1')]), commentsSnap([comment('c1'), comment('c4', { parent: 'c1' })])],
-      'Douyin/dms': [dmsSnap([]), () => {
-        seenDuringRound = db.prepare("SELECT handledOutcome, filteredReason FROM events WHERE id = 'comment.created:Douyin:c4'").get();
-        return dmsSnap([]);
-      }],
-    });
-    await runRound(db, { ...base, collect });
-    c.advance(15 * MIN);
-    const r = await runRound(db, { ...base, collect });
-    assert.deepEqual({ ...seenDuringRound }, { handledOutcome: 'skipped', filteredReason: 'peer-reply' });
-    assert.deepEqual(r.jobs.find((j) => j.kind === 'comments').filtered, [{ eventId: 'comment.created:Douyin:c4', rule: 'peer-reply' }]);
-    assert.equal(r.delivery.filtered, 1, '入库后过滤的也算进本轮汇总，只算一次');
-    assert.equal(logs.filter((l) => /过滤 1 条（peer-reply 1）/.test(l)).length, 1);
-  });
-
-  test('已有事件的评论在后来的快照里才补上 replyToUid、命中 peer-reply：这次没有新事件也马上过滤，任务完成时已落库', async () => {
-    const { db, c, base } = setup({ caps: [[DOUYIN, 'readComments'], [DOUYIN, 'readDM']] });
-    let seen = null;
-    const nickOnly = comment('c4', { parent: 'c1', replyTo: { uid: null, nickname: '昵称c1' } });
-    const withUid = comment('c4', { parent: 'c1', replyTo: { uid: 'u-c1', nickname: '昵称c1' } });
-    const { collect } = fakeCollect({
-      'Douyin/comments': [commentsSnap([comment('c1')]), commentsSnap([comment('c1'), nickOnly]), commentsSnap([comment('c1'), withUid])],
+      'Douyin/comments': [
+        commentsSnap([comment('c1')]),
+        commentsSnap([comment('c1'), comment('c4', { isMe: false })]),
+        commentsSnap([comment('c1'), comment('c4', { isMe: true })]),
+      ],
       'Douyin/dms': [dmsSnap([]), dmsSnap([]), () => {
-        seen = db.prepare("SELECT e.handledOutcome, e.filteredReason, j.status FROM events e, sync_jobs j WHERE e.id = 'comment.created:Douyin:c4' AND j.kind = 'comments' ORDER BY j.requestedAt DESC LIMIT 1").get();
+        seenDuringRound = db.prepare("SELECT e.handledOutcome, e.filteredReason, j.status FROM events e, sync_jobs j WHERE e.id = 'comment.created:Douyin:c4' AND j.kind = 'comments' ORDER BY j.requestedAt DESC LIMIT 1").get();
         return dmsSnap([]);
       }],
     });
@@ -132,25 +114,33 @@ describe('一轮抓取', () => {
     await runRound(db, { ...base, collect, fetchImpl });
     c.advance(15 * MIN);
     const r2 = await runRound(db, { ...base, collect, fetchImpl });
-    assert.equal(r2.delivery.filtered, 0, 'replyTo 只有昵称：拿不准，不过滤');
+    assert.equal(r2.delivery.filtered, 0);
     assert.equal(db.prepare("SELECT handledAt FROM events WHERE id = 'comment.created:Douyin:c4'").get().handledAt, null);
     c.advance(15 * MIN);
     const r3 = await runRound(db, { ...base, collect, fetchImpl });
     assert.equal(r3.jobs.find((j) => j.kind === 'comments').stats.events, 0);
-    assert.deepEqual({ ...seen }, { handledOutcome: 'skipped', filteredReason: 'peer-reply', status: 'ok' });
-    assert.equal(r3.delivery.filtered, 1);
+    assert.deepEqual({ ...seenDuringRound }, { handledOutcome: 'skipped', filteredReason: 'self-author', status: 'ok' });
+    assert.deepEqual(r3.jobs.find((j) => j.kind === 'comments').filtered, [{ eventId: 'comment.created:Douyin:c4', rule: 'self-author' }]);
+    assert.equal(r3.delivery.filtered, 1, '入库后过滤的也算进本轮汇总，只算一次');
+    assert.equal(logs.filter((l) => /过滤 1 条（self-author 1），已回执 skipped/.test(l)).length, 1);
   });
 
   test('推送出错时，入库后已过滤的条数照样进汇总和日志', async () => {
     const { db, c, base, logs } = setup();
     db.prepare("INSERT INTO subscribers (id, url, types, platforms, secret, createdAt, updatedAt) VALUES ('bot-a', 'http://127.0.0.1:9/h', 'not json', NULL, 's', ?, ?)").run(new Date(T0).toISOString(), new Date(T0).toISOString());
-    const { collect } = fakeCollect({ 'Douyin/comments': [commentsSnap([comment('c1')]), commentsSnap([comment('c1'), comment('c4', { parent: 'c1' })])] });
+    const { collect } = fakeCollect({ 'Douyin/comments': [
+      commentsSnap([comment('c1')]),
+      commentsSnap([comment('c1'), comment('c4', { isMe: false })]),
+      commentsSnap([comment('c1'), comment('c4', { isMe: true })]),
+    ] });
+    await runRound(db, { ...base, collect });
+    c.advance(15 * MIN);
     await runRound(db, { ...base, collect });
     c.advance(15 * MIN);
     const r = await runRound(db, { ...base, collect });
     assert.ok(r.delivery.error, '订阅方的 types 坏了，推送出错');
     assert.equal(r.delivery.filtered, 1);
-    assert.ok(logs.some((l) => /过滤 1 条（peer-reply 1）/.test(l)));
+    assert.ok(logs.some((l) => /过滤 1 条（self-author 1），已回执 skipped/.test(l)));
   });
 
   test('busy / user-controlled 记 skipped，不出事件、不算失败', async () => {
