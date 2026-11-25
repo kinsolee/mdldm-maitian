@@ -32,7 +32,7 @@ const id = (what) => z.string().describe(`${what}，写成 <platformCode>:<原�
 const READ_TOOLS = [
   ['list_accounts', '列出账号：登录状态、能力位、各类数据上次抓取成功的时间（lastSync）', {}, (db) => q.listAccounts(db)],
   ['inbox', '每个平台的未处理事件数、未读会话数、未回复评论数', { platforms }, (db, a) => q.inbox(db, a)],
-  ['list_events', '列事件（旧到新）。unhandled: true 取还没回执的，用来补漏推。推送前被确定规则过滤的（self-author、peer-reply）已自动回执 skipped，带 filteredReason。compact: true 返回精简条目', {
+  ['list_events', '列事件（旧到新）。unhandled: true 取还没回执的，用来补漏推。推送前被确定规则过滤的（当前为 self-author；历史记录可能带 peer-reply 等）已自动回执 skipped，带 filteredReason。compact: true 返回精简条目', {
     types: z.array(z.enum(EVENT_TYPES)).optional(), platforms, unhandled: z.boolean().optional(), since, cursor, limit, compact: compactEvents,
   }, (db, a) => q.listEvents(db, a)],
   ['ack_event', '回执一个事件：处理完一条就调，outcome 是 replied / skipped / pending_human / ignored', {

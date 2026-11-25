@@ -624,9 +624,10 @@ describe('麦田推送前过滤（filteredReason）', () => {
     const db = freshDb(opsDb);
     subscribe(db, { subscriberId: 'openbot-engage', url: 'http://127.0.0.1:9/maitian/hook', types: ['comment.created'] }, { now: at(T0 - MIN) });
     ingestSnapshot(db, douyin(db), commentsSnap([comment('r1')]), { now: at(T0) });
-    ingestSnapshot(db, douyin(db), commentsSnap([comment('r1'), comment('top'), comment('peer', { parent: 'r1' })]), { now: at(T0 + MIN) });
+    ingestSnapshot(db, douyin(db), commentsSnap([comment('r1'), comment('top'), comment('me1')]), { now: at(T0 + MIN) });
+    ingestSnapshot(db, douyin(db), commentsSnap([comment('r1'), comment('top'), comment('me1', { isMe: true })]), { now: at(T0 + MIN + 1000) });
     const d = await deliverPending(db, { now: at(T0 + 2 * MIN), notify: async () => true, fetchImpl: async () => new Response('{}') });
-    assert.deepEqual(d.filtered.map((f) => f.eventId), ['comment.created:Douyin:peer']);
+    assert.deepEqual(d.filtered.map((f) => f.eventId), ['comment.created:Douyin:me1']);
     db.close();
     const inbox = openInbox(p.stateDb);
     inbox.receive([ev('comment.created:Douyin:top')], T0 + 2 * MIN);
@@ -634,6 +635,6 @@ describe('麦田推送前过滤（filteredReason）', () => {
     const md = compareMain(['--hours', '48', '--until', new Date(T0 + 24 * 3600_000).toISOString()],
       { MAITIAN_OPS_DB: opsDb, CINDY_INBOX_DB: p.stateDb, CINDY_LEDGER_FILE: p.ledger, OPENBOT_RECORDS_FILE: path.join(p.dir, 'none.md'), OPENBOT_PENDING_FILE: path.join(p.dir, 'none2.md') });
     assert.match(md, /\| 窗口内事件 \| 1 \| 1 \|/);
-    assert.ok(!md.includes('comment.created:Douyin:peer'));
+    assert.ok(!md.includes('comment.created:Douyin:me1'));
   });
 });

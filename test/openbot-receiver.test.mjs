@@ -259,18 +259,18 @@ describe('整条链路：麦田发件箱 → 接收端 → OpenBot', () => {
     ingestSnapshot(db, douyin(db), commentsSnap([comment('r1'), comment('r2'), comment('a', { parent: 'r1' })]), { now: at(T0 + 2 * MIN) });
     const sent = await deliverPending(db, { now: at(T0 + 3 * MIN), notify: async () => true });
     assert.deepEqual(sent.batches.map((b) => b.ok), [true]);
-    // a 是网友回网友的一楼（peer-reply），麦田侧过滤掉、自动回执，不推
-    assert.deepEqual(sent.filtered, [{ eventId: 'comment.created:Douyin:a', rule: 'peer-reply' }]);
+    // a 是网友回网友的楼中楼：不再被 peer-reply 过滤，和 r2 一起推到接收端
+    assert.deepEqual(sent.filtered, []);
     await r.drain();
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].ids, ['comment.created:Douyin:r2']);
+    assert.deepEqual([...calls[0].ids].sort(), ['comment.created:Douyin:a', 'comment.created:Douyin:r2']);
 
     // 2 小时没回执，麦田重带一次：接收端认出是重复，不再投
     const again = await deliverPending(db, { now: at(T0 + 3 * MIN + 2 * 3600_000 + MIN), notify: async () => true });
     assert.deepEqual(again.batches.map((b) => b.ok), [true]);
     await r.drain();
     assert.equal(calls.length, 1);
-    assert.equal(store.stats().total, 1);
+    assert.equal(store.stats().total, 2);
 
     r.stop();
     server.closeAllConnections();

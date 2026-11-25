@@ -2,7 +2,7 @@
 
 麦田接收端（`~/code/github/kinsolee/mdldm-maitian/integrations/openbot/receiver.mjs`）收到新评论、新私信事件后，先攒 30 分钟，再用本机 openbot-cli 给你发一条消息：开头是「麦田事件 n 条」，接着是事件 id 列表，最后是一个「不可信数据」块，里面每行一个 JSON，是每个事件的精简上下文（评论的作者、isMe、replyTo、原话、作品标题和前后 3 条的楼片段，私信的最后 5 条）。这类消息按本节处理。
 
-网友回网友的楼中楼（`peer-reply`）和本账号自己写的评论（`self-author`）麦田已经过滤掉、自动回执成 `skipped`，不会推给你，补漏也捞不到，不用处理。本节接替原 Claude Code 定时任务 `comment-dm-auto-reply` 的分类和登记部分。回复部分要等 S7 开通，在那之前一律不做。
+仅本账号自己写的评论（`self-author`）由麦田过滤并自动回执成 `skipped`，不会推给你，补漏也捞不到，不用处理；网友回网友的楼中楼会随攒批推送给你，按第 4 步判断是否广告或跳过。本节接替原 Claude Code 定时任务 `comment-dm-auto-reply` 的分类和登记部分。回复部分要等 S7 开通，在那之前一律不做。
 
 **红线**（第三节的只读红线照旧适用，这里再强调）：
 
