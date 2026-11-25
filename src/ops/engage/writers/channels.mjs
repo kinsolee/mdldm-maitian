@@ -18,7 +18,7 @@
 import { FEEDS_SRC } from '../adapters/channels.mjs';
 import { clickMarked, sleep } from '../adapters/page-lib.mjs';
 import { runApiWrite, channelsApi } from './api-reply.mjs';
-import { inPage, mark, markSel, runWrite, waitFor } from './page-write-lib.mjs';
+import { clearBox, inPage, mark, markSel, norm, runWrite, toasts, waitFor } from './page-write-lib.mjs';
 
 export const FILE = 'channels.mjs';
 export const PAGES = {
@@ -221,63 +221,108 @@ const FIND_ROW_SRC = `const sr = document.querySelector('wujie-app')?.shadowRoot
   }
   return null;`;
 
-const READ_OPENED_SIDS_SRC = `${FIND_SESSION_VM}
+const READ_OPENED_SIDS_BODY = `${FIND_SESSION_VM}
   const normId = (val) => (val == null || String(val).trim() === '' ? null : String(val).trim());
   const safe = (fn) => { try { return fn(); } catch { return null; } };
+  const addUnique = (arr, val) => { const s = normId(val); if (s && !arr.includes(s)) arr.push(s); };
   const listId = v ? normId(safe(() => v.currentSessionId)) : null;
-  const dialogIds = [];
-  const addDialogId = (val) => { const s = normId(val); if (s && !dialogIds.includes(s)) dialogIds.push(s); };
-  const seen = new Set();
-  const queue = [];
-  for (const e of sr.querySelectorAll('.session-dialog .header, .session-dialog .header *')) if (e.__vue__) queue.push(e.__vue__);
-  for (const e of sr.querySelectorAll('.session-dialog, .session-dialog *')) if (e.__vue__) queue.push(e.__vue__);
-  while (queue.length && seen.size < 300) {
-    const vm = queue.shift();
-    if (!vm || seen.has(vm)) continue;
-    seen.add(vm);
-    addDialogId(safe(() => vm.sessionInfo?.sessionId));
-    if (Array.isArray(vm.$children)) queue.push(...vm.$children);
-  }
-  const ids = [...(listId ? [listId] : []), ...dialogIds];
-  if (!ids.length) {
-    const box = __marked('box');
-    const idOf = (val) => (val && typeof val === 'object' ? val.sessionId ?? val.sessionInfo?.sessionId ?? null : null);
-    for (let e = box, i = 0; e && i < 12; e = e.parentElement || e.getRootNode()?.host, i++) {
-      const vm = e.__vue__; if (!vm) continue;
-      for (const bag of [vm.$props, vm.$data]) { const own = normId(idOf(bag)); if (own) { ids.push(own); break; } }
-      if (ids.length) break;
-      for (const bag of [vm.$props, vm.$data]) {
-        for (const val of Object.values(bag ?? {})) { const id = normId(idOf(val)); if (id) { ids.push(id); break; } }
-        if (ids.length) break;
-      }
-      if (ids.length) break;
+  const headerIds = [];
+  const dialog = box?.closest?.('.session-dialog') ?? null;
+  if (dialog) {
+    const seen = new Set();
+    const queue = [];
+    for (const el of dialog.querySelectorAll('.header, .header *')) {
+      if (el.__vue__ && !el.closest('.message-list, .footer')) queue.push(el.__vue__);
+    }
+    while (queue.length && seen.size < 100) {
+      const vm = queue.shift();
+      if (!vm || seen.has(vm)) continue;
+      seen.add(vm);
+      addUnique(headerIds, safe(() => vm.sessionInfo?.sessionId));
+      if (Array.isArray(vm.$children)) queue.push(...vm.$children);
     }
   }
-  return { ok: ids.length > 0 && ids.every((x) => x === arg), ids };`;
+  const ids = [];
+  addUnique(ids, listId);
+  for (const id of headerIds) addUnique(ids, id);
+  if (!ids.length && box) {
+    const idOf = (val) => (val && typeof val === 'object' ? val.sessionId ?? val.sessionInfo?.sessionId ?? null : null);
+    for (let el = box, depth = 0; el && depth < 12; el = el.parentElement || el.getRootNode()?.host, depth++) {
+      const vm = el.__vue__;
+      if (!vm) continue;
+      if (Array.isArray(vm.$data?.sessionList)) {
+        addUnique(ids, safe(() => vm.currentSessionId));
+        break;
+      }
+      for (const bag of [vm.$props, vm.$data]) {
+        if (!bag || typeof bag !== 'object') continue;
+        addUnique(ids, safe(() => idOf(bag)));
+        for (const val of safe(() => Object.values(bag)) ?? []) addUnique(ids, safe(() => idOf(val)));
+      }
+    }
+  }
+  const openedOk = ids.length > 0 && ids.every((x) => x === targetSid);`;
 
-const DM_SEND = `const box = __marked('box'); if (!box) return null;
-  const re = /^发送$/;
-  const txt = (e) => (e.innerText || e.textContent || '').trim();
+const READ_OPENED_SIDS_SRC = `const box = __marked('box');
+  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => el.getClientRects().length);
+  if (!box || !box.isConnected || !sr.contains(box) || boxes.length !== 1 || boxes[0] !== box) return { ok: false, ids: [], boxMissing: true };
+  const targetSid = arg;
+  ${READ_OPENED_SIDS_BODY}
+  return { ok: openedOk, ids };`;
+
+const FIND_DM_SEND_BODY = `const re = /^发送$/;
+  const txt = (el) => (el.innerText || el.textContent || '').trim();
+  const isVisible = (el) => {
+    if (!el || !el.isConnected || !el.getClientRects().length) return false;
+    const st = getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
   const isDisabled = (el, stop) => {
-    for (let cur = el; cur && cur !== stop; cur = cur.parentElement) {
+    for (let cur = el; cur; cur = cur.parentElement) {
       if (cur.disabled || cur.hasAttribute?.('disabled') || cur.getAttribute?.('aria-disabled') === 'true') return true;
-      if (cur.classList && [...cur.classList].some((c) => /disabled/i.test(c))) return true;
+      if (cur.classList && [...cur.classList].some((cls) => /disabled/i.test(cls))) return true;
+      if (getComputedStyle(cur).pointerEvents === 'none') return true;
+      if (cur === stop) break;
     }
     return false;
   };
-  const scopes = [];
   const footer = box.closest('.footer');
-  if (footer) scopes.push(footer);
-  for (let e = box.parentElement, i = 0; e && i < 3; e = e.parentElement, i++) if (!scopes.includes(e)) scopes.push(e);
-  for (const scope of scopes) {
-    const hits = [...scope.querySelectorAll('button, [role=button], div, span, a')]
-      .filter((x) => re.test(txt(x)) && x.getClientRects().length && !x.closest('[class*=operations-]') && !x.querySelector('textarea, [contenteditable=true]') && !box.contains(x));
-    const inner = hits.filter((h) => !hits.some((o) => o !== h && h.contains(o)));
-    if (!inner.length) continue;
-    const enabled = inner.filter((h) => !isDisabled(h, scope));
-    return enabled.length ? enabled.at(-1) : null;
+  const scope = footer ?? (box.parentElement && !box.parentElement.querySelector('.message-list') ? box.parentElement : null);
+  let sendBtn = null;
+  if (scope && isVisible(scope)) {
+    const hits = [...scope.querySelectorAll('button, [role=button], a, [class*=btn]')]
+      .filter((el) => re.test(txt(el))
+        && isVisible(el)
+        && !el.closest('[class*=operations-], .message-list, .header')
+        && !el.querySelector('textarea, [contenteditable=true]')
+        && !box.contains(el));
+    const inner = hits.filter((h) => !hits.some((other) => other !== h && h.contains(other)));
+    if (inner.length === 1 && !isDisabled(inner[0], scope)) sendBtn = inner[0];
   }
-  return null;`;
+`;
+
+const dmSendSrc = (sid) => `const sr = document.querySelector('wujie-app')?.shadowRoot; if (!sr) return null;
+  const box = __marked('box');
+  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => el.getClientRects().length);
+  if (!box || !box.isConnected || !sr.contains(box) || boxes.length !== 1 || boxes[0] !== box) return null;
+  const targetSid = ${JSON.stringify(sid)};
+  ${READ_OPENED_SIDS_BODY}
+  if (!openedOk) return null;
+  ${FIND_DM_SEND_BODY}
+  return sendBtn;`;
+
+const PRE_CLICK_VERIFY_SRC = `const box = __marked('box');
+  const markedSend = __marked('send');
+  const boxes = [...sr.querySelectorAll('textarea.edit_area')].filter((el) => el.getClientRects().length);
+  if (!box || !box.isConnected || !sr.contains(box) || boxes.length !== 1 || boxes[0] !== box) return { ok: false, reason: '点击发送前输入框消失或不唯一' };
+  const targetSid = arg;
+  ${READ_OPENED_SIDS_BODY}
+  if (!openedOk) return { ok: false, reason: ids.length ? '点击发送前会话已切换（期望 ' + targetSid + '，当前 ' + [...new Set(ids)].join('/') + '）' : '点击发送前读不到当前打开的会话' };
+  ${FIND_DM_SEND_BODY}
+  if (!sendBtn || !markedSend || sendBtn !== markedSend) return { ok: false, reason: '点击发送前发送按钮已失效或发生变化' };
+  return { ok: true };`;
 
 const PHONE_DIALOG_SRC = `return __qa('.phone-check-dialog').some((el) => {
   if (!el.getClientRects().length) return false;
@@ -299,28 +344,47 @@ const validSvrMsgId = (val) => {
   return str && str !== '0' ? str : null;
 };
 
-const rawMsgSig = (raw) => {
-  const m = raw?.message;
-  if (!m) return null;
-  if (m.msgId != null && String(m.msgId) !== '') return `id:${m.msgId}`;
-  return `ts:${m.ts ?? ''}:${m.fromUsername ?? ''}`;
+const normLocalId = (val) => {
+  if (val == null) return null;
+  const str = String(val).trim();
+  return str || null;
 };
 
-const countBy = (arr, keyFn) => {
-  const map = new Map();
-  for (const item of arr) {
-    const key = keyFn(item);
-    if (key) map.set(key, (map.get(key) ?? 0) + 1);
+function sanitizeToastError(rawToast) {
+  const text = String(rawToast ?? '');
+  const codeMatch = text.match(/(?:errcode|err_code|错误码)[=:：\s]*(-?\d{1,6})(?!\d)/i);
+  const codeSuffix = codeMatch ? `（errcode=${codeMatch[1]}）` : '';
+  if (/验证|风控|安全|手机/.test(text)) return `私信发送触发平台安全验证提示${codeSuffix}`;
+  if (/频繁|频控|稍后|上限|限流|条数/.test(text)) return `私信发送触发频控或条数限制提示${codeSuffix}`;
+  if (/违规|敏感|涉政|违禁/.test(text)) return `私信发送触发内容审核限制提示${codeSuffix}`;
+  if (/不支持|无法|不能|受限|限制|拒收|拉黑|关闭/.test(text)) return `私信发送受限（平台页面提示无法发送）${codeSuffix}`;
+  return `私信发送失败（平台页面弹出错误提示）${codeSuffix}`;
+}
+
+function countLocalIds(messageList) {
+  const counts = new Map();
+  for (const raw of messageList ?? []) {
+    const lid = normLocalId(raw?.message?.msgId);
+    if (lid) counts.set(lid, (counts.get(lid) ?? 0) + 1);
   }
-  return map;
-};
+  return counts;
+}
 
 async function prepareDM({ page, params, t }) {
   const tg = params.target ?? {};
-  const find = (list) => (tg.conversationId != null ? list.find((s) => String(s.sessionId) === String(tg.conversationId)) : null)
-    ?? (tg.peerUid != null ? list.find((s) => s.sessionInfo?.username === String(tg.peerUid)) : null);
+  const wantConvId = tg.conversationId != null && String(tg.conversationId).trim() !== '' ? String(tg.conversationId).trim() : null;
+  const wantPeerUid = tg.peerUid != null && String(tg.peerUid).trim() !== '' ? String(tg.peerUid).trim() : null;
+  if (!wantConvId && !wantPeerUid) {
+    return { blocked: 'target-not-found', detail: '缺少目标会话 conversationId 和 peerUid，无法定位会话' };
+  }
+  const peerMatches = (list) => (wantPeerUid ? list.filter((s) => s.sessionInfo?.username === wantPeerUid) : []);
+  const find = (list) => {
+    if (wantConvId) return list.find((s) => String(s.sessionId) === wantConvId) ?? null;
+    const hits = peerMatches(list);
+    return hits.length === 1 ? hits[0] : null;
+  };
   let list = await waitFor(async () => { const l = await dmSessions(page); return l.length ? l : null; }, t.loadMs, 1000);
-  if (list && !find(list)) {
+  if (list && !find(list) && (wantConvId || peerMatches(list).length === 0)) {
     const maxScroll = params.maxScroll ?? LIMITS.maxScroll;
     for (let i = 0; i < maxScroll && !find(list); i++) {
       const scrolled = await inShadow(page, `const c = sr.querySelector('.session-container');
@@ -340,16 +404,22 @@ async function prepareDM({ page, params, t }) {
       if (!next.length) break;
       const grew = next.length > list.length;
       list = next;
-      if (find(list) || !grew) break;
+      if (find(list) || (!wantConvId && peerMatches(list).length > 1) || !grew) break;
     }
+  }
+  if (list && !wantConvId && peerMatches(list).length > 1) {
+    return { blocked: 'target-not-found', detail: `私信列表里用户 ${wantPeerUid} 匹配到多条会话，缺少 conversationId 无法唯一定位` };
   }
   const s = list && find(list);
   if (!s || s.sessionId == null || String(s.sessionId).trim() === '') {
-    return { blocked: 'target-not-found', detail: `私信列表里没有会话 ${tg.conversationId ?? tg.peerUid}` };
+    return { blocked: 'target-not-found', detail: `私信列表里没有会话 ${wantConvId ?? wantPeerUid}` };
   }
   const sid = String(s.sessionId);
+  if (wantConvId && wantPeerUid && s.sessionInfo?.username && s.sessionInfo.username !== wantPeerUid) {
+    return { blocked: 'target-not-found', detail: `会话 ${sid} 的对方账号与期望不符，没发` };
+  }
   const bySid = (l) => l.find((x) => String(x.sessionId) === sid) ?? null;
-  const peer = s.sessionInfo?.username ?? (tg.peerUid != null ? String(tg.peerUid) : null);
+  const peer = s.sessionInfo?.username ?? wantPeerUid;
   if (!peer) return { blocked: 'target-not-found', detail: `会话 ${sid} 缺少对方 username，无法判断收发方` };
   const lastIsMe = (x) => { const m = lastOf(x); return !!m && m.fromUsername !== peer; };
   if (lastIsMe(s)) return { blocked: 'last-is-me', detail: '会话最后一句是我说的' };
@@ -379,14 +449,62 @@ async function prepareDM({ page, params, t }) {
   const now = bySid(await dmSessions(page));
   if (now && lastIsMe(now)) return { blocked: 'last-is-me', detail: '打开会话后看到最后一句是我说的' };
   if (!box) return { blocked: 'no-input-box', detail: '打开会话后没有唯一的输入框（textarea.edit_area）' };
-  const snap = now ?? s;
-  const mineOfStatus = (sess, status) => (sess?.messageList ?? []).filter((raw) => raw?.currentMsgStatus === status && raw?.message && raw.message.fromUsername !== peer);
-  const failedBefore = countBy(mineOfStatus(snap, 3), rawMsgSig);
-  const pendingBefore = countBy(mineOfStatus(snap, 1), rawMsgSig);
+  const wantText = norm(params.text);
+  let baseline = null;
+
+  const snapshotBeforeClick = async () => {
+    const verified = await inShadow(page, PRE_CLICK_VERIFY_SRC, sid);
+    if (!verified?.ok) {
+      await clearBox(page).catch(() => {});
+      throw new Error(verified?.reason ?? '点击发送前页面状态校验失败');
+    }
+    const cur = bySid(await dmSessions(page));
+    if (!cur) {
+      await clearBox(page).catch(() => {});
+      throw new Error(`点击发送前读不到目标会话 ${sid}`);
+    }
+    if (lastIsMe(cur)) {
+      await clearBox(page).catch(() => {});
+      throw new Error('点击发送前看到会话最后一句已是我说的');
+    }
+    const allLocalIds = new Set();
+    const beforeSvrIds = new Set();
+    let minePendingCount = 0;
+    let mineAnonPendingCount = 0;
+    let mineAnonUnsettledCount = 0;
+    for (const raw of cur.messageList ?? []) {
+      const m = raw?.message;
+      if (!m) continue;
+      const lid = normLocalId(m.msgId);
+      if (lid) allLocalIds.add(lid);
+      const svrId = validSvrMsgId(m.svrMsgId);
+      if (svrId) beforeSvrIds.add(svrId);
+      if (typeof raw.currentMsgStatus === 'number' && m.fromUsername !== peer) {
+        if (raw.currentMsgStatus === 1) minePendingCount++;
+        if (!lid) {
+          if (raw.currentMsgStatus === 1) mineAnonPendingCount++;
+          if (raw.currentMsgStatus === 1 || raw.currentMsgStatus === 3) mineAnonUnsettledCount++;
+        }
+      }
+    }
+    baseline = {
+      allLocalIds,
+      beforeSvrIds,
+      minePendingCount,
+      mineAnonPendingCount,
+      mineAnonUnsettledCount,
+      phoneDialogVisible: Boolean(await inPage(page, PHONE_DIALOG_SRC)),
+      toasts: new Set((await toasts(page)) ?? []),
+    };
+    return cur;
+  };
+
   return {
-    send: DM_SEND,
+    send: dmSendSrc(sid),
     items: async () => {
-      const cur = bySid(await dmSessions(page));
+      const isBaselinePass = !baseline;
+      const cur = isBaselinePass ? await snapshotBeforeClick() : bySid(await dmSessions(page));
+      const localIdCounts = countLocalIds(cur?.messageList);
       const out = [];
       for (const raw of cur?.messageList ?? []) {
         const m = raw?.message;
@@ -397,6 +515,12 @@ async function prepareDM({ page, params, t }) {
           const okStatus = st === 2 || (st === 0 && !m.sendMsgFlag);
           const svrId = validSvrMsgId(m.svrMsgId);
           if (!okStatus || !svrId) continue;
+          if (!isBaselinePass && m.fromUsername !== peer && !baseline.beforeSvrIds.has(svrId)) {
+            const lid = normLocalId(m.msgId);
+            if (lid && baseline.allLocalIds.has(lid)) continue;
+            if (lid && (localIdCounts.get(lid) ?? 0) > 1) continue;
+            if (!lid && baseline.minePendingCount > 0) continue;
+          }
           out.push({ id: svrId, mine: m.fromUsername !== peer, rel: true, text: m.textMsg?.content ?? null });
         } else {
           out.push({ id: String(m.msgId ?? `${m.ts}:${m.fromUsername}`), mine: m.fromUsername !== peer, rel: true, text: m.textMsg?.content ?? null });
@@ -405,33 +529,72 @@ async function prepareDM({ page, params, t }) {
       return out;
     },
     apiError: async () => {
-      if (await inPage(page, PHONE_DIALOG_SRC)) {
+      if (!baseline) return null;
+      const cur = bySid(await dmSessions(page));
+      const phoneNow = Boolean(await inPage(page, PHONE_DIALOG_SRC));
+      if (!baseline.phoneDialogVisible && phoneNow) {
         return '触发手机验证弹窗(.phone-check-dialog)，发送被风控拦截';
       }
-      const cur = bySid(await dmSessions(page));
-      const failedNow = mineOfStatus(cur, 3);
-      const curFailCounts = countBy(failedNow, rawMsgSig);
-      const newFail = failedNow.find((raw) => {
-        const sig = rawMsgSig(raw);
-        if (!sig) return false;
-        const base = (failedBefore.get(sig) ?? 0) + (sig.startsWith('id:') ? (pendingBefore.get(sig) ?? 0) : 0);
-        return (curFailCounts.get(sig) ?? 0) > base;
-      });
-      if (newFail) {
-        return newFail.outLimitWarn
-          ? '私信发送失败（页面消息状态 Failure，触发条数/频控限制）'
-          : '私信发送失败（页面消息状态 Failure）';
+      if (cur) {
+        const localIdCounts = countLocalIds(cur.messageList);
+        let curAnonUnsettledCount = 0;
+        let hasAnonNewMineSuccess = false;
+        const sameTextNewMineWithId = [];
+        for (const raw of cur.messageList ?? []) {
+          const m = raw?.message;
+          const st = raw?.currentMsgStatus;
+          if (!m || typeof st !== 'number' || m.fromUsername === peer) continue;
+          const lid = normLocalId(m.msgId);
+          if (!lid) {
+            if (st === 1 || st === 3) curAnonUnsettledCount++;
+            const svrId = validSvrMsgId(m.svrMsgId);
+            if ((st === 2 && (!svrId || !baseline.beforeSvrIds.has(svrId))) || (st === 0 && !m.sendMsgFlag && svrId && !baseline.beforeSvrIds.has(svrId))) {
+              hasAnonNewMineSuccess = true;
+            }
+            continue;
+          }
+          if (baseline.allLocalIds.has(lid)) continue;
+          if (norm(m.textMsg?.content) === wantText) sameTextNewMineWithId.push({ raw, lid });
+        }
+        const noAnonAmbiguity = curAnonUnsettledCount === baseline.mineAnonUnsettledCount && !hasAnonNewMineSuccess;
+        if (noAnonAmbiguity && sameTextNewMineWithId.length === 1) {
+          const { raw, lid } = sameTextNewMineWithId[0];
+          if (raw.currentMsgStatus === 3 && (localIdCounts.get(lid) ?? 0) === 1) {
+            return raw.outLimitWarn
+              ? '私信发送失败（页面消息状态 Failure，触发条数/频控限制）'
+              : '私信发送失败（页面消息状态 Failure）';
+          }
+        }
       }
+      const newToast = ((await toasts(page)) ?? []).find((x) => !baseline.toasts.has(x));
+      if (newToast) return sanitizeToastError(newToast);
       return null;
     },
     diagnose: async () => {
+      if (!baseline) return null;
       const cur = bySid(await dmSessions(page));
-      const pendingNow = mineOfStatus(cur, 1);
-      const curPendingCounts = countBy(pendingNow, rawMsgSig);
-      const hasNewPending = [...curPendingCounts.entries()].some(([sig, n]) => n > (pendingBefore.get(sig) ?? 0));
-      if (hasNewPending) return '消息仍处于发送中(Pending)，未拿到服务端 svrMsgId';
-      const noSvrSuccess = mineOfStatus(cur, 2).some((raw) => raw.message.sendMsgFlag && !validSvrMsgId(raw.message.svrMsgId));
-      if (noSvrSuccess) return '消息状态为 Success 但未拿到有效服务端 svrMsgId';
+      if (!cur) return null;
+      let curAnonPendingCount = 0;
+      let hasNewPending = false;
+      let hasNewNoSvrSuccess = false;
+      for (const raw of cur.messageList ?? []) {
+        const m = raw?.message;
+        const st = raw?.currentMsgStatus;
+        if (!m || typeof st !== 'number' || m.fromUsername === peer) continue;
+        const lid = normLocalId(m.msgId);
+        if (!lid) {
+          if (st === 1) curAnonPendingCount++;
+          continue;
+        }
+        if (baseline.allLocalIds.has(lid)) continue;
+        if (norm(m.textMsg?.content) !== wantText) continue;
+        if (st === 1) hasNewPending = true;
+        if (st === 2 && !validSvrMsgId(m.svrMsgId)) hasNewNoSvrSuccess = true;
+      }
+      if (hasNewPending || curAnonPendingCount > baseline.mineAnonPendingCount) {
+        return '消息仍处于发送中(Pending)，未拿到服务端 svrMsgId';
+      }
+      if (hasNewNoSvrSuccess) return '消息状态为 Success 但未拿到有效服务端 svrMsgId';
       return null;
     },
   };

@@ -5,11 +5,13 @@
 <wujie-app></wujie-app>
 <script>
 // 模式（?mode=）：ok | scroll | swap | swap-header | swap-list | pending | fail | phonecheck | fail-history | locked | lastme | nobox | mangle | silent | nouid
+// 扩展回归模式：scroll-same-peer | old-pending-promote | fail-history-silent | async-fail-during-type | anon-pending-fail | phonecheck-preexisting | swap-during-type | ancestor-conflict | nobtn-msg-send | toast-leak
 const mode = new URLSearchParams(location.search).get('mode') || 'ok';
 if (mode !== 'nouid') window.__loginUser = { uniqId: 'v2_me', nickname: '麦田测试号' };
 const ME_USER = 'me_finder';
-let sendClicks = 0, seq = 0, listSid = '', headerSid = '', scrollLoads = 0, sawPending = false;
+let sendClicks = 0, msgTextClicks = 0, seq = 0, listSid = '', headerSid = '', scrollLoads = 0, sawPending = false;
 let page2Loaded = false, page2Loading = false;
+const scrolledTargets = [];
 const sr = document.querySelector('wujie-app').attachShadow({ mode: 'open' });
 sr.innerHTML = `<style>
   .private-msg-wrapper { display: flex; gap: 12px; font-family: sans-serif; }
@@ -21,13 +23,13 @@ sr.innerHTML = `<style>
   .session-dialog .message-list { min-height: 120px; padding: 8px; }
   textarea.edit_area { width: 300px; height: 60px; }
   .weui-desktop-btn_disabled { opacity: 0.5; pointer-events: none; }
-  .phone-check-dialog { position: fixed; top: 40px; left: 40px; width: 240px; padding: 16px; background: #fff; border: 1px solid #c00; }
+  .phone-check-dialog { position: fixed; bottom: 16px; right: 16px; width: 220px; padding: 16px; background: #fff; border: 1px solid #c00; }
   .weui-desktop-toast { position: fixed; top: 4px; right: 4px; }
 </style>
 <div class="private-msg-wrapper">
   <div class="session-container"><div class="session-tg"></div></div>
   <div class="session-dialog"></div>
-  <div class="phone-check-dialog" style="display:none">请先完成手机号安全验证</div>
+    <div class="phone-check-dialog" style="display:${mode === 'phonecheck-preexisting' ? 'block' : 'none'}">请先完成手机号安全验证</div>
   <div class="toast-holder"></div>
 </div>`;
 const ts = Math.floor(Date.now() / 1000) - 3600;
@@ -64,16 +66,41 @@ const targetSessions = [
 if (mode === 'lastme') {
   targetSessions[0][1].messageList.unshift(histMsg('m9', '7380000000000000009', ME_USER, 'peer_a', ts + 20, '稍等'));
 }
-if (mode === 'fail-history') {
+if (mode === 'fail-history' || mode === 'fail-history-silent') {
   targetSessions[0][1].messageList.unshift({
     currentMsgStatus: 3,
     outLimitWarn: false,
     message: { msgId: 'old-fail-uuid', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 20, msgType: 1, textMsg: { content: '上次没发出去' } },
   });
 }
+if (mode === 'old-pending-promote') {
+  targetSessions[0][1].messageList.splice(1, 0, {
+    currentMsgStatus: 1,
+    outLimitWarn: false,
+    message: { msgId: 'old-pending-uuid', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 5, msgType: 1, textMsg: { content: '你好，在的' } },
+  });
+}
+if (mode === 'anon-pending-fail') {
+  targetSessions[0][1].messageList.splice(1, 0, {
+    currentMsgStatus: 1,
+    outLimitWarn: false,
+    message: { msgId: null, svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 5, msgType: 1, textMsg: { content: '旧无ID待发' } },
+  });
+}
+if (mode === 'nobtn-msg-send') {
+  targetSessions[0][1].messageList.unshift(histMsg('m_send_txt', '7380000000000000088', 'peer_a', ME_USER, ts + 15, '发送'));
+}
+
+const samePeerOther = ['s_other', {
+  sessionInfo: { sessionId: 's_other', username: 'peer_a', nickname: '甲' },
+  messageList: [histMsg('m_other', '7380000000000000099', 'peer_a', ME_USER, ts + 5, '另一个会话')],
+  newMsgCount: 0, sessionIsUnread: false, sessionType: 1,
+}];
 
 const sessionList = mode === 'scroll'
   ? Array.from({ length: 12 }, (_, idx) => makeFiller(idx + 1))
+  : mode === 'scroll-same-peer'
+    ? [samePeerOther, ...Array.from({ length: 11 }, (_, idx) => makeFiller(idx + 1))]
   : [...targetSessions];
 
 const wrapperEl = sr.querySelector('.private-msg-wrapper');
@@ -93,7 +120,7 @@ const scrollListVm = {
 };
 const listVm = {
   $data: { sessionList },
-  get currentSessionId() { return listSid; },
+  get currentSessionId() { return mode === 'ancestor-conflict' ? '' : listSid; },
   $children: [scrollListVm],
 };
 wrapperEl.__vue__ = listVm;
@@ -104,16 +131,21 @@ const headerVm = {
   $props: {},
   $data: {},
   get sessionInfo() {
+    if (mode === 'ancestor-conflict') return {};
     const hit = sessionList.find(([id]) => id === headerSid);
     return hit ? hit[1].sessionInfo : null;
   },
   $children: [],
 };
 const editorVm = { $props: {}, $data: {}, $children: [] };
+if (mode === 'ancestor-conflict') {
+  editorVm.$props = { sessionId: 's_1' };
+  editorVm.$data = { sessionId: 's_2' };
+}
 dialogEl.__vue__ = { $props: {}, $data: {}, $children: [headerVm, editorVm] };
 
 containerEl.addEventListener('scroll', () => {
-  if (mode !== 'scroll' || page2Loaded || page2Loading) return;
+  if ((mode !== 'scroll' && mode !== 'scroll-same-peer') || page2Loaded || page2Loading) return;
   if (containerEl.scrollTop + containerEl.clientHeight < containerEl.scrollHeight - 20) return;
   page2Loading = true;
   setTimeout(() => {
@@ -129,10 +161,17 @@ containerEl.addEventListener('scroll', () => {
 function renderList() {
   tgEl.innerHTML = '';
   const vnodes = [];
-  for (const [id, s] of sessionList) {
+  // 让 DOM 顺序与 sessionList 顺序不同，确保测试覆盖 transition-group vnode.key 主路径而非索引回退
+  const renderItems = [...sessionList].reverse();
+  for (const [id, s] of renderItems) {
     const el = document.createElement('div');
     el.className = 'session-wrap' + (id === listSid ? ' active-session' : '');
     el.textContent = s.sessionInfo.nickname + '：' + (s.messageList[0]?.message?.textMsg?.content ?? '');
+    const origScroll = el.scrollIntoView.bind(el);
+    el.scrollIntoView = (opt) => {
+      scrolledTargets.push({ id, opt: opt ?? null });
+      return origScroll(opt);
+    };
     // 真实页面中 .session-wrap 是普通元素，不挂 __vue__
     el.onclick = () => {
       if (mode === 'swap') { listSid = 's_2'; headerSid = 's_2'; }
@@ -163,9 +202,14 @@ function renderPanel() {
 
   const msgBox = document.createElement('div');
   msgBox.className = 'message-list';
+  if (mode === 'ancestor-conflict') {
+    // 无关子组件挂着目标 sessionId，核验不应采信非 .header 里的无关组件
+    msgBox.__vue__ = { $props: {}, $data: {}, sessionInfo: { sessionId: 's_1' } };
+  }
   for (const m of [...s.messageList].reverse()) {
     const d = document.createElement('div');
     d.textContent = m.message.textMsg.content;
+    d.onclick = () => { msgTextClicks++; };
     msgBox.appendChild(d);
   }
   dialogEl.appendChild(msgBox);
@@ -174,27 +218,67 @@ function renderPanel() {
   const footer = document.createElement('div');
   footer.className = 'footer';
   footer.__vue__ = editorVm;
-  footer.innerHTML = '<textarea class="edit_area"></textarea><div class="weui-desktop-btn_wrp"><button class="weui-desktop-btn weui-desktop-btn_disabled" disabled>发送</button></div>';
+  footer.innerHTML = mode === 'nobtn-msg-send'
+    ? '<textarea class="edit_area"></textarea>'
+    : '<textarea class="edit_area"></textarea><div class="weui-desktop-btn_wrp"><button class="weui-desktop-btn weui-desktop-btn_disabled" disabled>发送</button></div>';
   dialogEl.appendChild(footer);
 
   const ta = footer.querySelector('textarea');
   const btn = footer.querySelector('button');
   const syncBtn = () => {
+    if (!btn) return;
     const canSend = mode !== 'locked' && ta.value.trim().length > 0;
     btn.disabled = !canSend;
     btn.classList.toggle('weui-desktop-btn_disabled', !canSend);
   };
   ta.addEventListener('input', () => {
     if (mode === 'mangle' && !ta.dataset.m) { ta.dataset.m = '1'; ta.value = ta.value.slice(0, -1); }
+    if (mode === 'async-fail-during-type' && !ta.dataset.af) {
+      ta.dataset.af = '1';
+      s.messageList.unshift({
+        currentMsgStatus: 3,
+        outLimitWarn: false,
+        message: { msgId: 'async-old-fail', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: ts + 3, msgType: 1, textMsg: { content: '异步补入的历史失败' } },
+      });
+    }
+    if (mode === 'swap-during-type' && !ta.dataset.sw) {
+      ta.dataset.sw = '1';
+      listSid = 's_2';
+      headerSid = 's_2';
+    }
     syncBtn();
   });
-  btn.onclick = () => { if (!btn.disabled) onSend(s, ta); };
+  if (btn) btn.onclick = () => { if (!btn.disabled) onSend(s, ta); };
 }
 
 function onSend(s, ta) {
   sendClicks++;
   const text = ta.value;
-  if (mode === 'silent') return;
+  if (mode === 'silent' || mode === 'fail-history-silent' || mode === 'async-fail-during-type' || mode === 'phonecheck-preexisting') return;
+  if (mode === 'old-pending-promote') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message?.msgId === 'old-pending-uuid');
+      if (old) {
+        old.currentMsgStatus = 2;
+        old.message.svrMsgId = '7390000000000009999';
+      }
+    }, 200);
+    return;
+  }
+  if (mode === 'anon-pending-fail') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message && m.message.msgId == null && m.currentMsgStatus === 1);
+      if (old) old.currentMsgStatus = 3;
+    }, 200);
+    return;
+  }
+  if (mode === 'toast-leak') {
+    setTimeout(() => {
+      const holder = sr.querySelector('.toast-holder');
+      holder.innerHTML = `<div class="weui-desktop-toast">发送失败：${text}</div>`;
+    }, 200);
+    return;
+  }
   const localId = 'local-uuid-' + (++seq);
   const entry = {
     currentMsgStatus: 1,
@@ -237,10 +321,12 @@ function onSend(s, ta) {
 
 window.__probe = () => ({
   sendClicks,
+  msgTextClicks,
   openId: listSid,
   headerId: headerSid,
   scrollLoads,
   sawPending,
+  scrolledTargets,
   rowHasVue: [...sr.querySelectorAll('.session-wrap')].some((el) => '__vue__' in el),
   boxes: [...sr.querySelectorAll('textarea.edit_area')].map((b) => b.value),
   mine: sessionList.flatMap(([id, s]) => s.messageList

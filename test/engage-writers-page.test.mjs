@@ -383,10 +383,18 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
       assertSent(x, '7390000000000000001');
       assert.equal(x.probe.rowHasVue, false);
       assert.equal(x.probe.sawPending, true);
+      assert.equal(x.probe.scrolledTargets.some((t) => t.id === 's_1' && t.opt?.block === 'center'), true);
       assert.deepEqual(x.probe.mine, [{ session: 's_1', svrMsgId: '7390000000000000001', text: '你好，在的' }]);
     });
     test('私信：目标在长列表下一页 → 滚动懒加载后定位、滚动到可视区并发送成功', async () => {
       const x = await dm('scroll');
+      assertSent(x, '7390000000000000001');
+      assert.equal(x.probe.scrollLoads, 1);
+      assert.equal(x.probe.scrolledTargets.some((t) => t.id === 's_1' && t.opt?.block === 'center'), true);
+      assert.deepEqual(x.probe.mine, [{ session: 's_1', svrMsgId: '7390000000000000001', text: '你好，在的' }]);
+    });
+    test('私信：第一页有同 peerUid 的其他会话、指定 conversationId 在下一页 → 不误发旧会话，翻页发到目标会话', async () => {
+      const x = await dm('scroll-same-peer');
       assertSent(x, '7390000000000000001');
       assert.equal(x.probe.scrollLoads, 1);
       assert.deepEqual(x.probe.mine, [{ session: 's_1', svrMsgId: '7390000000000000001', text: '你好，在的' }]);
@@ -394,6 +402,17 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
     test('私信：点开的不是目标会话 → target-not-found，不发', async () => assertNoSend(await dm('swap'), 'target-not-found'));
     test('私信：SessionHeader 与目标会话不一致 → target-not-found，不发', async () => assertNoSend(await dm('swap-header'), 'target-not-found'));
     test('私信：列表 currentSessionId 与目标会话不一致 → target-not-found，不发', async () => assertNoSend(await dm('swap-list'), 'target-not-found'));
+    test('私信：无关组件带目标 ID 且祖先数据冲突 → target-not-found，不发', async () => assertNoSend(await dm('ancestor-conflict'), 'target-not-found'));
+    test('私信：输入文字期间会话被切换 → 不点发送、清空输入框', async () => {
+      const x = await dm('swap-during-type');
+      assertNoSend(x, 'cannot-send');
+      assertCleared(x);
+    });
+    test('私信：旧 Pending 转 Success+svrMsgId 而本次 silent → 不误报 sent', async () => {
+      const x = await dm('old-pending-promote');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+    });
     test('私信：乐观写入停在 Pending(1) 无 svrMsgId → 不误报 sent，超时并给出 Pending 诊断', async () => {
       const x = await dm('pending');
       assertNotReadBack(x);
@@ -416,6 +435,38 @@ return { r, r2, afterFirst, probe: await page.evaluate(() => window.__probe()) }
     test('私信：历史存在旧 Failure(3) 消息 → 不触发 last-is-me 也不误报 sendError，正常发送成功', async () => {
       const x = await dm('fail-history');
       assertSent(x, '7390000000000000001');
+    });
+    test('私信：历史存在旧 Failure(3) 且本次 silent → 不误报 sendError', async () => {
+      const x = await dm('fail-history-silent');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+    });
+    test('私信：输入期间异步补入历史 Failure 且本次 silent → 不误报 sendError', async () => {
+      const x = await dm('async-fail-during-type');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+    });
+    test('私信：无 msgId 旧 Pending 转 Failure 且本次 silent → 不误报 sendError', async () => {
+      const x = await dm('anon-pending-fail');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+    });
+    test('私信：点击前已显示的手机验证弹窗且本次 silent → 不误报 sendError', async () => {
+      const x = await dm('phonecheck-preexisting');
+      assertNotReadBack(x);
+      assert.equal(x.r.sendError, undefined);
+    });
+    test('私信：页面弹出含私信正文的报错 toast → sendError 脱敏不含原文', async () => {
+      const x = await dm('toast-leak');
+      assertNotReadBack(x);
+      assert.match(x.r.sendError, /私信发送/);
+      assert.doesNotMatch(x.r.sendError, /你好，在的/);
+    });
+    test('私信：footer 缺发送按钮但聊天记录里有正文「发送」→ cannot-send，不点聊天正文，框已清空', async () => {
+      const x = await dm('nobtn-msg-send');
+      assertNoSend(x, 'cannot-send');
+      assertCleared(x);
+      assert.equal(x.probe.msgTextClicks, 0);
     });
     test('私信：输入后发送按钮仍是 disabled → cannot-send，框已清空，不点', async () => {
       const x = await dm('locked');
