@@ -245,7 +245,6 @@ export function readDmPage(via = 'context') {
   // Context 与 DOM 共用原 DOM 的 SDK 序列化；原生键、ISO 时间和事件 ID 需兼容已有数据。
   const messageOf = (lm) => lm ? {
     serverId: lm.serverId != null ? String(lm.serverId) : null, clientMessageId: lm.clientMessageId ?? null,
-    sequence: lm.indexInConversation == null ? null : String(lm.indexInConversation),
     sdkTime: Number(lm.createdAt) || null,
     type: lm.type, isFromMe: !!lm.isFromMe,
     createdAt: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null,
@@ -342,21 +341,13 @@ export function readDmPage(via = 'context') {
   const put = (item, fromDom = false) => {
     if (!item) return;
     const prev = byId.get(item.id);
-    const reads = prev?.reads ?? [];
-    if (item.lastMessage) {
-      const read = { message: item.lastMessage, fromDom };
-      if (fromDom) reads.unshift(read);
-      else reads.push(read);
-    }
-    if (!prev) { byId.set(item.id, { ...item, reads }); return; }
-    const prevTs = millis(prev.lastMessage);
-    const nextTs = millis(item.lastMessage);
-    // 首屏可反映撤回。列表中的同一会话用 DOM 维护摘要，两份观测仍全部入库。
-    const preferItem = (fromDom && item.lastMessage != null) || nextTs > prevTs;
-    const winner = preferItem ? item : prev;
+    item.onScreen = fromDom;
+    if (!prev) { byId.set(item.id, item); return; }
+    // DOM 是首屏会话的唯一来源，包括撤回和空末条。
+    const winner = fromDom || millis(item.lastMessage) > millis(prev.lastMessage) ? item : prev;
     const other = winner === item ? prev : item;
     byId.set(item.id, {
-      ...winner, reads,
+      ...winner,
       isStrangerChat: prev.isStrangerChat || item.isStrangerChat,
       name: (fromDom ? item.name : null) ?? winner.name ?? other.name ?? null,
       toParticipantUserId: winner.toParticipantUserId ?? other.toParticipantUserId ?? null,
@@ -390,7 +381,7 @@ export function readDmPage(via = 'context') {
     put({ ...row, id: String(row.id) }, true);
   }
   const conversations = [...byId.values()];
-  if (conversations.some((c) => c.reads.some(({ message: m }) => m.createdAt && (m.serverId ?? m.clientMessageId) === ''))) {
+  if (conversations.some(({ lastMessage: m }) => m?.createdAt && (m.serverId ?? m.clientMessageId) === '')) {
     return { ok: false, code: 'empty-message-id', domRows: domItems.length };
   }
   const strangerCount = conversations.filter((c) => c.isStrangerChat).length;
@@ -567,20 +558,11 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     const last = lm && at ? { by: lm.isFromMe ? 'me' : 'peer', at, text: textOf(lm), type: TYPE(lm.type) } : null;
     const rawName = typeof c.name === 'string' ? c.name.trim() : '';
     const nickname = rawName && rawName !== '陌生人消息' ? rawName : null;
-    const observations = [];
-    const seen = new Set();
-    for (const { message: m, fromDom } of c.reads ?? (lm ? [{ message: lm, fromDom: raw.via !== 'context' }] : [])) {
-      const sentAt = isoOf(m.createdAt);
-      if (!sentAt) continue;
-      const nativeId = String(m.serverId ?? m.clientMessageId ?? `${id}:${m.createdAt}`);
-      const msg = { nativeId, conversationNativeId: id, by: m.isFromMe ? 'me' : 'peer', at: sentAt, type: TYPE(m.type), text: textOf(m) };
-      const sdkSeconds = sdkTimestamp(m);
-      observations.push({ msg, fromDom, server: validDmId(m.serverId), client: validDmId(m.clientMessageId),
-        sdkIndex: validDmId(m.sequence), sdkSeconds, occurredAt: sdkIso(sdkSeconds), content: m.content });
-      if (!seen.has(nativeId)) { messages.push(msg); seen.add(nativeId); }
-    }
-    conversations.push({ nativeId: id, observations, observedLastAt: last ? sdkIso(sdkTimestamp(lm)) : null, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
+    const onScreen = c.onScreen ?? raw.via !== 'context';
+    conversations.push({ nativeId: id, onScreen, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
       unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}) });
+    if (last) messages.push({ nativeId: String(lm.serverId ?? lm.clientMessageId ?? `${id}:${lm.createdAt}`), conversationNativeId: id,
+      ...last, server: validDmId(lm.serverId), client: validDmId(lm.clientMessageId), sdkAt: sdkIso(sdkTimestamp(lm)) });
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
   if (raw.collectionStartedAt) out.collectionStartedAt = raw.collectionStartedAt;

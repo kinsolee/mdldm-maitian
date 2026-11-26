@@ -17,7 +17,7 @@ import { deliverPending } from '../src/daemon/outbox.mjs';
 import { runRound, DM_DELAY_ALERT_MS, DM_DELAY_ALERT_COOLDOWN_MS } from '../src/daemon/sync.mjs';
 import { freshDb, douyin, comment, commentsSnap, conv, dmsSnap, T0, MIN, at } from './helpers/engage-fixtures.mjs';
 
-import { generateDmHistory, identityHistory, modelItem, expectedDms } from './helpers/douyin-dm-model.mjs';
+import { generateDmHistory, identityHistory, sourceHistory, modelItem, expectedDms } from './helpers/douyin-dm-model.mjs';
 import { pathToFileURL } from 'node:url';
 
 const HOUR = 3600_000;
@@ -1137,7 +1137,7 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     }
   });
 
-  test('第十一轮：DOM 已见的对方私信与 Context 较新的己方回复都入库，撤回以 DOM 为准', async (t) => {
+  test('第十一轮：首屏先见对方私信、再见己方回复和撤回，以 DOM 更新并派发', async (t) => {
     const seed = identityItem(T0 - MIN, 'seed', { server: 'base', mine: true });
     const peer = identityItem(T0 + 100, 'first', { server: 'A' });
     const reply = identityItem(T0 + 300, 'reply', { server: 'me', mine: true });
@@ -1211,18 +1211,10 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
           const ingest = () => {
             const result = reader.ingestSnapshot(db, acc, snap, { now: at(T0 + i * MIN) });
             for (const id of result.events) {
-              const { text } = JSON.parse(db.prepare('SELECT payload FROM events WHERE id=?').get(id).payload);
-              const sent = reader !== control && db.prepare('SELECT server,client,sdkIndex FROM douyin_dm_receipts WHERE eventId=?').get(id);
-              const evidence = sent && (sent.server ?? sent.client);
-              if (evidence) {
-                const label = evidence.slice(1);
-                const truth = rounds.flatMap((round) => [...round.dom, ...round.context]).find((m) => String(m.number) === label);
-                assert.equal(text, truth.text ?? String(truth.number), 'outbox payload and identity agree');
-                events.push(label);
-                continue;
-              }
-              const views = reader === control || raw.via !== 'context' ? r.dom : [...r.dom, ...r.context];
-              const labels = new Set(views.filter((m) => !m.mine && (m.text ?? String(m.number)) === text).map((m) => String(m.number)));
+              const { text, conversationId } = JSON.parse(db.prepare('SELECT payload FROM events WHERE id=?').get(id).payload);
+              const views = [...r.dom, ...(reader !== control && raw.via === 'context' ?
+                r.context.filter((c) => !r.dom.some((d) => d.thread === c.thread)) : [])];
+              const labels = new Set(views.filter((m) => conversationId === `Douyin:thread-${m.thread}` && !m.mine && (m.text ?? String(m.number)) === text).map((m) => String(m.number)));
               assert.equal(labels.size, 1, 'fixture must identify the emitting observation');
               events.push(...labels);
             }
@@ -1239,8 +1231,8 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
           ingest();
           if (r.legacy && !control) {
             // 无历史代码的源码包仍测试旧行；移除新版独有的账本并恢复 main 的显示时间。
-            db.exec(`DELETE FROM douyin_dm_receipts; DELETE FROM douyin_dm_baselines;
-              DELETE FROM engage_baselines WHERE kind!='dms'; UPDATE messages SET receiptManaged=NULL;
+            db.exec(`DELETE FROM douyin_dm_baselines;
+              DELETE FROM engage_baselines WHERE kind!='dms'; UPDATE messages SET dmSource=NULL,dmClient=NULL,dmServer=NULL,dmTime=NULL;
               UPDATE conversations SET lastAt=(SELECT at FROM messages WHERE conversationId=conversations.id)`);
           }
           if (!r.legacy && r.crash === 3) { reopen(); ingest(); } // 已提交、尚未写任务结果
@@ -1252,12 +1244,23 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
         if (file !== ':memory:') fs.rmSync(file, { force: true });
       }
     }
-    const totals = { mainDuplicates: 0 };
+    const totals = { mainDuplicates: 0, excludedBySourcePolicy: 0 };
     async function check(rounds, file) {
       const actual = await replay(rounds, current, file);
-      assert.deepEqual(actual, expectedDms(rounds));
+      const visible = new Set(rounds.slice(1).flatMap((r) => [...r.dom,
+        ...(r.via === 'api' ? r.context.filter((c) => !r.dom.some((d) => d.thread === c.thread)) : [])])
+        .filter((m) => !m.mine && m.number > 0).map((m) => String(m.number)));
+      assert.equal(actual.length, new Set(actual).size, 'duplicate delivery: ' + actual);
+      for (const label of actual) assert.ok(visible.has(label), 'unexpected delivery: ' + label);
+      for (const label of expectedDms(rounds)) assert.ok(actual.includes(label), 'missing delivery: ' + label);
       if (control) {
         const main = await replay(rounds, control, file);
+        const oldUnion = new Set(rounds.slice(1).flatMap((r) => r.via === 'api' ? [...r.dom, ...r.context] : r.dom)
+          .filter((m) => !m.mine && m.number > 0).map((m) => String(m.number)));
+        for (const label of oldUnion) if (!actual.includes(label)) {
+          assert.ok(!main.includes(label), 'source policy lost a main event: ' + label);
+          totals.excludedBySourcePolicy++;
+        }
         for (const label of new Set(main)) {
           const observed = actual.filter((id) => id === label).length;
           const reference = main.filter((id) => id === label).length;
@@ -1282,7 +1285,22 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
       }
     });
   }
-  test('固定种子：跨视图、撤回、身份变化、事务回滚与重启后，每条可见的新私信恰好一个事件', async (t) => {
+  const sourceCases = ['legacy-server', 'distinct', 'old-index', 'metadata', 'late-index', 'precise-handoff'];
+  for (const kind of sourceCases) {
+    test('第十三轮：' + kind, async (t) => {
+      const { check, replay, current, control, dir } = await modelReplay(t);
+      const rounds = sourceHistory(kind, 1, T0);
+      const file = path.join(dir, 'handoff.sqlite');
+      const expected = kind === 'old-index' ? [] : kind === 'precise-handoff' ? ['1', '2'] : ['1'];
+      if (control) assert.deepEqual(await replay(rounds, control, file), expected);
+      assert.deepEqual(await replay(rounds, current, file), expected);
+      if (kind === 'precise-handoff') {
+        assert.deepEqual(await replay(rounds.slice(0, 3), current, file), expected);
+      }
+      await check(rounds, file);
+    });
+  }
+  test('固定种子：首屏对照 main，首屏外读取 Context，重放与重启后逐条核对发件箱', async (t) => {
     const { check, dir, control, totals } = await modelReplay(t);
     const count = 2048;
     for (let seed = 1; seed <= count; seed++) {
@@ -1290,7 +1308,7 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
       const extra = identityHistory(['upgrade', 'alias', 'collision'][seed % 3], seed, T0);
       // 每 32 个序列使用真实文件、在故障点重开连接；其余使用内存 SQLite 验证事务。
       const file = seed % 32 === 0 ? path.join(dir, 'replay.sqlite') : ':memory:';
-      for (const sequence of [rounds, extra]) {
+      for (const sequence of [rounds, extra, sourceHistory(sourceCases[seed % sourceCases.length], seed, T0)]) {
         try { await check(sequence, file); } catch (error) {
           let minimal = sequence;
           for (let i = minimal.length - 1; i > 0; i--) {
@@ -1301,7 +1319,7 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
         }
       }
     }
-    t.diagnostic(`${count * 2} sequences; 0 failures; 128 file-backed sequences; main comparison=${!!control}; main excess deliveries=${totals.mainDuplicates}`);
+    t.diagnostic(`${count * 3} sequences; 0 failures; 192 file-backed sequences; main comparison=${!!control}; main excess deliveries=${totals.mainDuplicates}; old union only=${totals.excludedBySourcePolicy}`);
   });
 
   test('占位昵称「陌生人消息」既不覆盖真实昵称，也不沿用旧行占位词到 payload.nickname', async () => {

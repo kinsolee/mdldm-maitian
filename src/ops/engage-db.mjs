@@ -43,19 +43,11 @@ CREATE TABLE IF NOT EXISTS messages (
   by TEXT NOT NULL, at TEXT, type TEXT, text TEXT, firstSeenAt TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_conv ON messages (conversationId, at);
--- 同一条 SDK 私信的身份证据与发件箱在同一事务确认。历史库无需回填。
+-- 首屏和扩展列表共用基线，Context 不推进 DOM 的末条时间。
 CREATE TABLE IF NOT EXISTS douyin_dm_baselines (
-  accountId TEXT NOT NULL, conversationId TEXT NOT NULL, lastAt TEXT,
+  accountId TEXT NOT NULL, conversationId TEXT NOT NULL, lastAt TEXT, domLastAt TEXT, domSdkAt TEXT,
   PRIMARY KEY (accountId, conversationId)
 );
-CREATE TABLE IF NOT EXISTS douyin_dm_receipts (
-  accountId TEXT NOT NULL, conversationId TEXT NOT NULL,
-  server TEXT, client TEXT, sdkIndex TEXT, signature TEXT NOT NULL, disposition TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS dm_receipt_server ON douyin_dm_receipts(accountId, conversationId, server);
-CREATE INDEX IF NOT EXISTS dm_receipt_client ON douyin_dm_receipts(accountId, conversationId, client);
-CREATE INDEX IF NOT EXISTS dm_receipt_index ON douyin_dm_receipts(accountId, conversationId, sdkIndex);
-CREATE INDEX IF NOT EXISTS dm_receipt_signature ON douyin_dm_receipts(accountId, conversationId, signature);
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY, type TEXT NOT NULL, platformCode TEXT NOT NULL, accountId TEXT, subjectId TEXT,
   createdAt TEXT NOT NULL, payload TEXT NOT NULL,
@@ -106,17 +98,13 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt)
 `);
   // 本分支早期建的 actions 没有 targetLastAt
   addColumnIfMissing(db, 'actions', 'targetLastAt', 'TEXT');
-  // 旧版 receipt 只有精确摘要；新增字段只用来查找可能是同一条的候选，不作为身份键。
-  addColumnIfMissing(db, 'douyin_dm_receipts', 'secondKey', 'TEXT');
-  addColumnIfMissing(db, 'douyin_dm_receipts', 'observedAt', 'TEXT');
-  addColumnIfMissing(db, 'douyin_dm_receipts', 'eventId', 'TEXT');
-  db.exec('CREATE INDEX IF NOT EXISTS dm_receipt_second ON douyin_dm_receipts(accountId, conversationId, secondKey)');
+  for (const col of ['domLastAt', 'domSdkAt']) addColumnIfMissing(db, 'douyin_dm_baselines', col, 'TEXT');
+  // dmSource 为 dom/context 时代表基线或已入箱，seen 表示仅观察到，NULL 兼容 main 的旧行。
+  for (const col of ['dmSource', 'dmServer', 'dmClient', 'dmTime']) addColumnIfMissing(db, 'messages', col, 'TEXT');
   // 推送前过滤（filter.mjs）命中的规则名；没命中为 NULL
   addColumnIfMissing(db, 'events', 'filteredReason', 'TEXT');
   // 对方发出时间（ISO，UTC）：评论取 comments.createdAt，私信取 last.at；旧行与系统事件为 NULL。createdAt 保持入库时间不变
   addColumnIfMissing(db, 'events', 'occurredAt', 'TEXT');
-  // NULL 是升级前的消息，旧库只能从 messages 恢复其身份。
-  addColumnIfMissing(db, 'messages', 'receiptManaged', 'INTEGER');
   // 自动关分两组：write（回复、私信）、moderate（删评论、拉黑、删会话）。旧记录 NULL 当 write
   addColumnIfMissing(db, 'engage_write_trips', 'family', 'TEXT');
 }

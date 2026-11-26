@@ -28,7 +28,8 @@ export function generateDmHistory(seed, epoch) {
     timeline.push(histories.map((h) => h.at(-1)));
     const sample = () => timeline[n - pick(Math.min(4, n + 1))];
     const dom = sample().map(view).filter((m) => m && pick(3));
-    const context = sample().map(view).filter((m) => m && pick(5));
+    const context = sample().map(view).filter((m) => m && pick(5))
+      .map((m) => ({ ...m, metadata: (m.number + seed) % 2 === 0 }));
     rounds.push({ dom, context, via: ['api', 'api', 'dom', 'fallback'][pick(4)], crash: pick(8) });
   }
   return rounds;
@@ -37,17 +38,33 @@ export function generateDmHistory(seed, epoch) {
 export function modelItem(m) {
   return { id: 'thread-' + m.thread, isStrangerChat: !!m.thread, lastMessage: {
     serverId: m.zero ? '0' : m.ids & 1 ? 'S' + m.number : null, clientMessageId: m.ids & 2 ? 'C' + m.number : null,
-    indexInConversation: m.index ? String(m.number + 10) : null,
+    indexInConversation: m.index ? String(m.sdkIndex ?? m.number + 10) : null,
     createdAt: m.seconds ? m.ms / 1000 : m.ms, isFromMe: m.mine,
-    type: 7, content: JSON.stringify({ text: m.text ?? String(m.number) }),
+    type: 7, content: JSON.stringify({ text: m.text ?? String(m.number), ...(m.metadata ? { source: 'context', version: 2 } : {}) }),
   } };
 }
 
 export function expectedDms(rounds) {
   const delivered = new Set();
-  for (const r of rounds.slice(1)) {
-    const reads = r.via === 'api' && r.context.length ? [...r.dom, ...r.context] : r.dom;
-    for (const m of reads) if (m.number > 0 && !m.mine) delivered.add(String(m.number));
+  const domLast = new Map();
+  const domEvents = new Set();
+  // DOM 原本就可能在两次采集中重复或回退。按真实的可见时间和发件箱键计算首屏应发集合。
+  for (const [i, r] of rounds.entries()) {
+    for (const m of r.dom) {
+      const at = m.seconds ? Math.floor(m.ms / 1000) * 1000 : m.ms;
+      const key = m.thread + ':' + at;
+      const previous = domLast.get(m.thread) ?? -Infinity;
+      if (i && !m.mine && at > previous && !domEvents.has(key)) {
+        domEvents.add(key);
+        if (m.number > 0) delivered.add(String(m.number));
+      }
+      domLast.set(m.thread, at);
+    }
+    if (i && r.via === 'api') {
+      for (const m of r.context) {
+        if (m.number > 0 && !m.mine && !r.dom.some((d) => d.thread === m.thread)) delivered.add(String(m.number));
+      }
+    }
   }
   return [...delivered].sort();
 }
@@ -80,4 +97,37 @@ export function identityHistory(kind, seed, epoch) {
   const b = peer(1, ms, 1, true, 'same');
   const identifiedA = { ...a, ids: 1, index: true };
   return [row(a), row(earlier), row(b), row(identifiedA), ...(seed % 2 ? [] : [row(b)]), row(offscreen, seed % 2 ? identifiedA : b)];
+}
+
+export function sourceHistory(kind, seed, epoch) {
+  const time = epoch + (seed % 31 + 1) * 1000;
+  const peer = (number, ms, ids, index = false) => ({ thread: 0, mine: false, number, ms, ids, index, text: 'same' });
+  const row = (dom, ctx = dom, legacy = false) => ({ dom: [dom], context: [ctx], via: 'api', crash: 3, legacy });
+  const mine = { ...peer(-9, time - 2000, 1), mine: true, text: 'mine' };
+  const other = { ...mine, thread: 1 };
+  const coarse = peer(1, time, 1);
+  const fine = { ...coarse, ids: 2, ms: time + (seed === 1 ? 456 : 1 + seed * 137 % 999) };
+  if (kind === 'precise-handoff') {
+    const first = { ...coarse, ms: time + 123, seconds: true };
+    const next = peer(2, time + 756, 2);
+    return [row(mine), row(first), row(other, next), row(next), row(other, next)];
+  }
+  if (kind === 'legacy-server' || kind === 'metadata') {
+    const legacy = kind === 'legacy-server';
+    const ctx = { ...fine, metadata: !legacy };
+    return [row(mine, mine, legacy), row(coarse, coarse, legacy), row(other, ctx),
+      row(other, { ...ctx, ids: 3 }), row(coarse, ctx)];
+  }
+  const a = peer(-1, time, 0);
+  if (kind === 'distinct') {
+    const old = { ...a, ids: 1, sdkIndex: 41 };
+    return [row(old), row(fine), row(fine, { ...old, index: true }), row({ ...fine, index: true, sdkIndex: 42 }), row({ ...fine, index: true, sdkIndex: 42 })];
+  }
+  if (kind === 'old-index') {
+    const old = { ...a, ids: 1, index: true, sdkIndex: 42 };
+    const older = { ...peer(-2, time, 1, true), sdkIndex: 41 };
+    return [row(a), row(mine), row(other, old), row(other, older), row(other, old)];
+  }
+  const b = peer(1, time, 1);
+  return [row(a), row(mine), row(b), row({ ...a, ids: 1, index: true, sdkIndex: 10 }), row({ ...b, index: true, sdkIndex: 20 })];
 }

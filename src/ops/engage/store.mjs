@@ -1,6 +1,6 @@
 // 评论私信入库、出事件、抓取任务（sync_jobs）。守护进程（dev-3）和测试调这里；MCP 只经 query.mjs 读。
 // 事件 id 是确定性的，INSERT OR IGNORE，所以重放同一轮、守护进程重启都不会重复出事件。
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { joinId, splitId } from './ids.mjs';
 import { ENGAGE_PLATFORMS } from '../../daemon/schedule.mjs';
 
@@ -120,123 +120,20 @@ function markGone(db, ctx, scannedWorks, seen, unresolved) {
 
 const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生人消息';
 
-// 同一事务记录所有已知身份。原生 messages 主键和对外 event id 继续兼容旧库。
-function douyinReceipts(db, ctx) {
-  const cols = 'rowid, server, client, sdkIndex, signature, disposition, observedAt, eventId';
-  const by = (field) => db.prepare(`SELECT ${cols} FROM douyin_dm_receipts WHERE accountId=? AND conversationId=? AND ${field}=?`);
-  const byServer = by('server'), byClient = by('client'), byIndex = by('sdkIndex');
-  const candidates = db.prepare(`SELECT ${cols} FROM douyin_dm_receipts
-    WHERE accountId=? AND conversationId=? AND (signature=? OR secondKey=?)`);
-  const insert = db.prepare(`INSERT INTO douyin_dm_receipts
-    (accountId, conversationId,server,client,sdkIndex,signature,disposition,secondKey,observedAt) VALUES (?,?,?,?,?,?,?,?,?)`);
-  const update = db.prepare(`UPDATE douyin_dm_receipts SET server=coalesce(server,?), client=coalesce(client,?),
-    sdkIndex=coalesce(sdkIndex,?), disposition=?, secondKey=coalesce(secondKey,?), observedAt=coalesce(observedAt,?) WHERE rowid=?`);
-  const removeAlias = db.prepare('DELETE FROM douyin_dm_receipts WHERE rowid=?');
-  const legacy = db.prepare('SELECT 1 FROM messages WHERE id=? AND accountId=? AND conversationId=? AND by=? AND receiptManaged IS NULL');
-  const legacyAnonymous = db.prepare(`SELECT id, at FROM messages WHERE accountId=? AND conversationId=? AND by='peer'
-    AND at IN (?, ?, ?) AND type IS ? AND text IS ? AND receiptManaged IS NULL`);
-  const setSent = db.prepare("UPDATE douyin_dm_receipts SET disposition='sent', eventId=? WHERE rowid=?");
-  function dispatch(receiptId, id, at, nickname, text) {
-    const eventId = `dm.received:${id}:${at}`;
-    if (emit(db, ctx, { id: eventId, type: 'dm.received', subjectId: id, occurredAt: at,
-      payload: { conversationId: id, nickname, text: snippet(text), at } })) setSent.run(eventId, receiptId);
-  }
-  const afterIndex = (later, earlier) => /^\d+$/.test(later) && /^\d+$/.test(earlier) && BigInt(later) > BigInt(earlier);
-  const anonymous = (r) => !r.server && !r.client && !r.sdkIndex;
-  const hash = (fields) => createHash('sha256').update(JSON.stringify(fields)).digest('hex');
-  return (id, before, anchor, nickname, read) => {
-    const { msg, server, client, sdkIndex, fromDom, sdkSeconds, content, occurredAt } = read;
-    if (msg.by !== 'peer') return;
-    const scope = [ctx.accountId, id];
-    const signature = hash([sdkSeconds, msg.type, content]);
-    const wholeSecond = iso(Math.floor(sdkSeconds) * 1000);
-    const secondKey = hash([wholeSecond, msg.type, content]);
-    const similar = candidates.all(...scope, signature, secondKey).filter((r) =>
-      r.signature === signature || (!(anonymous(read) && anonymous(r)) && (wholeSecond === occurredAt || r.observedAt === wholeSecond)));
-    // 只用 SDK 身份连接有键的行。两种键后来一起出现时，在入库事务内合并先前的候选。
-    const strong = [server && byServer.get(...scope, server), client && byClient.get(...scope, client),
-      sdkIndex && byIndex.get(...scope, sdkIndex)].filter(Boolean);
-    const receipt = strong.find((r) => r.disposition === 'sent') ?? strong.find((r) => r.disposition === 'baseline')
-      ?? strong[0] ?? (anonymous(read) && similar.find((r) => anonymous(r) && r.signature === signature));
-    const aliases = new Map(strong.map((r) => [r.rowid, r]));
-    const evidence = { server, client, sdkIndex };
-    for (const r of aliases.values()) {
-      evidence.server ??= r.server;
-      evidence.client ??= r.client;
-      evidence.sdkIndex ??= r.sdkIndex;
-      if (r.rowid !== receipt.rowid) removeAlias.run(r.rowid);
-    }
-    let state = receipt?.disposition;
-    if (['pending', 'unresolved', 'candidate'].includes(state)) state = null;
-    if (!state) {
-      const oldIds = new Set([server, client]);
-      const old = !receipt && [...oldIds].some((v) => v && v !== '0' && legacy.get(joinId(ctx.code, v), ...scope, msg.by));
-      // main 会把数值型小数秒写成整秒；0 键只在相同会话、方向、类型、正文和时间内可作候选。
-      const oldAnon = !receipt && !similar.some(anonymous) && legacyAnonymous.all(...scope, msg.at, occurredAt, wholeSecond, msg.type, msg.text)
-        .find((r) => r.id === joinId(ctx.code, '0') ||
-          (r.id.startsWith(id + ':') && Number.isFinite(Number(r.id.slice(id.length + 1)))));
-      if (old) state = 'baseline';
-      if (oldAnon) {
-        // 历史匿名行也保留为独立证据，不能把第一次补来的有效 ID 永久认作基线。
-        if (anonymous(read)) state = 'baseline';
-        else {
-          const { lastInsertRowid } = insert.run(...scope, null, null, null, signature, 'baseline', secondKey, occurredAt);
-          similar.push({ rowid: lastInsertRowid, signature, disposition: 'baseline' });
-        }
-      }
-    }
-    if (ctx.firstSync) state = 'baseline';
-    if (!state) {
-      // 单方有键或两侧的 ID 不可比较时，保留独立行，禁止把指纹当作已确认的关联。
-      const others = similar.filter((r) => !aliases.has(r.rowid) && r.rowid !== receipt?.rowid);
-      const compatible = others.filter((r) => !(r.server && server && r.server !== server)
-        && !(r.client && client && r.client !== client) && !(r.sdkIndex && sdkIndex && r.sdkIndex !== sdkIndex));
-      const weakBaseline = compatible.some((r) => r.disposition === 'baseline');
-      // 若旧匿名基线随后出现两个不同的 SDK 序号，较晚的那条已可区分。
-      const later = compatible.some((r) => anonymous(r) && r.disposition === 'baseline') && others.some((r) =>
-        r.signature === signature && afterIndex(evidence.sdkIndex, r.sdkIndex));
-      if (weakBaseline || compatible.some((r) => r.disposition === 'sent')) {
-        const rebound = receipt?.disposition === 'candidate' || (before?.lastAt && before.lastAt < msg.at);
-        state = weakBaseline && rebound && evidence.sdkIndex ? (later ? 'ready' : 'candidate') : 'unresolved';
-      }
-    }
-    if (!state || state === 'ready') {
-      const cutoff = (fromDom && ctx.domCutoff) || ctx.contextCutoff || (before?.lastAt && ctx.accountBaselineAt);
-      // 老库的会话末条只有 main 的显示精度，首次比较沿用它。之后均可使用 SDK 原始精度。
-      const sentAt = before && !anchor ? msg.at : read.occurredAt;
-      const baselineLastAt = anchor ? anchor.lastAt : before?.lastAt;
-      const afterBaselineLast = baselineLastAt && sentAt > baselineLastAt;
-      if (state !== 'ready' && cutoff && sentAt < cutoff && !afterBaselineLast) state = 'baseline';
-      else if (before?.lastAt === sentAt && state !== 'ready') state = 'pending'; // main 的同毫秒行为；撤回后可重判
-      else state = 'dispatch';
-    }
-    const disposition = state === 'dispatch' ? 'sent' : state;
-    let rowid = receipt?.rowid;
-    if (rowid) {
-      if (!receipt.observedAt || disposition !== receipt.disposition || aliases.size > 1 ||
-          (server && !receipt.server) || (client && !receipt.client) || (sdkIndex && !receipt.sdkIndex)) {
-        update.run(evidence.server, evidence.client, evidence.sdkIndex, disposition, secondKey, occurredAt, rowid);
-      }
-    } else rowid = insert.run(...scope, server, client, sdkIndex, signature, disposition, secondKey, occurredAt).lastInsertRowid;
-    if (state === 'dispatch') dispatch(rowid, id, occurredAt, nickname, msg.text);
-    // 即便 B 不再出现在窗口里，A 后补的更早 SDK 序号也能解除 B 的待判。
-    if (evidence.sdkIndex && similar.some((r) => anonymous(r) && r.disposition === 'baseline')) {
-      for (const r of similar) {
-        if (r.disposition === 'candidate' && r.signature === signature && afterIndex(r.sdkIndex, evidence.sdkIndex)) dispatch(r.rowid, id, r.observedAt, nickname, msg.text);
-      }
-    }
-  };
-}
-
 function upsertConversations(db, ctx, snap) {
   const { code } = ctx;
   const prev = db.prepare('SELECT peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend FROM conversations WHERE id = ?');
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
-  const receive = code === 'Douyin' ? douyinReceipts(db, ctx) : null;
-  const baseline = receive && db.prepare('SELECT lastAt FROM douyin_dm_baselines WHERE accountId=? AND conversationId=?');
-  const saveBaseline = receive && db.prepare('INSERT OR IGNORE INTO douyin_dm_baselines VALUES (?, ?, ?)');
+  const messages = new Map(snap.messages.map((m) => [m.conversationNativeId, m]));
+  const baseline = db.prepare('SELECT lastAt, domLastAt, domSdkAt FROM douyin_dm_baselines WHERE accountId=? AND conversationId=?');
+  const saveBaseline = db.prepare(`INSERT INTO douyin_dm_baselines (accountId,conversationId,lastAt,domLastAt,domSdkAt) VALUES (?,?,?,?,?)
+    ON CONFLICT(accountId,conversationId) DO UPDATE SET domLastAt=coalesce(excluded.domLastAt,domLastAt), domSdkAt=coalesce(excluded.domSdkAt,domSdkAt)`);
+  const prior = db.prepare(`SELECT id, at, dmSource, dmServer, dmClient, dmTime FROM messages
+    WHERE conversationId=? AND accountId=? AND by='peer' AND at BETWEEN ? AND ? AND type IS ? AND text IS ?
+    AND (dmSource IS NULL OR dmSource!='seen')`);
+  const sources = new Map();
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
     const last = k.last;
@@ -252,7 +149,7 @@ function upsertConversations(db, ctx, snap) {
     const nextCanSend = bool(k.canSend);
     const keepLast = !last;
     const nextLastBy = keepLast ? (before?.lastBy ?? null) : (last.by ?? null);
-    const nextLastAt = keepLast ? (before?.lastAt ?? null) : (k.observedLastAt ?? last.at ?? null);
+    const nextLastAt = keepLast ? (before?.lastAt ?? null) : (last.at ?? null);
     const nextLastText = keepLast ? (before?.lastText ?? null) : (last.text ?? null);
     const nextLastType = keepLast ? (before?.lastType ?? null) : (last.type ?? null);
     const vals = [ctx.accountId, code, nextUid, nextNick, nextKind, nextUnread,
@@ -270,36 +167,59 @@ function upsertConversations(db, ctx, snap) {
     if (changed) ctx.stats.changedConversations++;
     if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
     else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
-    if (receive && k.observations) {
-      const anchor = baseline.get(ctx.accountId, id);
-      for (const read of k.observations) receive(id, before, anchor, nextNick, read);
-      if (!anchor) {
-        // 升级优先保留原库末条；首次看到两种视图时将它们作为一个快照。
-        const latest = k.observations.reduce((at, r) => r.occurredAt > at ? r.occurredAt : at, '');
-        saveBaseline.run(ctx.accountId, id, before?.lastAt ?? (latest || null));
-      }
-      continue;
+    const msg = messages.get(k.nativeId);
+    const scoped = code === 'Douyin' && k.onScreen != null;
+    const source = k.onScreen ? 'dom' : 'context';
+    const anchor = scoped && baseline.get(ctx.accountId, id);
+    const priorDom = anchor ? anchor.domLastAt : before?.lastAt;
+    const cutoff = (k.onScreen || snap.via === 'dom-fallback' ? ctx.domCutoff : null) ?? ctx.contextCutoff;
+    const advancesKnownThread = scoped && before?.lastAt && last?.at > (anchor?.lastAt ?? before.lastAt);
+    const historical = cutoff && last?.at < cutoff && !advancesKnownThread;
+    if (scoped) {
+      const isBaseline = ctx.firstSync || historical;
+      const baselineAt = before?.lastAt ?? (isBaseline ? last?.at : null) ?? null;
+      const domAt = (k.onScreen && last ? last.at : priorDom) ?? null;
+      saveBaseline.run(ctx.accountId, id, baselineAt, domAt, k.onScreen ? msg?.sdkAt ?? null : null);
+      sources.set(k.nativeId, isBaseline ? source : 'seen');
     }
-    const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !ctx.firstSync;
-    if (last?.by !== 'peer' || !last.at || !isNewer) continue;
-    const domPeer = snap.via === 'dom-fallback' || k.domPeerAt === k.last.at;
-    const cutoff = domPeer ? ctx.domCutoff ?? ctx.contextCutoff : ctx.contextCutoff;
-    if (cutoff && Date.parse(last.at) < Date.parse(cutoff)) continue;
-    emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id, occurredAt: last.at,
-      payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
+    if (ctx.firstSync || historical || last?.by !== 'peer' || !last.at) continue;
+    const previous = scoped && k.onScreen ? priorDom : before?.lastAt;
+    if ((!scoped || k.onScreen) && previous && last.at <= previous) continue;
+    if (scoped && !k.onScreen && anchor?.lastAt && last.at <= anchor.lastAt) continue;
+    const at = msg?.sdkAt ?? last.at;
+    if (scoped && msg) {
+      // 首屏内外切换时，只在另一来源已处理相同可见内容且时间精度相容时沿用其结果。
+      const second = at.slice(0, 19);
+      const priorRows = prior.all(id, ctx.accountId, second + '.000Z', second + '.999Z', msg.type, msg.text);
+      const seen = priorRows.some((m) => {
+        if ((msg.server && m.dmServer === msg.server) || (msg.client && m.dmClient === msg.client)) return true;
+        if (k.onScreen && anchor?.domSdkAt === at && m.dmTime === at) return true;
+        if ((m.dmSource ?? 'dom') === source) return false;
+        if ((msg.server && m.dmServer && msg.server !== m.dmServer) || (msg.client && m.dmClient && msg.client !== m.dmClient)) return false;
+        const observedAt = m.dmTime ?? m.at;
+        return observedAt === at || observedAt.endsWith('.000Z') || at.endsWith('.000Z');
+      });
+      if (seen) continue;
+      sources.set(k.nativeId, source);
+    }
+    emit(db, ctx, { id: `dm.received:${id}:${at}`, type: 'dm.received', subjectId: id, occurredAt: at,
+      payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at } });
   }
-  const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, receiptManaged) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
-  const managed = new Set(snap.conversations.filter((k) => receive && k.observations).map((k) => k.nativeId));
+  const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, dmSource, dmServer, dmClient, dmTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const mark = db.prepare(`UPDATE messages SET dmSource=CASE WHEN dmSource='seen' THEN ? ELSE dmSource END,
+    dmServer=coalesce(dmServer,?), dmClient=coalesce(dmClient,?) WHERE id=? AND accountId=? AND conversationId=?`);
   for (const m of snap.messages) {
-    const r = insMsg.run(joinId(code, m.nativeId), joinId(code, m.conversationNativeId), ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at, managed.has(m.conversationNativeId) ? 1 : null);
+    const id = joinId(code, m.nativeId), convId = joinId(code, m.conversationNativeId);
+    const source = sources.get(m.conversationNativeId) ?? null;
+    const r = insMsg.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at,
+      source, m.server ?? null, m.client ?? null, m.sdkAt ?? null);
     if (r.changes) ctx.stats.inserted++;
+    else if (source) mark.run(source, m.server ?? null, m.client ?? null, id, ctx.accountId, convId);
   }
 }
 
 function emit(db, ctx, e) {
-  const inserted = insertEvent(db, { ...e, platformCode: ctx.code, accountId: ctx.accountId, createdAt: ctx.at });
-  if (inserted) ctx.events.push(e.id);
-  return inserted;
+  if (insertEvent(db, { ...e, platformCode: ctx.code, accountId: ctx.accountId, createdAt: ctx.at })) ctx.events.push(e.id);
 }
 
 /**
@@ -324,7 +244,6 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
   const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats };
   return tx(db, () => {
     const accountBaselineAt = getBaselineAt(db, ctx.accountId, kind);
-    ctx.accountBaselineAt = accountBaselineAt;
     ctx.firstSync = accountBaselineAt == null;
     const douyinDms = kind === 'dms' && ctx.code === 'Douyin';
     const context = douyinDms && snap.via === 'context';
