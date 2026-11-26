@@ -36,7 +36,7 @@ export async function runInSpace(task, params) {
   // G-B5b/G-B7：user/info 读不到或非 0（又不是掉线）时不往下采；uid 交给 collect 核对账号
   if (info?.status_code !== 0) return { failed: 'auth-failed', error: `GET /web/api/media/user/info/ ${info ? `status_code=${info.status_code}` : '请求失败或不是 JSON'}` };
   const uidSeen = str(info.user?.uid ?? info.user_info?.uid);
-  return params.kind === 'dms' ? { kind: 'dms', uidSeen, ...(await rawDms(page, o)) } : { kind: 'comments', uidSeen, ...(await rawComments(page, o)) };
+  return params.kind === 'dms' ? { kind: 'dms', uidSeen, collectionStartedAt: new Date(params.now ?? Date.now()).toISOString(), ...(await rawDms(page, o)) } : { kind: 'comments', uidSeen, ...(await rawComments(page, o)) };
 }
 
 const slimUser = (u) => (u ? { uid: str(u.uid), nickname: u.nickname ?? '' } : null);
@@ -242,35 +242,13 @@ export function readDmPage(via = 'context') {
   const fiberOf = (el) => { const k = Object.keys(el).find((x) => x.startsWith('__reactFiber')); return k ? el[k] : null; };
   const isSvc = (v) => !!v && typeof v === 'object' && !!v.bytedIM && Array.isArray(v.conversationList);
   const domItems = [...document.querySelectorAll('li.semi-list-item')];
-  const tsOf = (v) => {
-    if (v == null || v === '') return null;
-    let ms;
-    if (typeof v === 'number') ms = v;
-    else if (typeof v?.getTime === 'function') ms = v.getTime();
-    else {
-      const s = String(v).trim();
-      if (!s) return null;
-      ms = /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : Date.parse(s);
-    }
-    if (!Number.isFinite(ms) || ms <= 0) return null;
-    return String(Math.trunc(ms < 1e12 ? ms * 1000 : ms));
-  };
-  const messageOf = (lm) => {
-    if (!lm) return null;
-    let content = lm.content ?? null;
-    if (content != null && typeof content !== 'string') {
-      try { content = JSON.stringify(content); } catch { content = null; }
-    }
-    return {
-      serverId: lm.serverId != null ? String(lm.serverId) : null,
-      clientMessageId: lm.clientMessageId != null ? String(lm.clientMessageId) : null,
-      clientId: lm.clientId != null ? String(lm.clientId) : null,
-      // 逐字沿用 main 的 SDK 时间序列化；排序与展示仍使用 createdAt。
-      keyTimestamp: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null,
-      rawTimestamp: lm.createdAt == null ? null : String(lm.createdAt?.getTime?.() ?? lm.createdAt),
-      createdAt: tsOf(lm.createdAt), type: lm.type, isFromMe: !!lm.isFromMe, content,
-    };
-  };
+  // Context 与 DOM 共用原 DOM 的 SDK 序列化；原生键、ISO 时间和事件 ID 需兼容已有数据。
+  const messageOf = (lm) => lm ? {
+    serverId: lm.serverId != null ? String(lm.serverId) : null, clientMessageId: lm.clientMessageId ?? null,
+    type: lm.type, isFromMe: !!lm.isFromMe,
+    createdAt: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null,
+    content: lm.content ?? null,
+  } : null;
   if (via === 'dom') {
     return domItems.map((li) => {
       let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
@@ -324,10 +302,13 @@ export function readDmPage(via = 'context') {
   }
 
   const domNames = new Map();
+  const domPeerTimes = new Map();
   for (const li of domItems) {
     let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
     const it = f?.memoizedProps?.item;
     if (!it || it.id == null) continue;
+    const lm = messageOf(it.lastMessage);
+    if (lm && !lm.isFromMe) domPeerTimes.set(String(it.id), lm.createdAt);
     const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
     const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
     if (rawName && rawName !== '陌生人消息') domNames.set(String(it.id), rawName);
@@ -360,17 +341,22 @@ export function readDmPage(via = 'context') {
       isGroupChat: !!(it.isGroupChat === true || it.type === 2),
       unreadCount: Number(it.unreadCount) || 0,
       name: pickName(it, id, uid),
+      domPeerTime: domPeerTimes.get(id),
       lastMessage: messageOf(it.lastMessage),
     };
   };
 
+  const millis = (m) => {
+    const t = Number(m?.createdAt) || 0;
+    return t < 1e12 ? t * 1000 : t;
+  };
   const byId = new Map();
   const put = (item) => {
     if (!item) return;
     const prev = byId.get(item.id);
     if (!prev) { byId.set(item.id, item); return; }
-    const prevTs = Number(prev.lastMessage?.createdAt ?? 0);
-    const nextTs = Number(item.lastMessage?.createdAt ?? 0);
+    const prevTs = millis(prev.lastMessage);
+    const nextTs = millis(item.lastMessage);
     const winner = nextTs > prevTs ? item : prev;
     const other = winner === item ? prev : item;
     byId.set(item.id, {
@@ -404,6 +390,9 @@ export function readDmPage(via = 'context') {
   for (const item of shapedNormal) put(item);
   for (const item of shapedStrangers) put(item);
   const conversations = [...byId.values()];
+  if (conversations.some(({ lastMessage: m }) => m?.createdAt && (m.serverId ?? m.clientMessageId) === '')) {
+    return { ok: false, code: 'empty-message-id', domRows: domItems.length };
+  }
   const strangerCount = conversations.filter((c) => c.isStrangerChat).length;
   return { ok: true, conversations, strangerCount, hasStrangerList: true, emptyConfirmed: false, domRows: domItems.length };
 }
@@ -423,7 +412,7 @@ export async function rawDms(page, o = {}) {
     let waited = false;
     let missingWithDomSince = null;
     const deadline = Date.now() + waitMs;
-    const fallbackCodes = ['service-missing', 'empty-with-dom', 'no-valid-items', 'partial-invalid-items', 'stranger-list-missing'];
+    const fallbackCodes = ['service-missing', 'empty-with-dom', 'no-valid-items', 'partial-invalid-items', 'stranger-list-missing', 'empty-message-id'];
     for (;;) {
       r = await page.evaluate(readDmPage).catch(() => ({ ok: false, code: 'eval-error' }));
       if (r?.ok) {
@@ -560,12 +549,6 @@ function textOf(m) {
   if (Number(m.type) !== 7) return null;
   try { return clip(JSON.parse(m.content ?? 'null')?.text ?? null); } catch { return null; }
 }
-function validMsgId(v) {
-  if (v == null) return null;
-  const s = String(v);
-  return !s.trim() || s.trim() === '0' ? null : s;
-}
-
 export function parseDms(raw, { accountUid, fetchedAt }) {
   if (!Array.isArray(raw.conversations)) adapterFail('no-data', '抖音私信会话列表读不到');
   if (!raw.conversations.length && !raw.emptyState) adapterFail('no-data', `抖音私信 0 个会话，但页面没显示空状态${raw.diag ? `：${JSON.stringify(raw.diag)}` : ''}`);
@@ -578,22 +561,11 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     const rawName = typeof c.name === 'string' ? c.name.trim() : '';
     const nickname = rawName && rawName !== '陌生人消息' ? rawName : null;
     conversations.push({ nativeId: id, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
-      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}) });
-    if (last) {
-      const serverId = validMsgId(lm.serverId);
-      const clientId = validMsgId(lm.clientMessageId) ?? validMsgId(lm.clientId);
-      const mainTimestamp = lm.keyTimestamp ?? lm.createdAt;
-      const fallback = `${id}:${mainTimestamp}`;
-      const nativeId = serverId ?? clientId ?? fallback;
-      const mainId = String(lm.serverId ?? lm.clientMessageId ?? fallback);
-      messages.push({ nativeId, conversationNativeId: id, by: last.by, at, type: last.type, text: last.text,
-        ...(serverId ? { serverId } : {}),
-        ...(clientId ? { clientId } : {}),
-        ...(!serverId && !clientId ? { usesTimestampKey: true } : {}),
-        legacy: { nativeId: mainId, timestampId: fallback, rawTimestamp: lm.rawTimestamp ?? String(lm.createdAt), at: isoOf(mainTimestamp) } });
-    }
+      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}), ...(c.domPeerTime ? { domPeerAt: isoOf(c.domPeerTime) } : {}) });
+    if (last) messages.push({ nativeId: String(lm.serverId ?? lm.clientMessageId ?? `${id}:${lm.createdAt}`), conversationNativeId: id, by: last.by, at, type: last.type, text: last.text });
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
+  if (raw.collectionStartedAt) out.collectionStartedAt = raw.collectionStartedAt;
   if (raw.via === 'context' || raw.via === 'dom' || raw.via === 'dom-fallback') out.via = raw.via;
   if (typeof raw.strangerCount === 'number') out.strangerCount = raw.strangerCount;
   if (typeof raw.hasStrangerList === 'boolean') out.hasStrangerList = raw.hasStrangerList;

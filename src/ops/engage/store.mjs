@@ -120,100 +120,12 @@ function markGone(db, ctx, scannedWorks, seen, unresolved) {
 
 const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生人消息';
 
-// 抖音每个会话只带最后一条消息。把实际插入结果交给事件派发，重读和撤回也可以更新会话展示。
-function insertMessages(db, ctx, messages) {
-  const insert = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, douyinServerId, douyinRawTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-  const confirmServer = db.prepare('UPDATE messages SET douyinServerId = ? WHERE id = ? AND conversationId = ? AND douyinServerId IS NULL');
-  const remember = db.prepare('INSERT OR IGNORE INTO douyin_dm_client_ids (conversationId, clientId, serverId) VALUES (?, ?, ?)');
-  const lookup = db.prepare('SELECT serverId FROM douyin_dm_client_ids WHERE conversationId = ? AND clientId = ?');
-  const promoteClient = db.prepare('UPDATE OR IGNORE messages SET id = ? WHERE conversationId = ? AND id = ?');
-  // 先后只见 serverId、clientId 会留下待判行；SDK 同时给出两个 ID 时可确认它们是一条。
-  const mergeClient = db.prepare(`UPDATE messages AS srv SET douyinDispatch =
-    CASE WHEN cli.douyinDispatch LIKE 'dm.received:%' OR srv.douyinDispatch = 'pending'
-      THEN cli.douyinDispatch ELSE srv.douyinDispatch END
-    FROM messages AS cli WHERE srv.id = ? AND cli.id = ? AND srv.conversationId = ?
-      AND cli.conversationId = srv.conversationId AND (srv.douyinDispatch = 'pending' OR cli.douyinDispatch = 'pending')`);
-  const removeClient = db.prepare('DELETE FROM messages WHERE id = ? AND conversationId = ?');
-  const moveAliases = db.prepare('UPDATE douyin_dm_client_ids SET serverId = ? WHERE conversationId = ? AND serverId = ?');
-  // main 的占位行没有保存原 clientId。只在本会话、方向及旧时间相符时接续；
-  // 当前输入已换键时，再核对旧行的类型和正文，避免认领同时间的另一条消息。
-  // 无原始时间的旧时间键只能用键中保留下来的值作证，不能用取整后的 at 认领。
-  const promoteLegacy = db.prepare(`UPDATE OR IGNORE messages SET id = :id, at = :at, douyinRawTimestamp = :rawTimestamp
-    WHERE id = (SELECT id FROM messages
-      WHERE conversationId = :convId AND by = :by AND id IN (:mainId, :timestampId, 'Douyin:0', 'Douyin:')
-        AND CASE WHEN douyinRawTimestamp IS NOT NULL THEN douyinRawTimestamp = :rawTimestamp
-                 WHEN id = :timestampId THEN id = :convId || ':' || :rawTimestamp
-                 ELSE at = :mainAt END
-        AND (id = :mainId OR (type IS :type AND text IS :text))
-      ORDER BY (id = :mainId) DESC, (id = :timestampId) DESC, id LIMIT 1)
-      AND id <> :id`);
-  const douyinPeers = new Map();
-  for (const m of messages) {
-    const convId = joinId(ctx.code, m.conversationNativeId);
-    let id = joinId(ctx.code, m.nativeId);
-    if (ctx.code === 'Douyin') {
-      if (m.clientId && m.clientId !== m.nativeId) {
-        const clientKey = joinId(ctx.code, m.clientId);
-        remember.run(convId, m.clientId, id);
-        if (promoteClient.run(id, convId, clientKey).changes) {
-          moveAliases.run(id, convId, clientKey);
-        } else if (mergeClient.run(id, clientKey, convId).changes) {
-          removeClient.run(clientKey, convId);
-          moveAliases.run(id, convId, clientKey);
-        }
-      } else if (m.clientId || m.usesTimestampKey) {
-        id = lookup.get(convId, m.nativeId)?.serverId ?? id;
-      }
-      if (m.legacy?.at) {
-        const timestampId = joinId(ctx.code, m.legacy.timestampId);
-        const promoted = promoteLegacy.run({ id, convId, timestampId, mainId: joinId(ctx.code, m.legacy.nativeId),
-          mainAt: m.legacy.at, rawTimestamp: m.legacy.rawTimestamp, at: m.at, by: m.by, type: m.type, text: m.text });
-        if (promoted.changes && timestampId !== id) remember.run(convId, m.legacy.timestampId, id);
-      }
-    }
-    const serverId = ctx.code === 'Douyin' ? m.serverId ?? null : null;
-    const inserted = insert.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at, serverId, m.legacy?.rawTimestamp ?? null).changes > 0;
-    if (!inserted && serverId) confirmServer.run(serverId, id, convId);
-    if (inserted) ctx.stats.inserted++;
-    if (ctx.code === 'Douyin' && m.by === 'peer') {
-      douyinPeers.set(m.conversationNativeId, { at: m.at, id, inserted });
-    }
-  }
-  return douyinPeers;
-}
-
-function emitDm(db, ctx, conversationId, at, text, nickname, messageId) {
-  let id = `dm.received:${conversationId}:${at}`;
-  if (messageId && db.prepare('SELECT 1 FROM events WHERE id = ?').get(id)) id += `:${splitId(messageId).nativeId}`;
-  emit(db, ctx, { id, type: 'dm.received', subjectId: conversationId, occurredAt: at,
-    payload: { conversationId, nickname, text: snippet(text), at } });
-  if (messageId) db.prepare('UPDATE messages SET douyinDispatch = ? WHERE id = ?').run(id, messageId);
-}
-
-// 即使已经不是会话末条，也会随该账号下一轮私信同步重查。基线行没有 pending 标记。
-function retryPendingDms(db, ctx) {
-  const pending = db.prepare(`SELECT m.id, m.conversationId, m.at, m.text, m.douyinServerId, c.peerNickname
-    FROM messages m JOIN conversations c ON c.id = m.conversationId
-    WHERE m.accountId = ? AND m.douyinDispatch = 'pending' ORDER BY m.at, m.id`).all(ctx.accountId);
-  const prior = db.prepare(`SELECT count(*) AS total, count(CASE WHEN douyinServerId <> ? THEN 1 END) AS distinctServers
-    FROM messages WHERE conversationId = ? AND at = ? AND by = 'peer' AND douyinDispatch IS NOT 'pending'`);
-  for (const m of pending) {
-    const peers = prior.get(m.douyinServerId, m.conversationId, m.at);
-    if (peers.total && peers.total === peers.distinctServers) {
-      emitDm(db, ctx, m.conversationId, m.at, m.text, m.peerNickname, m.id);
-    }
-  }
-}
-
 function upsertConversations(db, ctx, snap) {
   const { code } = ctx;
   const prev = db.prepare('SELECT peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend FROM conversations WHERE id = ?');
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
-  const defer = db.prepare("UPDATE messages SET douyinDispatch = 'pending' WHERE id = ? AND douyinDispatch IS NULL");
-  const hasPeerAt = db.prepare("SELECT 1 FROM messages WHERE conversationId = ? AND at = ? AND by = 'peer' AND id <> ? LIMIT 1");
-  const peerMessages = insertMessages(db, ctx, snap.messages);
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
     const last = k.last ?? null;
@@ -227,13 +139,7 @@ function upsertConversations(db, ctx, snap) {
     const nextKind = k.peer?.kind ?? before?.peerKind ?? null;
     const nextUnread = k.unread ?? 0;
     const nextCanSend = bool(k.canSend);
-    const beforeLastMs = before?.lastAt ? Date.parse(before.lastAt) : NaN;
-    const incomingLastMs = last?.at ? Date.parse(last.at) : NaN;
-    const staleFallback = ctx.isDomFallback
-      && Number.isFinite(beforeLastMs)
-      && Number.isFinite(incomingLastMs)
-      && incomingLastMs < beforeLastMs;
-    const keepLast = !last?.at || staleFallback;
+    const keepLast = !last;
     const nextLastBy = keepLast ? (before?.lastBy ?? null) : (last.by ?? null);
     const nextLastAt = keepLast ? (before?.lastAt ?? null) : (last.at ?? null);
     const nextLastText = keepLast ? (before?.lastText ?? null) : (last.text ?? null);
@@ -253,21 +159,19 @@ function upsertConversations(db, ctx, snap) {
     if (changed) ctx.stats.changedConversations++;
     if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
     else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
-    if (last?.by !== 'peer' || !last.at || ctx.firstSync) continue;
-    const peerMessage = peerMessages.get(k.nativeId);
-    if (peerMessage && !peerMessage.inserted) continue;
-    const baselineAt = (k.isStranger ? ctx.strangerBaselineAt : null) ?? ctx.contextBaselineAt ?? ctx.firstContextCutoff;
-    if (incomingLastMs < Date.parse(baselineAt)) continue;
-    if (incomingLastMs <= beforeLastMs) {
-      if (peerMessage?.at !== last.at || incomingLastMs < Date.parse(ctx.dmBaselineAt)) continue;
-      if ((incomingLastMs === beforeLastMs && before.lastBy === 'peer') || hasPeerAt.get(id, last.at, peerMessage.id)) {
-        defer.run(peerMessage.id);
-        continue;
-      }
-    }
-    emitDm(db, ctx, id, last.at, last.text, nextNick, peerMessage?.id);
+    const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !ctx.firstSync;
+    if (last?.by !== 'peer' || !last.at || !isNewer) continue;
+    const domPeer = !k.isStranger && (snap.via === 'dom-fallback' || k.domPeerAt === last.at);
+    const cutoff = domPeer ? ctx.domCutoff ?? ctx.contextCutoff : ctx.contextCutoff;
+    if (cutoff && Date.parse(last.at) < Date.parse(cutoff)) continue;
+    emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id, occurredAt: last.at,
+      payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
   }
-  if (code === 'Douyin') retryPendingDms(db, ctx);
+  const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  for (const m of snap.messages) {
+    const r = insMsg.run(joinId(code, m.nativeId), joinId(code, m.conversationNativeId), ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at);
+    if (r.changes) ctx.stats.inserted++;
+  }
 }
 
 function emit(db, ctx, e) {
@@ -297,30 +201,34 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
   return tx(db, () => {
     const accountBaselineAt = getBaselineAt(db, ctx.accountId, kind);
     ctx.firstSync = accountBaselineAt == null;
-    if (kind === 'dms') ctx.dmBaselineAt = accountBaselineAt;
-    ctx.isContext = kind === 'dms' && snap.via === 'context';
-    ctx.isDomFallback = kind === 'dms' && snap.via === 'dom-fallback';
-    ctx.useContextBaseline = ctx.isContext || ctx.isDomFallback;
-    if (ctx.useContextBaseline) {
-      ctx.contextBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:context');
-      ctx.strangerBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:stranger');
-      ctx.firstContextSync = ctx.isContext && ctx.contextBaselineAt == null;
-      ctx.firstStrangerSync = ctx.isContext && ctx.strangerBaselineAt == null;
-      if (ctx.firstContextSync || ctx.firstStrangerSync) {
+    const douyinDms = kind === 'dms' && ctx.code === 'Douyin';
+    const context = douyinDms && snap.via === 'context';
+    const captureAt = snap.collectionStartedAt ?? snap.fetchedAt ?? ctx.at;
+    if (context || (douyinDms && snap.via === 'dom-fallback')) {
+      ctx.contextCutoff = getBaselineAt(db, ctx.accountId, 'dms:context');
+      ctx.domCutoff = getBaselineAt(db, ctx.accountId, 'dms:legacy-dom');
+      if (context && ctx.contextCutoff == null) {
         const job = db.prepare(`SELECT startedAt FROM sync_jobs
           WHERE platformCode = ? AND accountId = ? AND kind = 'dms' AND status = 'ok'
           ORDER BY finishedAt DESC, rowid DESC LIMIT 1`).get(ctx.code, ctx.accountId);
-        ctx.firstContextCutoff = job?.startedAt ?? accountBaselineAt ?? ctx.at;
+        const previousCapture = job?.startedAt ?? getBaselineAt(db, ctx.accountId, 'dms:capture');
+        ctx.contextCutoff = previousCapture ?? accountBaselineAt ?? captureAt;
+        if (accountBaselineAt && !previousCapture) {
+          // main 旧库只记入库时间。上次已读到的最新消息是采集时刻的下界；
+          // 普通首屏沿用 main 处理两者之间的消息，Context 扩展出的历史列表仍用入库水位。
+          const { latest } = db.prepare(`SELECT max(at) AS latest FROM messages
+            WHERE accountId = ? AND firstSeenAt <= ? AND at <= ?`).get(ctx.accountId, accountBaselineAt, accountBaselineAt);
+          ctx.domCutoff = latest ?? iso(0);
+          setBaseline(db, ctx.accountId, 'dms:legacy-dom', ctx.domCutoff);
+        }
       }
     }
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);
     else upsertConversations(db, ctx, snap);
     setBaseline(db, ctx.accountId, kind, ctx.at);
-    if (ctx.isContext) {
-      setBaseline(db, ctx.accountId, 'dms:context', ctx.firstContextCutoff ?? ctx.at);
-      if (snap.hasStrangerList !== false) setBaseline(db, ctx.accountId, 'dms:stranger', ctx.firstContextCutoff ?? ctx.at);
-    }
+    if (douyinDms && ctx.firstSync) setBaseline(db, ctx.accountId, 'dms:capture', captureAt);
+    if (context) setBaseline(db, ctx.accountId, 'dms:context', ctx.contextCutoff);
     return { ...ctx.stats, events: ctx.events };
   });
 }

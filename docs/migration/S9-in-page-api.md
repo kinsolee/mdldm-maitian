@@ -21,9 +21,11 @@
 
 | 能力位 | 打开后 |
 |---|---|
-| `readViaApi` | 抖音、视频号的评论采集改成调页面服务（不再点作品、不点展开）；抖音私信采集改为读聊天区 React Context（`conversationList` + `strangerConversationList`，首次 Context 同步只建基线不推旧私信，Context 不可用或结构异常时自动回落 DOM）；视频号私信不变 |
+| `readViaApi` | 抖音、视频号的评论采集改成调页面服务（不再点作品、不点展开）；抖音私信采集改为读聊天区 React Context（`conversationList` + `strangerConversationList`，首次 Context 同步按采集水位过滤旧私信，Context 不可用或结构异常时自动回落 DOM）；视频号私信不变 |
 | `writeViaApi` | 抖音、视频号的 `reply_comment` 改成调页面服务。`send_dm` 不受它影响 |
 | `writeDmViaApi` | 抖音的 `send_dm` 改成调私信页自己的发送函数。`reply_comment` 不受它影响 |
+
+抖音私信的 DOM 和 Context 共用原 DOM 的消息键和发送时间。发件箱按会话和发送时间去重。同毫秒的多条私信沿用原行为，最多产生一个事件。首次开启 Context 时，优先取同账号上次成功私信任务的开始时间。没有任务记录时使用已保存的采集时间。旧库若只留有入库时间，陌生人及首屏外消息按该时间建基线。普通首屏可见的消息在上次已观察到的最新发送时间与入库时间之间仍按 DOM 规则处理。
 
 ```sh
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 readViaApi true

@@ -43,11 +43,6 @@ CREATE TABLE IF NOT EXISTS messages (
   by TEXT NOT NULL, at TEXT, type TEXT, text TEXT, firstSeenAt TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_conv ON messages (conversationId, at);
--- SDK 补上 serverId 后，仍能用旧快照里的 clientMessageId 找回同一行。
-CREATE TABLE IF NOT EXISTS douyin_dm_client_ids (
-  conversationId TEXT NOT NULL, clientId TEXT NOT NULL, serverId TEXT NOT NULL,
-  PRIMARY KEY (conversationId, clientId)
-);
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY, type TEXT NOT NULL, platformCode TEXT NOT NULL, accountId TEXT, subjectId TEXT,
   createdAt TEXT NOT NULL, payload TEXT NOT NULL,
@@ -102,13 +97,6 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt)
   addColumnIfMissing(db, 'events', 'filteredReason', 'TEXT');
   // 对方发出时间（ISO，UTC）：评论取 comments.createdAt，私信取 last.at；旧行与系统事件为 NULL。createdAt 保持入库时间不变
   addColumnIfMissing(db, 'events', 'occurredAt', 'TEXT');
-  // 只有 SDK 明确给出的 serverId 才能区分同时间的两条对方私信；旧行保留 NULL。
-  addColumnIfMissing(db, 'messages', 'douyinServerId', 'TEXT');
-  // 时间兜底键可能截去小数；只有同一个 SDK 原始时间才能将该行升级为真实 ID。
-  addColumnIfMissing(db, 'messages', 'douyinRawTimestamp', 'TEXT');
-  // NULL 留给基线和升级前的行。新私信存 pending 或已写入发件箱的事件 id。
-  addColumnIfMissing(db, 'messages', 'douyinDispatch', 'TEXT');
-  db.exec("CREATE INDEX IF NOT EXISTS messages_douyin_pending ON messages (accountId, at) WHERE douyinDispatch = 'pending'");
   // 自动关分两组：write（回复、私信）、moderate（删评论、拉黑、删会话）。旧记录 NULL 当 write
   addColumnIfMissing(db, 'engage_write_trips', 'family', 'TEXT');
 }
