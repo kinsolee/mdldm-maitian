@@ -127,22 +127,34 @@ function insertMessages(db, ctx, messages) {
   const remember = db.prepare('INSERT OR IGNORE INTO douyin_dm_client_ids (conversationId, clientId, serverId) VALUES (?, ?, ?)');
   const lookup = db.prepare('SELECT serverId FROM douyin_dm_client_ids WHERE conversationId = ? AND clientId = ?');
   const promoteClient = db.prepare('UPDATE OR IGNORE messages SET id = ? WHERE conversationId = ? AND id = ?');
-  const promotePlaceholder = db.prepare('UPDATE OR IGNORE messages SET id = ? WHERE conversationId = ? AND id = ? AND at = ? AND by = ?');
+  const moveAliases = db.prepare('UPDATE douyin_dm_client_ids SET serverId = ? WHERE conversationId = ? AND serverId = ?');
+  // main 的占位行没有保存原 clientId。只在本会话、方向及旧时间相符时接续；
+  // 当前输入已换键时，再核对旧行的类型和正文，避免认领同时间的另一条消息。
+  const promoteLegacy = db.prepare(`UPDATE OR IGNORE messages SET id = :id, at = :at
+    WHERE id = (SELECT id FROM messages
+      WHERE conversationId = :convId AND by = :by AND id IN (:mainId, :timestampId, 'Douyin:0', 'Douyin:')
+        AND (at = :mainAt OR (id = :timestampId AND at = :at))
+        AND (id = :mainId OR (type IS :type AND text IS :text))
+      ORDER BY (id = :mainId) DESC, (id = :timestampId) DESC, id LIMIT 1)
+      AND id <> :id`);
   const douyinPeers = new Map();
   for (const m of messages) {
     const convId = joinId(ctx.code, m.conversationNativeId);
     let id = joinId(ctx.code, m.nativeId);
-    if (ctx.code === 'Douyin' && m.clientId) {
-      if (m.clientId === m.nativeId) {
-        id = lookup.get(convId, m.clientId)?.serverId ?? id;
-      } else {
+    if (ctx.code === 'Douyin') {
+      if (m.clientId && m.clientId !== m.nativeId) {
+        const clientKey = joinId(ctx.code, m.clientId);
         remember.run(convId, m.clientId, id);
-        promoteClient.run(id, convId, joinId(ctx.code, m.clientId));
+        if (promoteClient.run(id, convId, clientKey).changes) moveAliases.run(id, convId, clientKey);
+      } else if (m.clientId || m.usesTimestampKey) {
+        id = lookup.get(convId, m.nativeId)?.serverId ?? id;
       }
-    }
-    if (ctx.code === 'Douyin' && m.legacyPlaceholderId != null) {
-      // main 可能已把空串或 "0" 存成主键，只升级本会话、同时间和方向的那一行。
-      promotePlaceholder.run(id, convId, joinId(ctx.code, m.legacyPlaceholderId), m.at, m.by);
+      if (m.legacy?.at) {
+        const timestampId = joinId(ctx.code, m.legacy.timestampId);
+        const promoted = promoteLegacy.run({ id, convId, timestampId, mainId: joinId(ctx.code, m.legacy.nativeId),
+          mainAt: m.legacy.at, at: m.at, by: m.by, type: m.type, text: m.text });
+        if (promoted.changes && timestampId !== id) remember.run(convId, m.legacy.timestampId, id);
+      }
     }
     const inserted = insert.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at).changes > 0;
     if (inserted) ctx.stats.inserted++;

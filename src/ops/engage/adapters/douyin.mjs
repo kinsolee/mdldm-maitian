@@ -581,13 +581,14 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     if (last) {
       const serverId = validMsgId(lm.serverId);
       const clientId = validMsgId(lm.clientMessageId) ?? validMsgId(lm.clientId);
-      const fallback = `${id}:${lm.keyTimestamp ?? lm.createdAt}`;
+      const mainTimestamp = lm.keyTimestamp ?? lm.createdAt;
+      const fallback = `${id}:${mainTimestamp}`;
       const nativeId = serverId ?? clientId ?? fallback;
-      const oldId = lm.serverId ?? lm.clientMessageId;
+      const mainId = String(lm.serverId ?? lm.clientMessageId ?? fallback);
       messages.push({ nativeId, conversationNativeId: id, by: last.by, at, type: last.type, text: last.text,
         ...(clientId ? { clientId } : {}),
         ...(!serverId && !clientId ? { usesTimestampKey: true } : {}),
-        ...(oldId != null && !validMsgId(oldId) ? { legacyPlaceholderId: String(oldId) } : {}) });
+        legacy: { nativeId: mainId, timestampId: fallback, at: isoOf(mainTimestamp) } });
     }
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
