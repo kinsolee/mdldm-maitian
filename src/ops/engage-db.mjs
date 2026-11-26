@@ -86,6 +86,8 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt)
   if (!db.prepare('PRAGMA table_info(actions)').all().some((c) => c.name === 'targetLastAt')) db.exec('ALTER TABLE actions ADD COLUMN targetLastAt TEXT');
   // 推送前过滤（filter.mjs）命中的规则名；没命中为 NULL
   if (!db.prepare('PRAGMA table_info(events)').all().some((c) => c.name === 'filteredReason')) db.exec('ALTER TABLE events ADD COLUMN filteredReason TEXT');
+  // 对方发出时间（ISO，UTC）：评论取 comments.createdAt，私信取 last.at；旧行与系统事件为 NULL。createdAt 保持入库时间不变
+  if (!db.prepare('PRAGMA table_info(events)').all().some((c) => c.name === 'occurredAt')) db.exec('ALTER TABLE events ADD COLUMN occurredAt TEXT');
   // 自动关分两组：write（回复、私信）、moderate（删评论、拉黑、删会话）。旧记录 NULL 当 write
   if (!db.prepare('PRAGMA table_info(engage_write_trips)').all().some((c) => c.name === 'family')) db.exec('ALTER TABLE engage_write_trips ADD COLUMN family TEXT');
 }

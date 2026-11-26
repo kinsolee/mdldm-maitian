@@ -22,9 +22,9 @@ function tx(db, fn) {
 }
 
 /** 写一条事件；已存在（同 id）就什么都不做。返回是否新写了。 */
-export function insertEvent(db, { id, type, platformCode, accountId, subjectId, createdAt, payload }) {
-  const r = db.prepare('INSERT OR IGNORE INTO events (id, type, platformCode, accountId, subjectId, createdAt, payload) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(id, type, platformCode, accountId ?? null, subjectId ?? null, createdAt, JSON.stringify(payload ?? {}));
+export function insertEvent(db, { id, type, platformCode, accountId, subjectId, createdAt, occurredAt = null, payload }) {
+  const r = db.prepare('INSERT OR IGNORE INTO events (id, type, platformCode, accountId, subjectId, createdAt, occurredAt, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(id, type, platformCode, accountId ?? null, subjectId ?? null, createdAt, occurredAt ?? null, JSON.stringify(payload ?? {}));
   return r.changes > 0;
 }
 
@@ -97,7 +97,7 @@ function upsertComments(db, ctx, snap) {
     ctx.stats.inserted++;
     if (ctx.firstSync || c.author?.isMe) continue;
     const w = workOf.get(workId) ?? {};   // upsertWorks 已先跑：库里是合并后的值（快照里 title 为 null 不会盖掉旧的）
-    emit(db, ctx, { id: `comment.created:${id}`, type: 'comment.created', subjectId: id,
+    emit(db, ctx, { id: `comment.created:${id}`, type: 'comment.created', subjectId: id, occurredAt: c.createdAt ?? null,
       payload: { workId, workTitle: w.title ?? null, workUrl: w.url ?? null, commentId: id, rootId: p.rootId, parentId: p.parentId, nickname: c.author?.nickname ?? null, text: snippet(c.text) } });
   }
   markGone(db, ctx, snap.scannedWorks, seen, unresolved);
@@ -120,24 +120,47 @@ function markGone(db, ctx, scannedWorks, seen, unresolved) {
 
 function upsertConversations(db, ctx, snap) {
   const { code } = ctx;
-  const prev = db.prepare('SELECT lastAt FROM conversations WHERE id = ?');
+  const prev = db.prepare('SELECT peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend FROM conversations WHERE id = ?');
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
-  // last 为 null 是「这一轮没读到」（例如小红书没打开的会话），不是「没有最后一句」：库里已有的不动
-  const updKeepLast = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, canSend = ?, updatedAt = ? WHERE id = ?');
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
     const last = k.last ?? null;
-    const vals = [ctx.accountId, code, k.peer?.uid ?? null, k.peer?.nickname ?? null, k.peer?.kind ?? null, k.unread ?? 0,
-      last?.by ?? null, last?.at ?? null, last?.text ?? null, last?.type ?? null, bool(k.canSend)];
     const before = prev.get(id);
-    if (before && !last) { updKeepLast.run(...vals.slice(0, 6), vals[10], ctx.at, id); ctx.stats.updated++; }
-    else if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; } else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
-    const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !ctx.firstSync;
+    // last 为 null 是「这一轮没读到」（例如小红书没打开的会话），不是「没有最后一句」：库里已有的不动
+    // peerUid / peerNickname 读不到（例如首屏外 Context 会话没有 DOM 昵称）时保留库里已有值
+    const nextUid = k.peer?.uid ?? before?.peerUid ?? null;
+    const nextNick = k.peer?.nickname ?? before?.peerNickname ?? null;
+    const nextKind = k.peer?.kind ?? before?.peerKind ?? null;
+    const nextUnread = k.unread ?? 0;
+    const nextCanSend = bool(k.canSend);
+    const nextLastBy = last ? (last.by ?? null) : (before?.lastBy ?? null);
+    const nextLastAt = last ? (last.at ?? null) : (before?.lastAt ?? null);
+    const nextLastText = last ? (last.text ?? null) : (before?.lastText ?? null);
+    const nextLastType = last ? (last.type ?? null) : (before?.lastType ?? null);
+    const vals = [ctx.accountId, code, nextUid, nextNick, nextKind, nextUnread,
+      nextLastBy, nextLastAt, nextLastText, nextLastType, nextCanSend];
+    const changed = !before
+      || nextUid !== before.peerUid
+      || nextNick !== before.peerNickname
+      || nextKind !== before.peerKind
+      || nextUnread !== before.unread
+      || nextCanSend !== before.canSend
+      || nextLastBy !== before.lastBy
+      || nextLastAt !== before.lastAt
+      || nextLastText !== before.lastText
+      || nextLastType !== before.lastType;
+    if (changed) ctx.stats.changedConversations++;
+    if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
+    else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
+    const baselineOnly = ctx.firstSync
+      || (ctx.firstContextSync && !before)
+      || (ctx.firstStrangerSync && k.isStranger === true && !before);
+    const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !baselineOnly;
     if (last?.by !== 'peer' || !last.at || !isNewer) continue;
-    emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id,
-      payload: { conversationId: id, nickname: k.peer?.nickname ?? null, text: snippet(last.text), at: last.at } });
+    emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id, occurredAt: last.at,
+      payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
   }
   const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
   for (const m of snap.messages) {
@@ -161,13 +184,29 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
   const kind = snapshot.kind;
   if (!SYNC_KINDS.includes(kind)) throw new Error(`快照 kind 要是 comments 或 dms：${kind}`);
   const snap = { works: [], comments: [], scannedWorks: [], conversations: [], messages: [], ...snapshot };
-  const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats: { inserted: 0, updated: 0, gone: 0 } };
+  const stats = kind === 'dms'
+    ? {
+        inserted: 0, updated: 0, gone: 0,
+        changedConversations: 0,
+        strangerCount: typeof snap.strangerCount === 'number' ? snap.strangerCount : snap.conversations.filter((k) => k.isStranger === true).length,
+        ...(snap.via ? { via: snap.via } : {}),
+      }
+    : { inserted: 0, updated: 0, gone: 0 };
+  const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats };
   return tx(db, () => {
     ctx.firstSync = !hasBaseline(db, ctx.accountId, kind);
+    if (kind === 'dms') {
+      ctx.firstContextSync = snap.via === 'context' && !hasBaseline(db, ctx.accountId, 'dms:context');
+      ctx.firstStrangerSync = snap.via === 'context' && !hasBaseline(db, ctx.accountId, 'dms:stranger');
+    }
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);
     else upsertConversations(db, ctx, snap);
     setBaseline(db, ctx.accountId, kind, ctx.at);
+    if (kind === 'dms' && snap.via === 'context') {
+      setBaseline(db, ctx.accountId, 'dms:context', ctx.at);
+      if (snap.hasStrangerList !== false) setBaseline(db, ctx.accountId, 'dms:stranger', ctx.at);
+    }
     return { ...ctx.stats, events: ctx.events };
   });
 }

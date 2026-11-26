@@ -5,10 +5,12 @@
 //        楼中楼（S6a 核实）：reply_id 是所在楼的一楼 cid，reply_to_reply_id 是直接回复的那条（"0" 表示回复一楼），
 //        reply_to_userid / reply_to_username 是被回复的人。
 //   私信：li.semi-list-item 的 React fiber 往上 2 层 memoizedProps.item（IM SDK Conversation），lastMessage.isFromMe 判 last.by。
-//   S9 页面内接口（账号能力位 readViaApi 打开时，params.readVia = 'api'）：作品列表照旧抄页面自己发的 item/list，
-//        一楼、楼中楼改成调页面自己的评论服务（awemeV1CommentListSelect / awemeV1CommentListReply，见 ../inpage-api.mjs），
-//        不再点「选择作品」「查看回复」。翻页上限同 DOM 路径（一楼 maxSelectPages 页、楼中楼共 maxExpand 次请求），原始数据形状不变。
-//        找不到页面服务时退回 DOM 路径（raw.apiFallback 写明原因）。
+//   S9 页面内接口（账号能力位 readViaApi 打开时，params.readVia = 'api'）：
+//        评论：作品列表照旧抄页面自己发的 item/list，一楼、楼中楼改成调页面自己的评论服务（awemeV1CommentListSelect / awemeV1CommentListReply，见 ../inpage-api.mjs），
+//             不再点「选择作品」「查看回复」。翻页上限同 DOM 路径（一楼 maxSelectPages 页、楼中楼共 maxExpand 次请求），原始数据形状不变。
+//             找不到页面服务时退回 DOM 路径（raw.apiFallback 写明原因）。
+//        私信：从聊天区 React Context 读 conversationList + strangerConversationList（含首屏外会话和陌生人会话），
+//             Context 读不到时退回 DOM 路径（raw.apiFallback 写明原因）。
 // 不点「回复」、不往输入框里写字、不调 Context 上的写函数。
 import { countOf, pageEnd, pageMore, serviceCaller } from '../inpage-api.mjs';
 import { open, atLogin, bigJson, capCount, captured, clickMarked, installHook, mainPage, sleep, waitCaptured } from './page-lib.mjs';
@@ -230,9 +232,159 @@ export function dyDmEmptyState(doc) {
   return !!d.querySelector('.semi-list-empty') || /暂无(私信|消息|会话)|没有(私信|消息|会话)/.test(d.body?.innerText ?? '');
 }
 
-async function rawDms(page, o) {
-  await page.waitForSelector('li.semi-list-item', { timeout: o.loadMs }).catch(() => {});
-  await sleep(2000);
+/**
+ * 在私信页里执行（page.evaluate 序列化，函数体自包含，导出给测试传假 document / fiber）：
+ * 沿 li.semi-list-item / [class*=chat-] / [class*=semi-list] 的 React fiber 往上找聊天区 Context
+ * （含 bytedIM 和 conversationList），合并读取 conversationList + strangerConversationList 并按会话 id 去重。
+ * 仅只读字段，不调用任何写方法或 SDK 方法。
+ */
+export function readDmContext() {
+  const fiberOf = (el) => { const k = Object.keys(el).find((x) => x.startsWith('__reactFiber')); return k ? el[k] : null; };
+  const isSvc = (v) => !!v && typeof v === 'object' && !!v.bytedIM && Array.isArray(v.conversationList);
+  const domItems = [...document.querySelectorAll('li.semi-list-item')];
+  const starts = [
+    ...domItems,
+    ...document.querySelectorAll('[class*=chat-]'),
+    ...document.querySelectorAll('[class*=semi-list]'),
+  ].slice(0, 30);
+  let svc = null;
+  for (const el of starts) {
+    for (let f = fiberOf(el), d = 0; f && d < 200; f = f.return, d++) {
+      const v = f.memoizedProps?.value;
+      if (isSvc(v)) { svc = v; break; }
+    }
+    if (svc) break;
+  }
+  if (!svc) return { ok: false, code: 'service-missing', domRows: domItems.length };
+  const normal = svc.conversationList.filter(Boolean);
+  const hasStrangerList = Array.isArray(svc.strangerConversationList);
+  const strangers = hasStrangerList ? svc.strangerConversationList.filter(Boolean) : [];
+  const ready = normal.length > 0 || strangers.length > 0 || svc.loading === false;
+  if (!ready) return { ok: false, code: 'list-loading', domRows: domItems.length };
+  if (!normal.length && !strangers.length && domItems.length > 0) return { ok: false, code: 'empty-with-dom', domRows: domItems.length };
+
+  const domNames = new Map();
+  for (const li of domItems) {
+    let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
+    const it = f?.memoizedProps?.item;
+    if (!it || it.id == null) continue;
+    const rawName = (li.querySelector('[class*=item-header], [class*=name]')?.innerText ?? li.innerText ?? '').split('\n')[0]?.trim() || null;
+    if (rawName && rawName !== '陌生人消息') domNames.set(String(it.id), rawName);
+  }
+  const nameFromMap = (uid) => {
+    if (!uid) return null;
+    for (const m of [svc.userInfoMap, svc.userMap, svc.profileMap]) {
+      if (!m || typeof m !== 'object') continue;
+      const u = typeof m.get === 'function' ? m.get(uid) : m[uid];
+      const n = u?.nickname ?? u?.name ?? u?.nickName ?? null;
+      if (typeof n === 'string' && n.trim() && n.trim() !== '陌生人消息') return n.trim();
+    }
+    return null;
+  };
+  const pickName = (it, id, uid) => {
+    for (const x of [domNames.get(id), it.name, it.coreInfo?.name, it.nickname, it.peerNickname, it.userInfo?.nickname, it.toUserInfo?.nickname, nameFromMap(uid)]) {
+      if (typeof x === 'string' && x.trim() && x.trim() !== '陌生人消息') return x.trim();
+    }
+    return null;
+  };
+  const tsOf = (v) => {
+    if (v == null || v === '') return null;
+    const ms = v instanceof Date ? v.getTime() : (typeof v === 'number' ? v : (Number(v) || Date.parse(String(v))));
+    if (!Number.isFinite(ms) || ms <= 0) return null;
+    return String(ms < 1e12 ? ms * 1000 : ms);
+  };
+  const shape = (it, forceStranger) => {
+    if (!it || it.id == null || String(it.id) === '') return null;
+    const id = String(it.id);
+    const uid = it.toParticipantUserId != null ? String(it.toParticipantUserId) : null;
+    const lm = it.lastMessage;
+    let content = null;
+    if (lm?.content != null) {
+      if (typeof lm.content === 'string') content = lm.content;
+      else { try { content = JSON.stringify(lm.content); } catch { content = null; } }
+    }
+    return {
+      id,
+      shortId: it.shortId != null ? String(it.shortId) : null,
+      toParticipantUserId: uid,
+      isStrangerChat: !!(forceStranger || it.isStrangerChat),
+      isGroupChat: !!(it.isGroupChat === true || it.type === 2),
+      unreadCount: Number(it.unreadCount) || 0,
+      name: pickName(it, id, uid),
+      lastMessage: lm ? {
+        serverId: lm.serverId != null ? String(lm.serverId) : null,
+        clientMessageId: lm.clientMessageId ?? lm.clientId ?? null,
+        type: lm.type,
+        isFromMe: !!lm.isFromMe,
+        createdAt: tsOf(lm.createdAt),
+        content,
+      } : null,
+    };
+  };
+
+  const byId = new Map();
+  const put = (item) => {
+    if (!item) return;
+    const prev = byId.get(item.id);
+    if (!prev) { byId.set(item.id, item); return; }
+    const prevTs = Number(prev.lastMessage?.createdAt ?? 0);
+    const nextTs = Number(item.lastMessage?.createdAt ?? 0);
+    const winner = nextTs > prevTs ? item : prev;
+    const other = winner === item ? prev : item;
+    byId.set(item.id, {
+      ...winner,
+      isStrangerChat: prev.isStrangerChat || item.isStrangerChat,
+      name: winner.name ?? other.name ?? null,
+    });
+  };
+  for (const it of normal) put(shape(it, false));
+  for (const it of strangers) put(shape(it, true));
+  const conversations = [...byId.values()];
+  const strangerCount = conversations.filter((c) => c.isStrangerChat).length;
+  return { ok: true, conversations, strangerCount, hasStrangerList, domRows: domItems.length };
+}
+
+export async function rawDms(page, o = {}) {
+  const loadMs = o.loadMs ?? LIMITS.loadMs;
+  const settleMs = o.settleMs ?? 2000;
+  let apiFallback = null;
+  if (o.readVia === 'api') {
+    const waitMs = Math.min(loadMs, o.contextWaitMs ?? 30000);
+    const pollMs = o.contextPollMs ?? 500;
+    const graceMs = o.contextFallbackGraceMs ?? 3000;
+    if (settleMs > 0) await sleep(settleMs);
+    let r = null;
+    let waited = false;
+    let missingWithDomSince = null;
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      r = await page.evaluate(readDmContext).catch(() => ({ ok: false, code: 'eval-error' }));
+      if (r?.ok) {
+        if (waited && settleMs > 0) {
+          await sleep(settleMs);
+          const r2 = await page.evaluate(readDmContext).catch(() => null);
+          if (r2?.ok) r = r2;
+        }
+        return {
+          via: 'context',
+          conversations: r.conversations,
+          strangerCount: r.strangerCount ?? r.conversations.filter((c) => c.isStrangerChat).length,
+          hasStrangerList: r.hasStrangerList !== false,
+          emptyState: r.conversations.length === 0 && (r.domRows ?? 0) === 0,
+        };
+      }
+      if ((r?.code === 'service-missing' || r?.code === 'empty-with-dom') && (r.domRows ?? 0) > 0) {
+        if (missingWithDomSince == null) missingWithDomSince = Date.now();
+        if (Date.now() - missingWithDomSince >= graceMs) break;
+      }
+      if (Date.now() >= deadline) break;
+      waited = true;
+      if (pollMs > 0) await sleep(pollMs);
+    }
+    apiFallback = `私信页 React Context 读不到（${r?.code ?? 'unknown'}），退回 DOM 路径`;
+  }
+  await page.waitForSelector('li.semi-list-item', { timeout: loadMs }).catch(() => {});
+  if (settleMs > 0) await sleep(settleMs);
   const conversations = await page.evaluate(() => [...document.querySelectorAll('li.semi-list-item')].map((li) => {
     const k = Object.keys(li).find((k) => k.startsWith('__reactFiber'));
     let f = li[k]; for (let i = 0; i < 2 && f; i++) f = f.return;
@@ -247,7 +399,8 @@ async function rawDms(page, o) {
   const diag = conversations.length ? null : await page.evaluate(() => ({ path: location.pathname, txt: document.body?.innerText.length ?? 0, li: document.querySelectorAll('li').length, semi: document.querySelectorAll('[class*=semi-list]').length }));
   // U1：0 个会话时只有页面明确显示空状态才算「没有私信」
   const emptyState = conversations.length ? false : await page.evaluate(dyDmEmptyState);
-  return { conversations, emptyState, ...(diag ? { diag } : {}) };
+  const strangerCount = conversations.filter((c) => c.isStrangerChat).length;
+  return { via: 'dom', ...(apiFallback ? { apiFallback } : {}), conversations, strangerCount, emptyState, ...(diag ? { diag } : {}) };
 }
 
 // —— 解析 ——
@@ -352,8 +505,12 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     const at = lm?.createdAt ? isoOf(lm.createdAt) : null;
     const last = lm && at ? { by: lm.isFromMe ? 'me' : 'peer', at, text: textOf(lm), type: TYPE(lm.type) } : null;
     conversations.push({ nativeId: id, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname: c.name ?? null, kind: c.isGroupChat ? 'group' : 'user' },
-      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat });
+      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}) });
     if (last) messages.push({ nativeId: String(lm.serverId ?? lm.clientMessageId ?? `${id}:${lm.createdAt}`), conversationNativeId: id, by: last.by, at, type: last.type, text: last.text });
   }
-  return okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
+  const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
+  if (raw.via === 'context' || raw.via === 'dom') out.via = raw.via;
+  if (typeof raw.strangerCount === 'number') out.strangerCount = raw.strangerCount;
+  if (typeof raw.hasStrangerList === 'boolean') out.hasStrangerList = raw.hasStrangerList;
+  return out;
 }
