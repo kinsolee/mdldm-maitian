@@ -238,10 +238,51 @@ export function dyDmEmptyState(doc) {
  * （含 bytedIM 和 conversationList），合并读取 conversationList + strangerConversationList 并按会话 id 去重。
  * 仅只读字段，不调用任何写方法或 SDK 方法。
  */
-export function readDmContext() {
+export function readDmPage(via = 'context') {
   const fiberOf = (el) => { const k = Object.keys(el).find((x) => x.startsWith('__reactFiber')); return k ? el[k] : null; };
   const isSvc = (v) => !!v && typeof v === 'object' && !!v.bytedIM && Array.isArray(v.conversationList);
   const domItems = [...document.querySelectorAll('li.semi-list-item')];
+  const tsOf = (v) => {
+    if (v == null || v === '') return null;
+    let ms;
+    if (typeof v === 'number') ms = v;
+    else if (typeof v?.getTime === 'function') ms = v.getTime();
+    else {
+      const s = String(v).trim();
+      if (!s) return null;
+      ms = /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : Date.parse(s);
+    }
+    if (!Number.isFinite(ms) || ms <= 0) return null;
+    return String(Math.trunc(ms < 1e12 ? ms * 1000 : ms));
+  };
+  const messageOf = (lm) => {
+    if (!lm) return null;
+    let content = lm.content ?? null;
+    if (content != null && typeof content !== 'string') {
+      try { content = JSON.stringify(content); } catch { content = null; }
+    }
+    return {
+      serverId: lm.serverId != null ? String(lm.serverId) : null,
+      clientMessageId: lm.clientMessageId != null ? String(lm.clientMessageId) : null,
+      clientId: lm.clientId != null ? String(lm.clientId) : null,
+      // 逐字沿用 main 的 SDK 时间序列化；排序与展示仍使用 createdAt。
+      keyTimestamp: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null,
+      createdAt: tsOf(lm.createdAt), type: lm.type, isFromMe: !!lm.isFromMe, content,
+    };
+  };
+  if (via === 'dom') {
+    return domItems.map((li) => {
+      let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
+      const it = f?.memoizedProps?.item;
+      if (!it || it.id == null || String(it.id).trim() === '') return null;
+      const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
+      const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
+      const name = rawName && rawName !== '陌生人消息' ? rawName : null;
+      return { id: it.id, shortId: it.shortId != null ? String(it.shortId) : null, toParticipantUserId: it.toParticipantUserId != null ? String(it.toParticipantUserId) : null, isStrangerChat: !!it.isStrangerChat,
+        isGroupChat: !!(it.isGroupChat ?? it.type === 2), unreadCount: it.unreadCount ?? 0, name,
+        lastMessage: messageOf(it.lastMessage) };
+    }).filter(Boolean);
+  }
   const seenEl = new Set();
   const starts = [];
   const addStarts = (els, cap) => {
@@ -281,11 +322,6 @@ export function readDmContext() {
     return { ok: true, conversations: [], strangerCount: 0, hasStrangerList: true, emptyConfirmed: true, domRows: 0 };
   }
 
-  const msgIdOf = (v) => {
-    if (v == null) return null;
-    const s = String(v).trim();
-    return !s || s === '0' ? null : s;
-  };
   const domNames = new Map();
   for (const li of domItems) {
     let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
@@ -311,29 +347,10 @@ export function readDmContext() {
     }
     return null;
   };
-  const tsOf = (v) => {
-    if (v == null || v === '') return null;
-    let ms;
-    if (typeof v === 'number') ms = v;
-    else if (typeof v?.getTime === 'function') ms = v.getTime();
-    else {
-      const s = String(v).trim();
-      if (!s) return null;
-      ms = /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : Date.parse(s);
-    }
-    if (!Number.isFinite(ms) || ms <= 0) return null;
-    return String(Math.trunc(ms < 1e12 ? ms * 1000 : ms));
-  };
   const shape = (it, forceStranger) => {
     if (!it || typeof it !== 'object' || it.id == null || String(it.id).trim() === '') return null;
     const id = String(it.id);
     const uid = it.toParticipantUserId != null ? String(it.toParticipantUserId) : null;
-    const lm = it.lastMessage;
-    let content = null;
-    if (lm?.content != null) {
-      if (typeof lm.content === 'string') content = lm.content;
-      else { try { content = JSON.stringify(lm.content); } catch { content = null; } }
-    }
     return {
       id,
       shortId: it.shortId != null ? String(it.shortId) : null,
@@ -342,14 +359,7 @@ export function readDmContext() {
       isGroupChat: !!(it.isGroupChat === true || it.type === 2),
       unreadCount: Number(it.unreadCount) || 0,
       name: pickName(it, id, uid),
-      lastMessage: lm ? {
-        serverId: msgIdOf(lm.serverId),
-        clientMessageId: msgIdOf(lm.clientMessageId) ?? msgIdOf(lm.clientId),
-        type: lm.type,
-        isFromMe: !!lm.isFromMe,
-        createdAt: tsOf(lm.createdAt),
-        content,
-      } : null,
+      lastMessage: messageOf(it.lastMessage),
     };
   };
 
@@ -397,6 +407,8 @@ export function readDmContext() {
   return { ok: true, conversations, strangerCount, hasStrangerList: true, emptyConfirmed: false, domRows: domItems.length };
 }
 
+export { readDmPage as readDmContext };
+
 export async function rawDms(page, o = {}) {
   const loadMs = o.loadMs ?? LIMITS.loadMs;
   const settleMs = o.settleMs ?? 2000;
@@ -412,11 +424,11 @@ export async function rawDms(page, o = {}) {
     const deadline = Date.now() + waitMs;
     const fallbackCodes = ['service-missing', 'empty-with-dom', 'no-valid-items', 'partial-invalid-items', 'stranger-list-missing'];
     for (;;) {
-      r = await page.evaluate(readDmContext).catch(() => ({ ok: false, code: 'eval-error' }));
+      r = await page.evaluate(readDmPage).catch(() => ({ ok: false, code: 'eval-error' }));
       if (r?.ok) {
         if (waited && settleMs > 0) {
           await sleep(settleMs);
-          const r2 = await page.evaluate(readDmContext).catch(() => ({ ok: false, code: 'eval-error' }));
+          const r2 = await page.evaluate(readDmPage).catch(() => ({ ok: false, code: 'eval-error' }));
           if (!r2?.ok) {
             r = r2;
             missingWithDomSince = null;
@@ -448,45 +460,7 @@ export async function rawDms(page, o = {}) {
   }
   await page.waitForSelector('li.semi-list-item', { timeout: loadMs }).catch(() => {});
   if (settleMs > 0) await sleep(settleMs);
-  const conversations = await page.evaluate(() => {
-    const msgIdOf = (v) => {
-      if (v == null) return null;
-      const s = String(v).trim();
-      return !s || s === '0' ? null : s;
-    };
-    const tsOf = (v) => {
-      if (v == null || v === '') return null;
-      let ms;
-      if (typeof v === 'number') ms = v;
-      else if (typeof v?.getTime === 'function') ms = v.getTime();
-      else {
-        const s = String(v).trim();
-        if (!s) return null;
-        ms = /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : Date.parse(s);
-      }
-      if (!Number.isFinite(ms) || ms <= 0) return null;
-      return String(Math.trunc(ms < 1e12 ? ms * 1000 : ms));
-    };
-    return [...document.querySelectorAll('li.semi-list-item')].map((li) => {
-      const k = Object.keys(li).find((key) => key.startsWith('__reactFiber'));
-      let f = li[k]; for (let i = 0; i < 2 && f; i++) f = f.return;
-      const it = f?.memoizedProps?.item;
-      if (!it || it.id == null || String(it.id).trim() === '') return null;
-      const lm = it.lastMessage;
-      const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
-      const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
-      const name = rawName && rawName !== '陌生人消息' ? rawName : null;
-      return { id: it.id, shortId: it.shortId != null ? String(it.shortId) : null, toParticipantUserId: it.toParticipantUserId != null ? String(it.toParticipantUserId) : null, isStrangerChat: !!it.isStrangerChat,
-        isGroupChat: !!(it.isGroupChat ?? it.type === 2), unreadCount: it.unreadCount ?? 0, name,
-        lastMessage: lm ? {
-          serverId: msgIdOf(lm.serverId),
-          clientMessageId: msgIdOf(lm.clientMessageId) ?? msgIdOf(lm.clientId),
-          type: lm.type, isFromMe: !!lm.isFromMe,
-          createdAt: tsOf(lm.createdAt),
-          content: lm.content ?? null,
-        } : null };
-    }).filter(Boolean);
-  });
+  const conversations = await page.evaluate(readDmPage, 'dom');
   const diag = conversations.length ? null : await page.evaluate(() => ({ path: location.pathname, txt: document.body?.innerText.length ?? 0, li: document.querySelectorAll('li').length, semi: document.querySelectorAll('[class*=semi-list]').length }));
   // U1：0 个会话时只有页面明确显示空状态才算「没有私信」
   const emptyState = conversations.length ? false : await page.evaluate(dyDmEmptyState);
@@ -587,8 +561,8 @@ function textOf(m) {
 }
 function validMsgId(v) {
   if (v == null) return null;
-  const s = String(v).trim();
-  return !s || s === '0' ? null : s;
+  const s = String(v);
+  return !s.trim() || s.trim() === '0' ? null : s;
 }
 
 export function parseDms(raw, { accountUid, fetchedAt }) {
@@ -605,8 +579,15 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     conversations.push({ nativeId: id, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
       unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}) });
     if (last) {
-      const nativeId = validMsgId(lm.serverId) ?? validMsgId(lm.clientMessageId) ?? `${id}:${Date.parse(at) / 1000}`;
-      messages.push({ nativeId, conversationNativeId: id, by: last.by, at, type: last.type, text: last.text });
+      const serverId = validMsgId(lm.serverId);
+      const clientId = validMsgId(lm.clientMessageId) ?? validMsgId(lm.clientId);
+      const fallback = `${id}:${lm.keyTimestamp ?? lm.createdAt}`;
+      const nativeId = serverId ?? clientId ?? fallback;
+      const oldId = lm.serverId ?? lm.clientMessageId;
+      messages.push({ nativeId, conversationNativeId: id, by: last.by, at, type: last.type, text: last.text,
+        ...(clientId ? { clientId } : {}),
+        ...(!serverId && !clientId ? { usesTimestampKey: true } : {}),
+        ...(oldId != null && !validMsgId(oldId) ? { legacyPlaceholderId: String(oldId) } : {}) });
     }
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });

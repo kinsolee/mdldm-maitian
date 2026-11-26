@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS messages (
   by TEXT NOT NULL, at TEXT, type TEXT, text TEXT, firstSeenAt TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_conv ON messages (conversationId, at);
+-- SDK 补上 serverId 后，仍能用旧快照里的 clientMessageId 找回同一行。
+CREATE TABLE IF NOT EXISTS douyin_dm_client_ids (
+  conversationId TEXT NOT NULL, clientId TEXT NOT NULL, serverId TEXT NOT NULL,
+  PRIMARY KEY (conversationId, clientId)
+);
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY, type TEXT NOT NULL, platformCode TEXT NOT NULL, accountId TEXT, subjectId TEXT,
   createdAt TEXT NOT NULL, payload TEXT NOT NULL,

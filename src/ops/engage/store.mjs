@@ -124,18 +124,30 @@ const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生�
 // 抖音每个会话只带最后一条消息。把实际插入结果交给事件派发，重读和撤回也可以更新会话展示。
 function insertMessages(db, ctx, messages) {
   const insert = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-  const byId = db.prepare('SELECT 1 FROM messages WHERE id = ?');
+  const remember = db.prepare('INSERT OR IGNORE INTO douyin_dm_client_ids (conversationId, clientId, serverId) VALUES (?, ?, ?)');
+  const lookup = db.prepare('SELECT serverId FROM douyin_dm_client_ids WHERE conversationId = ? AND clientId = ?');
+  const promoteClient = db.prepare('UPDATE OR IGNORE messages SET id = ? WHERE conversationId = ? AND id = ?');
+  const promotePlaceholder = db.prepare('UPDATE OR IGNORE messages SET id = ? WHERE conversationId = ? AND id = ? AND at = ? AND by = ?');
   const douyinPeers = new Map();
   for (const m of messages) {
-    // main 直接拼 SDK 的时间值，存量键可能是秒或毫秒。只认同一时刻的毫秒旧键。
-    const ms = Date.parse(m.at);
-    const hasOldMsKey = ctx.code === 'Douyin' && m.nativeId === `${m.conversationNativeId}:${ms / 1000}`
-      && byId.get(joinId(ctx.code, `${m.conversationNativeId}:${ms}`));
-    const inserted = !hasOldMsKey && insert.run(joinId(ctx.code, m.nativeId), joinId(ctx.code, m.conversationNativeId),
-      ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at).changes > 0;
+    const convId = joinId(ctx.code, m.conversationNativeId);
+    let id = joinId(ctx.code, m.nativeId);
+    if (ctx.code === 'Douyin' && m.clientId) {
+      if (m.clientId === m.nativeId) {
+        id = lookup.get(convId, m.clientId)?.serverId ?? id;
+      } else {
+        remember.run(convId, m.clientId, id);
+        promoteClient.run(id, convId, joinId(ctx.code, m.clientId));
+      }
+    }
+    if (ctx.code === 'Douyin' && m.legacyPlaceholderId != null) {
+      // main 可能已把空串或 "0" 存成主键，只升级本会话、同时间和方向的那一行。
+      promotePlaceholder.run(id, convId, joinId(ctx.code, m.legacyPlaceholderId), m.at, m.by);
+    }
+    const inserted = insert.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at).changes > 0;
     if (inserted) ctx.stats.inserted++;
     if (ctx.code === 'Douyin' && m.by === 'peer') {
-      douyinPeers.set(m.conversationNativeId, { at: m.at, nativeId: m.nativeId, inserted });
+      douyinPeers.set(m.conversationNativeId, { at: m.at, nativeId: m.nativeId, usesTimestampKey: m.usesTimestampKey, inserted });
     }
   }
   return douyinPeers;
@@ -198,7 +210,7 @@ function upsertConversations(db, ctx, snap) {
     } else {
       if (incomingLastMs < beforeLastMs) continue;
       // 只有会话摘要时沿用 main 的严格时间比较；抖音能从新插入的消息区分同毫秒的不同 ID。
-      if (incomingLastMs === beforeLastMs && (historical || peerMessage?.at !== last.at)) continue;
+      if (incomingLastMs === beforeLastMs && (historical || peerMessage?.at !== last.at || peerMessage.usesTimestampKey)) continue;
     }
     let eventId = `dm.received:${id}:${last.at}`;
     if (peerMessage && hasEventId.get(eventId)) eventId += `:${peerMessage.nativeId}`;
