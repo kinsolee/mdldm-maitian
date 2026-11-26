@@ -271,15 +271,14 @@ export function readDmContext() {
   }
   const rawNormal = svc.conversationList;
   const rawStrangers = svc.strangerConversationList;
+  const ready = svc.loading === false || rawNormal.length > 0 || rawStrangers.length > 0;
+  if (!ready) return { ok: false, code: 'list-loading', domRows: domItems.length };
   if (!rawNormal.length && !rawStrangers.length) {
     if (domItems.length > 0) return { ok: false, code: 'empty-with-dom', domRows: domItems.length };
     const hasEmptyUi = !!document.querySelector('.semi-list-empty')
       || /暂无(私信|消息|会话)|没有(私信|消息|会话)/.test(document.body?.innerText ?? '');
-    if (hasEmptyUi) {
-      return { ok: true, conversations: [], strangerCount: 0, hasStrangerList: true, emptyConfirmed: true, domRows: 0 };
-    }
-    if (svc.loading !== false) return { ok: false, code: 'list-loading', domRows: 0 };
-    return { ok: false, code: 'empty-unconfirmed', domRows: 0 };
+    if (!hasEmptyUi) return { ok: false, code: 'empty-unconfirmed', domRows: 0 };
+    return { ok: true, conversations: [], strangerCount: 0, hasStrangerList: true, emptyConfirmed: true, domRows: 0 };
   }
 
   const msgIdOf = (v) => {
@@ -447,7 +446,7 @@ export async function rawDms(page, o = {}) {
     }
     apiFallback = `私信页 React Context 读不到（${r?.code ?? 'unknown'}），退回 DOM 路径`;
   }
-  await page.waitForSelector('li.semi-list-item, .semi-list-empty', { timeout: loadMs }).catch(() => {});
+  await page.waitForSelector('li.semi-list-item', { timeout: loadMs }).catch(() => {});
   if (settleMs > 0) await sleep(settleMs);
   const conversations = await page.evaluate(() => {
     const msgIdOf = (v) => {
@@ -606,7 +605,7 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     conversations.push({ nativeId: id, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
       unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}) });
     if (last) {
-      const nativeId = validMsgId(lm.serverId) ?? validMsgId(lm.clientMessageId) ?? `${id}:${Date.parse(at)}`;
+      const nativeId = validMsgId(lm.serverId) ?? validMsgId(lm.clientMessageId) ?? `${id}:${Date.parse(at) / 1000}`;
       messages.push({ nativeId, conversationNativeId: id, by: last.by, at, type: last.type, text: last.text });
     }
   }

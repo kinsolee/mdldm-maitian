@@ -121,31 +121,24 @@ function markGone(db, ctx, scannedWorks, seen, unresolved) {
 
 const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生人消息';
 
-function legacyFallbackMsgIds(code, m) {
-  const prefix = `${m.conversationNativeId}:`;
-  if (!m.nativeId.startsWith(prefix)) return [];
-  const suffix = m.nativeId.slice(prefix.length);
-  if (!/^\d+$/.test(suffix)) return [];
-  const num = Number(suffix);
-  if (!Number.isFinite(num) || num <= 0) return [];
-  if (num >= 1e12) {
-    const sec = Math.floor(num / 1000);
-    return [{ id: joinId(code, `${prefix}${sec}`), exact: num % 1000 === 0 }];
+// 抖音每个会话只带最后一条消息。把实际插入结果交给事件派发，重读和撤回也可以更新会话展示。
+function insertMessages(db, ctx, messages) {
+  const insert = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const byId = db.prepare('SELECT 1 FROM messages WHERE id = ?');
+  const douyinPeers = new Map();
+  for (const m of messages) {
+    // main 直接拼 SDK 的时间值，存量键可能是秒或毫秒。只认同一时刻的毫秒旧键。
+    const ms = Date.parse(m.at);
+    const hasOldMsKey = ctx.code === 'Douyin' && m.nativeId === `${m.conversationNativeId}:${ms / 1000}`
+      && byId.get(joinId(ctx.code, `${m.conversationNativeId}:${ms}`));
+    const inserted = !hasOldMsKey && insert.run(joinId(ctx.code, m.nativeId), joinId(ctx.code, m.conversationNativeId),
+      ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at).changes > 0;
+    if (inserted) ctx.stats.inserted++;
+    if (ctx.code === 'Douyin' && m.by === 'peer') {
+      douyinPeers.set(m.conversationNativeId, { at: m.at, nativeId: m.nativeId, inserted });
+    }
   }
-  return [{ id: joinId(code, `${prefix}${num * 1000}`), exact: true }];
-}
-
-function hasExistingMessage(db, code, m) {
-  const fullId = joinId(code, m.nativeId);
-  if (db.prepare('SELECT 1 FROM messages WHERE id = ?').get(fullId)) return true;
-  const convId = joinId(code, m.conversationNativeId);
-  for (const cand of legacyFallbackMsgIds(code, m)) {
-    const row = db.prepare('SELECT conversationId, by, type, text FROM messages WHERE id = ?').get(cand.id);
-    if (!row || row.conversationId !== convId) continue;
-    if (cand.exact) return true;
-    if (row.by === m.by && (row.type ?? null) === (m.type ?? null) && (row.text ?? null) === (m.text ?? null)) return true;
-  }
-  return false;
+  return douyinPeers;
 }
 
 function upsertConversations(db, ctx, snap) {
@@ -154,14 +147,8 @@ function upsertConversations(db, ctx, snap) {
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
-  const hasSameTsMsg = db.prepare('SELECT 1 FROM messages WHERE conversationId = ? AND at = ? LIMIT 1');
   const hasEventId = db.prepare('SELECT 1 FROM events WHERE id = ?');
-  const msgsByConv = new Map();
-  for (const m of snap.messages) {
-    let list = msgsByConv.get(m.conversationNativeId);
-    if (!list) { list = []; msgsByConv.set(m.conversationNativeId, list); }
-    list.push(m);
-  }
+  const peerMessages = insertMessages(db, ctx, snap.messages);
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
     const last = k.last ?? null;
@@ -201,58 +188,22 @@ function upsertConversations(db, ctx, snap) {
     if (changed) ctx.stats.changedConversations++;
     if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
     else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
-    const isFreshLast = !before || before.lastAt == null;
-    let isNewer = false;
-    let newSameTsMsg = null;
-    if (isFreshLast) {
-      if (ctx.useContextBaseline) {
-        const effectiveBaselineAt = k.isStranger === true
-          ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt)
-          : ctx.contextBaselineAt;
-        const baselineMs = effectiveBaselineAt ? Date.parse(effectiveBaselineAt) : NaN;
-        const historical = Number.isFinite(baselineMs) && Number.isFinite(incomingLastMs) && incomingLastMs < baselineMs;
-        const baselineOnly = ctx.firstSync
-          || ctx.firstContextSync
-          || (k.isStranger === true && ctx.firstStrangerSync)
-          || historical;
-        isNewer = !baselineOnly;
-      } else {
-        isNewer = before ? true : !ctx.firstSync;
-      }
-    } else if (Number.isFinite(incomingLastMs) && Number.isFinite(beforeLastMs)) {
-      if (incomingLastMs > beforeLastMs) {
-        isNewer = true;
-      } else if (incomingLastMs === beforeLastMs && last?.by === 'peer') {
-        const effectiveBaselineAt = k.isStranger === true
-          ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt)
-          : ctx.contextBaselineAt;
-        const baselineMs = ctx.useContextBaseline && effectiveBaselineAt ? Date.parse(effectiveBaselineAt) : NaN;
-        const historical = Number.isFinite(baselineMs) && incomingLastMs < baselineMs;
-        if (!historical) {
-          const convMsgs = msgsByConv.get(k.nativeId) ?? [];
-          const matched = convMsgs.find((m) => m.by === 'peer' && m.at === last.at && !hasExistingMessage(db, code, m));
-          if (matched && (before.lastBy !== 'peer' || hasSameTsMsg.get(id, last.at))) {
-            isNewer = true;
-            newSameTsMsg = matched;
-          } else if (before.lastBy !== 'peer') {
-            isNewer = true;
-          }
-        }
-      }
+    if (last?.by !== 'peer' || !last.at || ctx.firstSync) continue;
+    const peerMessage = peerMessages.get(k.nativeId);
+    if (peerMessage && !peerMessage.inserted) continue;
+    const baselineAt = k.isStranger ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt) : ctx.contextBaselineAt;
+    const historical = baselineAt != null && incomingLastMs < Date.parse(baselineAt);
+    if (before?.lastAt == null) {
+      if (historical || ctx.firstContextSync || (k.isStranger && ctx.firstStrangerSync)) continue;
+    } else {
+      if (incomingLastMs < beforeLastMs) continue;
+      // 只有会话摘要时沿用 main 的严格时间比较；抖音能从新插入的消息区分同毫秒的不同 ID。
+      if (incomingLastMs === beforeLastMs && (historical || peerMessage?.at !== last.at)) continue;
     }
-    if (last?.by !== 'peer' || !last.at || !isNewer) continue;
     let eventId = `dm.received:${id}:${last.at}`;
-    if (newSameTsMsg && hasEventId.get(eventId)) {
-      eventId = `dm.received:${id}:${last.at}:${newSameTsMsg.nativeId}`;
-    }
+    if (peerMessage && hasEventId.get(eventId)) eventId += `:${peerMessage.nativeId}`;
     emit(db, ctx, { id: eventId, type: 'dm.received', subjectId: id, occurredAt: last.at,
       payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
-  }
-  const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-  for (const m of snap.messages) {
-    if (hasExistingMessage(db, code, m)) continue;
-    const r = insMsg.run(joinId(code, m.nativeId), joinId(code, m.conversationNativeId), ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at);
-    if (r.changes) ctx.stats.inserted++;
   }
 }
 

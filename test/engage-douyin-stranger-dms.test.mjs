@@ -75,6 +75,12 @@ function sdkConv(id, { uid, name, stranger = false, group = false, unread = 1, t
   };
 }
 
+function parseFixtureDm(via, atMs, serverId = null, byMe = false) {
+  const item = sdkConv('thread', { atMs, byMe });
+  item.lastMessage.serverId = serverId;
+  return parseDms({ via, conversations: [item] }, { accountUid: ME, fetchedAt: new Date(T0).toISOString() });
+}
+
 afterEach(() => {
   delete globalThis.document;
   delete globalThis.location;
@@ -173,36 +179,33 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     assert.throws(() => parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0).toISOString() }), /没显示空状态/);
   });
 
-  test('0 私信账号 loading 非布尔 false 但页面已呈现 .semi-list-empty：立刻确认空态不白等超时', async () => {
-    const ctx = { bytedIM: {}, conversationList: [], strangerConversationList: [] }; // loading 为 undefined
-    const chatEl = { __reactFiber$test: { memoizedProps: { value: ctx }, return: null } };
-    installFakeDoc({ domLis: [], chatEls: [chatEl], emptyNode: true });
+  test('空态先出现、会话后加载，Context 和 DOM 都等到会话', async () => {
+    const item = sdkConv('late');
+    const ctx = { bytedIM: {}, conversationList: [], strangerConversationList: [] };
+    const chatEl = { __reactFiber$test: { memoizedProps: { value: ctx } } };
+    installFakeDoc({ chatEls: [chatEl], emptyNode: true });
 
-    const res = readDmContext();
-    assert.equal(res.ok, true);
-    assert.equal(res.emptyConfirmed, true);
-
-    let evalCount = 0;
-    const page = {
-      waitForSelector: async () => true,
-      evaluate: async (fn, ...args) => { evalCount++; return fn(...args); },
+    const page = fakePage();
+    let polls = 0;
+    page.evaluate = async (fn) => {
+      if (++polls === 2) ctx.conversationList = [item];
+      return fn();
     };
-    const raw = await rawDms(page, { readVia: 'api', settleMs: 0, contextWaitMs: 10000, contextPollMs: 50 });
-    assert.equal(raw.via, 'context');
-    assert.equal(raw.emptyState, true);
-    assert.equal(evalCount, 1, '一次 evaluate 即确认空态，不轮询等超时');
+    const fromContext = await rawDms(page, { readVia: 'api', settleMs: 0, contextPollMs: 0 });
+    assert.equal(fromContext.via, 'context');
+    assert.deepEqual(fromContext.conversations.map((c) => c.id), ['late']);
 
-    // DOM 路径下 waitForSelector 同时等待 .semi-list-empty
-    let waitedSel = null;
-    const domPage = {
-      waitForSelector: async (sel) => { waitedSel = sel; return true; },
-      evaluate: async (fn, ...args) => fn(...args),
+    // 模拟选择器匹配：空态在 0ms 匹配，会话行到 2300ms 才匹配。
+    const domPage = fakePage();
+    installFakeDoc({ emptyNode: true });
+    domPage.waitForSelector = async (selector, { timeout }) => {
+      if (selector.includes('.semi-list-empty')) return;
+      assert.equal(selector, 'li.semi-list-item');
+      assert.ok(timeout >= 2300);
+      installFakeDoc({ domLis: [makeLi({ item })] });
     };
-    installFakeDoc({ domLis: [], chatEls: [], emptyNode: true });
-    const domRaw = await rawDms(domPage, { readVia: 'dom', settleMs: 0 });
-    assert.equal(domRaw.via, 'dom');
-    assert.equal(domRaw.emptyState, true);
-    assert.match(waitedSel, /\.semi-list-empty/);
+    const fromDom = await rawDms(domPage, { readVia: 'dom', settleMs: 0 });
+    assert.deepEqual(fromDom.conversations.map((c) => c.id), ['late']);
   });
 
   test('loading=true 时即使普通列表非空也不返回半截列表，等加载完成后再返回完整列表', async () => {
@@ -372,8 +375,8 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     const parsed = parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0).toISOString() });
     assert.deepEqual(shapeErrors(parsed), []);
     const msgByConv = new Map(parsed.messages.map((m) => [m.conversationNativeId, m.nativeId]));
-    assert.equal(msgByConv.get('0:1:me:e1'), `0:1:me:e1:${atMs}`);
-    assert.equal(msgByConv.get('0:1:me:e2'), `0:1:me:e2:${atMs}`);
+    assert.equal(msgByConv.get('0:1:me:e1'), `0:1:me:e1:${atMs / 1000}`);
+    assert.equal(msgByConv.get('0:1:me:e2'), `0:1:me:e2:${atMs / 1000}`);
     assert.equal(msgByConv.get('0:1:me:e3'), 'cli-valid-3');
     assert.notEqual(msgByConv.get('0:1:me:e1'), msgByConv.get('0:1:me:e2'), '不同会话不得主键碰撞');
   });
@@ -405,7 +408,7 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     assert.deepEqual(shapeErrors(parsedCtx), []);
 
     assert.equal(parsedDom.messages[0].nativeId, parsedCtx.messages[0].nativeId);
-    assert.equal(parsedDom.messages[0].nativeId, `0:1:me:u1:${ms}`);
+    assert.equal(parsedDom.messages[0].nativeId, `0:1:me:u1:${sec}`);
 
     const db = freshDb();
     const acc = douyin(db);
@@ -757,6 +760,57 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     const rDirectSameTs = ingestSnapshot(dbCtx, accCtx, { ...dmsSnap([conv('c2', { by: 'peer', at: t3, text: '对方同毫秒回复' })], [{ nativeId: 'cm2', conversationNativeId: 'c2', by: 'peer', at: t3, type: 'text', text: '对方同毫秒回复' }]), via: 'context', strangerCount: 0, hasStrangerList: true }, { now: at(T0 + 21 * MIN) });
     assert.deepEqual(rDirectSameTs.events, [`dm.received:Douyin:c2:${t3}`]);
     assert.equal(dbCtx.prepare("SELECT lastBy, lastText FROM conversations WHERE id = 'Douyin:c2'").get().lastBy, 'peer');
+  });
+
+  test('旧秒键与同会话同内容的 .456 秒无 ID 消息分别入库', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    const baseline = parseFixtureDm('dom', T0);
+    const legacyId = `thread:${T0 / 1000}`;
+    baseline.messages[0].nativeId = legacyId; // main 遇到秒级时间时的旧键
+    ingestSnapshot(db, acc, baseline, { now: at(T0) });
+    const next = parseFixtureDm('dom', T0 + 456);
+    const sync = ingestSnapshot(db, acc, next, { now: at(T0 + MIN) });
+    assert.equal(sync.events.length, 1);
+    const rows = db.prepare('SELECT id, at FROM messages ORDER BY at').all();
+    assert.deepEqual(rows.map((m) => m.at), [baseline.messages[0].at, next.messages[0].at]);
+    assert.equal(rows[0].id, `Douyin:${legacyId}`);
+    assert.equal(rows[1].id, `Douyin:thread:${T0 / 1000}.456`);
+
+    // main 遇到毫秒输入也会直接拼原值。把第二条换成这种存量键，重读仍只有两行。
+    db.prepare('UPDATE messages SET id = ? WHERE id = ?').run(`Douyin:thread:${T0 + 456}`, rows[1].id);
+    assert.deepEqual(ingestSnapshot(db, acc, next, { now: at(T0 + MIN) }).events, []);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 2);
+  });
+
+  test('关闭再打开 readViaApi，恢复已建基线的消息不派发', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    const baseline = parseFixtureDm('context', T0 - MIN, 'baseline');
+    const older = parseFixtureDm('dom', T0 - HOUR, 'older');
+    ingestSnapshot(db, acc, baseline, { now: at(T0) });
+    ingestSnapshot(db, acc, older, { now: at(T0 + MIN) });
+    const lastAt = db.prepare("SELECT lastAt FROM conversations WHERE id = 'Douyin:thread'");
+    assert.equal(lastAt.get().lastAt, older.messages[0].at);
+    const reopened = ingestSnapshot(db, acc, baseline, { now: at(T0 + 3 * HOUR) });
+    assert.equal(lastAt.get().lastAt, baseline.messages[0].at);
+    assert.deepEqual(reopened.events, []);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 2);
+  });
+
+  test('同时间戳撤回己方消息，恢复已知 peer 消息不派发', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    const peer = parseFixtureDm('dom', T0, 'peer');
+    const mine = parseFixtureDm('dom', T0, 'mine', true);
+    ingestSnapshot(db, acc, peer, { now: at(T0) });
+    ingestSnapshot(db, acc, mine, { now: at(T0 + MIN) });
+    const lastBy = db.prepare("SELECT lastBy FROM conversations WHERE id = 'Douyin:thread'");
+    assert.equal(lastBy.get().lastBy, 'me');
+    assert.deepEqual(ingestSnapshot(db, acc, peer, { now: at(T0 + 2 * MIN) }).events, []);
+    assert.equal(lastBy.get().lastBy, 'peer');
+    const newPeer = parseFixtureDm('dom', T0, 'new-peer');
+    assert.equal(ingestSnapshot(db, acc, newPeer, { now: at(T0 + 3 * MIN) }).events.length, 1);
   });
 
   test('origin/main 写入的秒级旧兜底键升级后不重复入库，且不丢同秒内不同内容的新消息', async () => {
