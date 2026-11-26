@@ -17,6 +17,9 @@ import { deliverPending } from '../src/daemon/outbox.mjs';
 import { runRound, DM_DELAY_ALERT_MS, DM_DELAY_ALERT_COOLDOWN_MS } from '../src/daemon/sync.mjs';
 import { freshDb, douyin, comment, commentsSnap, conv, dmsSnap, T0, MIN, at } from './helpers/engage-fixtures.mjs';
 
+import { generateDmHistory, modelItem, expectedDms } from './helpers/douyin-dm-model.mjs';
+import { pathToFileURL } from 'node:url';
+
 const HOUR = 3600_000;
 const ME = '106707338905';
 const tmpLock = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kin340-lock-')), 'engage-sync.lock');
@@ -1051,7 +1054,9 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     const file = path.join(dir, 'fixture.sqlite');
     let db = freshDb(file);
     const acc = douyin(db);
-    if (legacy) db.exec(mainBaseline);
+    if (legacy === 'empty') {
+      db.prepare("INSERT INTO engage_baselines VALUES (?, 'dms', ?)").run(acc.id, new Date(T0 + 1000).toISOString());
+    } else if (legacy) db.exec(mainBaseline);
     db.close();
     for (const [i, { dom, context = dom, via = 'context' }] of rounds.entries()) {
       const service = via === 'dom-fallback' ? null : {
@@ -1116,6 +1121,129 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
       { dom: [coarse], context: [precise] }, { dom: [sdkConv('other', { byMe: true })], context: [precise] }, { dom: [coarse], via: 'dom' }]);
     assert.deepEqual(r.events, ['one']);
     assert.equal(r.ids.filter((id) => id === 'Douyin:peer').length, 1);
+  });
+
+  function identityItem(time, text, { server = null, client = null, mine = false } = {}) {
+    const item = sdkConv('thread', { text, byMe: mine });
+    Object.assign(item.lastMessage, { createdAt: time, serverId: server, clientMessageId: client });
+    return item;
+  }
+
+  test('第十一轮：空旧库已提交基线、任务尚未完成，首屏新消息跨重启只发一次', async (t) => {
+    const peer = identityItem(T0 + 500, 'new', { server: 'S' });
+    for (const via of ['context', 'dom-fallback']) {
+      const r = await replayDms(t, [{ dom: [peer], via }, { dom: [peer], via }], { legacy: 'empty' });
+      assert.deepEqual(r.events, ['new']);
+    }
+  });
+
+  test('第十一轮：DOM 已见的对方私信与 Context 较新的己方回复都入库，撤回以 DOM 为准', async (t) => {
+    const seed = identityItem(T0 - MIN, 'seed', { server: 'base', mine: true });
+    const peer = identityItem(T0 + 100, 'first', { server: 'A' });
+    const reply = identityItem(T0 + 300, 'reply', { server: 'me', mine: true });
+    const next = identityItem(T0 + 300, 'second', { server: 'B' });
+    const r = await replayDms(t, [{ dom: [seed] }, { dom: [peer], context: [reply] }, { dom: [reply] },
+      { dom: [peer], context: [reply] }, { dom: [next] }, { dom: [next] }]);
+    assert.deepEqual(r.events, ['first', 'second']);
+    assert.ok(r.ids.includes('Douyin:me'));
+  });
+
+  test('第十一轮：滞后 Context 补齐基线消息的 serverId，累计仍为零', async (t) => {
+    const baseline = identityItem(T0 - 100, 'old', { client: 'C' });
+    const earlier = identityItem(T0 - 200, 'earlier', { server: 'me', mine: true });
+    const enriched = identityItem(T0 - 100, 'old', { client: 'C', server: 'S' });
+    const r = await replayDms(t, [{ dom: [baseline] }, { dom: [earlier], via: 'dom' },
+      { dom: [earlier], context: [enriched] }, { dom: [earlier], context: [enriched] }]);
+    assert.deepEqual(r.events, []);
+  });
+
+  for (const linked of [true, false]) {
+    test(`第十一轮：${linked ? '双 ID 转客户端 ID' : '无 ID 且挤出首屏'}，两路时间表示变化累计派发一次`, async (t) => {
+      const seed = identityItem(T0 - MIN, 'old', { server: 'me', mine: true });
+      const dom = identityItem(T0 / 1000 + 0.456, 'one', linked ? { server: 'S', client: 'C' } : {});
+      const ctx = identityItem(T0 + 456, 'one', linked ? { client: 'C' } : {});
+      const other = sdkConv('other', { byMe: true });
+      const r = await replayDms(t, [{ dom: [seed] }, { dom: [dom], via: 'dom' },
+        { dom: [other], context: [seed] }, { dom: [other], context: [ctx] }, { dom: [other], context: [ctx] }]);
+      assert.deepEqual(r.events, ['one']);
+    });
+  }
+
+  test('固定种子：跨视图、撤回、身份变化、事务回滚与重启后，每条可见的新私信恰好一个事件', async (t) => {
+    // 可选对照目录为 git archive 407500c 的临时解包；只导出该版本的私有 rawDms。
+    const ref = process.env.KIN340_MAIN_FIXTURE;
+    let control;
+    if (ref) {
+      const moduleAt = (name) => import(pathToFileURL(path.join(ref, name)));
+      control = { ...await moduleAt('src/ops/engage/adapters/douyin.mjs'),
+        ...await moduleAt('src/ops/engage/store.mjs'), ...await moduleAt('test/helpers/engage-fixtures.mjs') };
+      // main 在读取假页面前固定等两秒。仅推进这个模拟页面的稳定等待。
+      const timeout = globalThis.setTimeout;
+      t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) =>
+        ms === 2000 ? queueMicrotask(fn) : timeout(fn, ms, ...args));
+    }
+    const current = { freshDb, douyin, rawDms, parseDms, ingestSnapshot };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin340-model-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    async function replay(rounds, api, file) {
+      let db = api.freshDb(file);
+      const acc = api.douyin(db);
+      const reopen = () => {
+        if (file === ':memory:') return;
+        db.close();
+        db = api.freshDb(file);
+      };
+      try {
+        for (const [i, r] of rounds.entries()) {
+          const items = r.context.map(modelItem);
+          const service = r.via === 'fallback' ? null : { bytedIM: {}, loading: false,
+            conversationList: items.filter((k) => !k.isStrangerChat), strangerConversationList: items.filter((k) => k.isStrangerChat) };
+          installFakeDoc({ domLis: r.dom.map((m) => makeLi({ item: modelItem(m), ctxValue: service })),
+            chatEls: service ? [{ __reactFiber$fixture: { memoizedProps: { value: service } } }] : [], emptyNode: !r.dom.length });
+          const raw = await api.rawDms(fakePage(), { readVia: r.via === 'dom' ? 'dom' : 'api', settleMs: 0, contextWaitMs: 0 });
+          const snap = api.parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0 + i * MIN).toISOString() });
+          const ingest = () => api.ingestSnapshot(db, acc, snap, { now: at(T0 + i * MIN) });
+          if (r.crash === 1) reopen();  // 已读页面、尚未提交
+          if (r.crash === 2) {
+            // ingestSnapshot 的最后一步写基线；此时事件、会话、消息均已尝试写入。
+            db.exec(`CREATE TEMP TRIGGER interrupt BEFORE INSERT ON engage_baselines
+              BEGIN SELECT RAISE(ABORT, 'fixture interruption'); END`);
+            assert.throws(ingest, /fixture interruption/);
+            db.exec('DROP TRIGGER interrupt');
+            reopen();
+          }
+          ingest();
+          if (r.crash === 3) { reopen(); ingest(); } // 已提交、尚未写任务结果
+        }
+        return db.prepare("SELECT payload FROM events WHERE type='dm.received'").all().map((row) => JSON.parse(row.payload).text).sort();
+      } finally {
+        db.close();
+        if (file !== ':memory:') fs.rmSync(file, { force: true });
+      }
+    }
+    async function check(rounds, file) {
+      const actual = await replay(rounds, current, file);
+      assert.deepEqual(actual, expectedDms(rounds));
+      if (control) {
+        const main = await replay(rounds, control, file);
+        for (const label of main) if (Number(label) > 0) assert.ok(actual.includes(label), 'main delivered ' + label);
+      }
+    }
+    const count = 2048;
+    for (let seed = 1; seed <= count; seed++) {
+      const rounds = generateDmHistory(seed, T0);
+      // 每 32 个序列使用真实文件、在故障点重开连接；其余使用内存 SQLite 验证事务。
+      const file = seed % 32 === 0 ? path.join(dir, 'replay.sqlite') : ':memory:';
+      try { await check(rounds, file); } catch (error) {
+        let minimal = rounds;
+        for (let i = minimal.length - 1; i > 0; i--) {
+          const candidate = minimal.filter((_, j) => j !== i);
+          try { await check(candidate, file); } catch { minimal = candidate; }
+        }
+        throw new Error(`seed=${seed} rounds=${JSON.stringify(minimal)}`, { cause: error });
+      }
+    }
+    t.diagnostic(`${count} sequences; 0 failures; 64 persistent databases; main comparison=${!!control}`);
   });
 
   test('占位昵称「陌生人消息」既不覆盖真实昵称，也不沿用旧行占位词到 payload.nickname', async () => {

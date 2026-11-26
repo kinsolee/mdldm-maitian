@@ -245,6 +245,8 @@ export function readDmPage(via = 'context') {
   // Context 与 DOM 共用原 DOM 的 SDK 序列化；原生键、ISO 时间和事件 ID 需兼容已有数据。
   const messageOf = (lm) => lm ? {
     serverId: lm.serverId != null ? String(lm.serverId) : null, clientMessageId: lm.clientMessageId ?? null,
+    sequence: lm.indexInConversation == null ? null : String(lm.indexInConversation),
+    sdkTime: Number(lm.createdAt) || null,
     type: lm.type, isFromMe: !!lm.isFromMe,
     createdAt: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null,
     content: lm.content ?? null,
@@ -340,16 +342,23 @@ export function readDmPage(via = 'context') {
   const put = (item, fromDom = false) => {
     if (!item) return;
     const prev = byId.get(item.id);
-    if (!prev) { byId.set(item.id, item); return; }
+    const reads = prev?.reads ?? [];
+    if (item.lastMessage) {
+      const read = { message: item.lastMessage, fromDom };
+      if (fromDom) reads.unshift(read);
+      else reads.push(read);
+    }
+    if (!prev) { byId.set(item.id, { ...item, reads }); return; }
     const prevTs = millis(prev.lastMessage);
     const nextTs = millis(item.lastMessage);
-    const winner = nextTs > prevTs || (fromDom && nextTs === prevTs) ? item : prev;
+    // 首屏可反映撤回。列表中的同一会话用 DOM 维护摘要，两份观测仍全部入库。
+    const preferItem = (fromDom && item.lastMessage != null) || nextTs > prevTs;
+    const winner = preferItem ? item : prev;
     const other = winner === item ? prev : item;
     byId.set(item.id, {
-      ...winner,
+      ...winner, reads,
       isStrangerChat: prev.isStrangerChat || item.isStrangerChat,
       name: (fromDom ? item.name : null) ?? winner.name ?? other.name ?? null,
-      domPeerTime: item.domPeerTime ?? prev.domPeerTime,
       toParticipantUserId: winner.toParticipantUserId ?? other.toParticipantUserId ?? null,
       unreadCount: Math.max(prev.unreadCount, item.unreadCount),
     });
@@ -378,10 +387,10 @@ export function readDmPage(via = 'context') {
   for (const item of shapedStrangers) put(item);
   // DOM 可能先于 Context 更新，甚至已有 Context 尚未列出的会话。
   for (const row of readDom()) {
-    put({ ...row, id: String(row.id), domPeerTime: row.lastMessage?.isFromMe === false ? row.lastMessage.createdAt : null }, true);
+    put({ ...row, id: String(row.id) }, true);
   }
   const conversations = [...byId.values()];
-  if (conversations.some(({ lastMessage: m }) => m?.createdAt && (m.serverId ?? m.clientMessageId) === '')) {
+  if (conversations.some((c) => c.reads.some(({ message: m }) => m.createdAt && (m.serverId ?? m.clientMessageId) === ''))) {
     return { ok: false, code: 'empty-message-id', domRows: domItems.length };
   }
   const strangerCount = conversations.filter((c) => c.isStrangerChat).length;
@@ -540,6 +549,13 @@ function textOf(m) {
   if (Number(m.type) !== 7) return null;
   try { return clip(JSON.parse(m.content ?? 'null')?.text ?? null); } catch { return null; }
 }
+const validDmId = (v) => v != null && String(v).trim() && String(v) !== '0' ? String(v) : null;
+function sdkTimestamp(message) {
+  const time = Number(message.sdkTime ?? message.createdAt);
+  return time >= 1e12 ? time / 1000 : time;
+}
+const sdkIso = (seconds) => new Date(Math.round(seconds * 1000)).toISOString();
+
 export function parseDms(raw, { accountUid, fetchedAt }) {
   if (!Array.isArray(raw.conversations)) adapterFail('no-data', '抖音私信会话列表读不到');
   if (!raw.conversations.length && !raw.emptyState) adapterFail('no-data', `抖音私信 0 个会话，但页面没显示空状态${raw.diag ? `：${JSON.stringify(raw.diag)}` : ''}`);
@@ -548,15 +564,23 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     const id = String(c.id);
     const lm = c.lastMessage;
     const at = lm?.createdAt ? isoOf(lm.createdAt) : null;
-    const serverId = String(lm?.serverId ?? '').trim();
     const last = lm && at ? { by: lm.isFromMe ? 'me' : 'peer', at, text: textOf(lm), type: TYPE(lm.type) } : null;
     const rawName = typeof c.name === 'string' ? c.name.trim() : '';
     const nickname = rawName && rawName !== '陌生人消息' ? rawName : null;
-    conversations.push({ nativeId: id, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
-      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}),
-      ...(serverId && serverId !== '0' ? { lastServerId: String(lm.serverId) } : {}),
-      ...(c.domPeerTime ? { domPeerAt: isoOf(c.domPeerTime) } : {}) });
-    if (last) messages.push({ nativeId: String(lm.serverId ?? lm.clientMessageId ?? `${id}:${lm.createdAt}`), conversationNativeId: id, by: last.by, at, type: last.type, text: last.text });
+    const observations = [];
+    const seen = new Set();
+    for (const { message: m, fromDom } of c.reads ?? (lm ? [{ message: lm, fromDom: raw.via !== 'context' }] : [])) {
+      const sentAt = isoOf(m.createdAt);
+      if (!sentAt) continue;
+      const nativeId = String(m.serverId ?? m.clientMessageId ?? `${id}:${m.createdAt}`);
+      const msg = { nativeId, conversationNativeId: id, by: m.isFromMe ? 'me' : 'peer', at: sentAt, type: TYPE(m.type), text: textOf(m) };
+      const sdkSeconds = sdkTimestamp(m);
+      observations.push({ msg, fromDom, server: validDmId(m.serverId), client: validDmId(m.clientMessageId),
+        sdkIndex: validDmId(m.sequence), sdkSeconds, occurredAt: sdkIso(sdkSeconds), content: m.content });
+      if (!seen.has(nativeId)) { messages.push(msg); seen.add(nativeId); }
+    }
+    conversations.push({ nativeId: id, observations, observedLastAt: last ? sdkIso(sdkTimestamp(lm)) : null, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
+      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}) });
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
   if (raw.collectionStartedAt) out.collectionStartedAt = raw.collectionStartedAt;
