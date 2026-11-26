@@ -271,14 +271,15 @@ export function readDmContext() {
   }
   const rawNormal = svc.conversationList;
   const rawStrangers = svc.strangerConversationList;
-  const ready = svc.loading === false || rawNormal.length > 0 || rawStrangers.length > 0;
-  if (!ready) return { ok: false, code: 'list-loading', domRows: domItems.length };
   if (!rawNormal.length && !rawStrangers.length) {
     if (domItems.length > 0) return { ok: false, code: 'empty-with-dom', domRows: domItems.length };
     const hasEmptyUi = !!document.querySelector('.semi-list-empty')
       || /暂无(私信|消息|会话)|没有(私信|消息|会话)/.test(document.body?.innerText ?? '');
-    if (!hasEmptyUi) return { ok: false, code: 'empty-unconfirmed', domRows: 0 };
-    return { ok: true, conversations: [], strangerCount: 0, hasStrangerList: true, emptyConfirmed: true, domRows: 0 };
+    if (hasEmptyUi) {
+      return { ok: true, conversations: [], strangerCount: 0, hasStrangerList: true, emptyConfirmed: true, domRows: 0 };
+    }
+    if (svc.loading !== false) return { ok: false, code: 'list-loading', domRows: 0 };
+    return { ok: false, code: 'empty-unconfirmed', domRows: 0 };
   }
 
   const msgIdOf = (v) => {
@@ -325,7 +326,7 @@ export function readDmContext() {
     return String(Math.trunc(ms < 1e12 ? ms * 1000 : ms));
   };
   const shape = (it, forceStranger) => {
-    if (!it || it.id == null || String(it.id) === '') return null;
+    if (!it || typeof it !== 'object' || it.id == null || String(it.id).trim() === '') return null;
     const id = String(it.id);
     const uid = it.toParticipantUserId != null ? String(it.toParticipantUserId) : null;
     const lm = it.lastMessage;
@@ -371,17 +372,24 @@ export function readDmContext() {
     });
   };
   const shapedNormal = [];
+  let badNormal = 0;
   for (const it of rawNormal) {
     const item = shape(it, false);
     if (item) shapedNormal.push(item);
+    else badNormal++;
   }
   const shapedStrangers = [];
+  let badStrangers = 0;
   for (const it of rawStrangers) {
     const item = shape(it, true);
     if (item) shapedStrangers.push(item);
+    else badStrangers++;
   }
   if ((rawNormal.length > 0 && shapedNormal.length === 0) || (rawStrangers.length > 0 && shapedStrangers.length === 0)) {
     return { ok: false, code: 'no-valid-items', domRows: domItems.length };
+  }
+  if (badNormal > 0 || badStrangers > 0) {
+    return { ok: false, code: 'partial-invalid-items', domRows: domItems.length };
   }
   for (const item of shapedNormal) put(item);
   for (const item of shapedStrangers) put(item);
@@ -403,7 +411,7 @@ export async function rawDms(page, o = {}) {
     let waited = false;
     let missingWithDomSince = null;
     const deadline = Date.now() + waitMs;
-    const fallbackCodes = ['service-missing', 'empty-with-dom', 'no-valid-items', 'stranger-list-missing'];
+    const fallbackCodes = ['service-missing', 'empty-with-dom', 'no-valid-items', 'partial-invalid-items', 'stranger-list-missing'];
     for (;;) {
       r = await page.evaluate(readDmContext).catch(() => ({ ok: false, code: 'eval-error' }));
       if (r?.ok) {
@@ -439,7 +447,7 @@ export async function rawDms(page, o = {}) {
     }
     apiFallback = `私信页 React Context 读不到（${r?.code ?? 'unknown'}），退回 DOM 路径`;
   }
-  await page.waitForSelector('li.semi-list-item', { timeout: loadMs }).catch(() => {});
+  await page.waitForSelector('li.semi-list-item, .semi-list-empty', { timeout: loadMs }).catch(() => {});
   if (settleMs > 0) await sleep(settleMs);
   const conversations = await page.evaluate(() => {
     const msgIdOf = (v) => {
@@ -464,7 +472,7 @@ export async function rawDms(page, o = {}) {
       const k = Object.keys(li).find((key) => key.startsWith('__reactFiber'));
       let f = li[k]; for (let i = 0; i < 2 && f; i++) f = f.return;
       const it = f?.memoizedProps?.item;
-      if (!it) return null;
+      if (!it || it.id == null || String(it.id).trim() === '') return null;
       const lm = it.lastMessage;
       const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
       const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
@@ -484,7 +492,7 @@ export async function rawDms(page, o = {}) {
   // U1：0 个会话时只有页面明确显示空状态才算「没有私信」
   const emptyState = conversations.length ? false : await page.evaluate(dyDmEmptyState);
   const strangerCount = conversations.filter((c) => c.isStrangerChat).length;
-  return { via: 'dom', ...(apiFallback ? { apiFallback } : {}), conversations, strangerCount, emptyState, ...(diag ? { diag } : {}) };
+  return { via: apiFallback ? 'dom-fallback' : 'dom', ...(apiFallback ? { apiFallback } : {}), conversations, strangerCount, emptyState, ...(diag ? { diag } : {}) };
 }
 
 // —— 解析 ——
@@ -603,7 +611,7 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     }
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
-  if (raw.via === 'context' || raw.via === 'dom') out.via = raw.via;
+  if (raw.via === 'context' || raw.via === 'dom' || raw.via === 'dom-fallback') out.via = raw.via;
   if (typeof raw.strangerCount === 'number') out.strangerCount = raw.strangerCount;
   if (typeof raw.hasStrangerList === 'boolean') out.hasStrangerList = raw.hasStrangerList;
   return out;

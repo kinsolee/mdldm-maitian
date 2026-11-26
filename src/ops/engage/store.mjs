@@ -121,12 +121,47 @@ function markGone(db, ctx, scannedWorks, seen, unresolved) {
 
 const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生人消息';
 
+function legacyFallbackMsgIds(code, m) {
+  const prefix = `${m.conversationNativeId}:`;
+  if (!m.nativeId.startsWith(prefix)) return [];
+  const suffix = m.nativeId.slice(prefix.length);
+  if (!/^\d+$/.test(suffix)) return [];
+  const num = Number(suffix);
+  if (!Number.isFinite(num) || num <= 0) return [];
+  if (num >= 1e12) {
+    const sec = Math.floor(num / 1000);
+    return [{ id: joinId(code, `${prefix}${sec}`), exact: num % 1000 === 0 }];
+  }
+  return [{ id: joinId(code, `${prefix}${num * 1000}`), exact: true }];
+}
+
+function hasExistingMessage(db, code, m) {
+  const fullId = joinId(code, m.nativeId);
+  if (db.prepare('SELECT 1 FROM messages WHERE id = ?').get(fullId)) return true;
+  const convId = joinId(code, m.conversationNativeId);
+  for (const cand of legacyFallbackMsgIds(code, m)) {
+    const row = db.prepare('SELECT conversationId, by, type, text FROM messages WHERE id = ?').get(cand.id);
+    if (!row || row.conversationId !== convId) continue;
+    if (cand.exact) return true;
+    if (row.by === m.by && (row.type ?? null) === (m.type ?? null) && (row.text ?? null) === (m.text ?? null)) return true;
+  }
+  return false;
+}
+
 function upsertConversations(db, ctx, snap) {
   const { code } = ctx;
   const prev = db.prepare('SELECT peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend FROM conversations WHERE id = ?');
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
+  const hasSameTsMsg = db.prepare('SELECT 1 FROM messages WHERE conversationId = ? AND at = ? LIMIT 1');
+  const hasEventId = db.prepare('SELECT 1 FROM events WHERE id = ?');
+  const msgsByConv = new Map();
+  for (const m of snap.messages) {
+    let list = msgsByConv.get(m.conversationNativeId);
+    if (!list) { list = []; msgsByConv.set(m.conversationNativeId, list); }
+    list.push(m);
+  }
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
     const last = k.last ?? null;
@@ -142,7 +177,11 @@ function upsertConversations(db, ctx, snap) {
     const nextCanSend = bool(k.canSend);
     const beforeLastMs = before?.lastAt ? Date.parse(before.lastAt) : NaN;
     const incomingLastMs = last?.at ? Date.parse(last.at) : NaN;
-    const keepLast = !last?.at || (Number.isFinite(beforeLastMs) && Number.isFinite(incomingLastMs) && incomingLastMs < beforeLastMs);
+    const staleFallback = ctx.isDomFallback
+      && Number.isFinite(beforeLastMs)
+      && Number.isFinite(incomingLastMs)
+      && incomingLastMs < beforeLastMs;
+    const keepLast = !last?.at || staleFallback;
     const nextLastBy = keepLast ? (before?.lastBy ?? null) : (last.by ?? null);
     const nextLastAt = keepLast ? (before?.lastAt ?? null) : (last.at ?? null);
     const nextLastText = keepLast ? (before?.lastText ?? null) : (last.text ?? null);
@@ -163,9 +202,10 @@ function upsertConversations(db, ctx, snap) {
     if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
     else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
     const isFreshLast = !before || before.lastAt == null;
-    let isNewer;
+    let isNewer = false;
+    let newSameTsMsg = null;
     if (isFreshLast) {
-      if (ctx.isContext) {
+      if (ctx.useContextBaseline) {
         const effectiveBaselineAt = k.isStranger === true
           ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt)
           : ctx.contextBaselineAt;
@@ -179,15 +219,38 @@ function upsertConversations(db, ctx, snap) {
       } else {
         isNewer = before ? true : !ctx.firstSync;
       }
-    } else {
-      isNewer = Number.isFinite(incomingLastMs) && Number.isFinite(beforeLastMs) && incomingLastMs > beforeLastMs;
+    } else if (Number.isFinite(incomingLastMs) && Number.isFinite(beforeLastMs)) {
+      if (incomingLastMs > beforeLastMs) {
+        isNewer = true;
+      } else if (incomingLastMs === beforeLastMs && last?.by === 'peer') {
+        const effectiveBaselineAt = k.isStranger === true
+          ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt)
+          : ctx.contextBaselineAt;
+        const baselineMs = ctx.useContextBaseline && effectiveBaselineAt ? Date.parse(effectiveBaselineAt) : NaN;
+        const historical = Number.isFinite(baselineMs) && incomingLastMs < baselineMs;
+        if (!historical) {
+          const convMsgs = msgsByConv.get(k.nativeId) ?? [];
+          const matched = convMsgs.find((m) => m.by === 'peer' && m.at === last.at && !hasExistingMessage(db, code, m));
+          if (matched && (before.lastBy !== 'peer' || hasSameTsMsg.get(id, last.at))) {
+            isNewer = true;
+            newSameTsMsg = matched;
+          } else if (before.lastBy !== 'peer') {
+            isNewer = true;
+          }
+        }
+      }
     }
     if (last?.by !== 'peer' || !last.at || !isNewer) continue;
-    emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id, occurredAt: last.at,
+    let eventId = `dm.received:${id}:${last.at}`;
+    if (newSameTsMsg && hasEventId.get(eventId)) {
+      eventId = `dm.received:${id}:${last.at}:${newSameTsMsg.nativeId}`;
+    }
+    emit(db, ctx, { id: eventId, type: 'dm.received', subjectId: id, occurredAt: last.at,
       payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
   }
   const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
   for (const m of snap.messages) {
+    if (hasExistingMessage(db, code, m)) continue;
     const r = insMsg.run(joinId(code, m.nativeId), joinId(code, m.conversationNativeId), ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at);
     if (r.changes) ctx.stats.inserted++;
   }
@@ -220,17 +283,19 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
   return tx(db, () => {
     ctx.firstSync = !hasBaseline(db, ctx.accountId, kind);
     ctx.isContext = kind === 'dms' && snap.via === 'context';
-    if (ctx.isContext) {
+    ctx.isDomFallback = kind === 'dms' && snap.via === 'dom-fallback';
+    ctx.useContextBaseline = ctx.isContext || ctx.isDomFallback;
+    if (ctx.useContextBaseline) {
       ctx.contextBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:context');
       ctx.strangerBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:stranger');
-      ctx.firstContextSync = ctx.contextBaselineAt == null;
-      ctx.firstStrangerSync = ctx.strangerBaselineAt == null;
+      ctx.firstContextSync = ctx.isContext && ctx.contextBaselineAt == null;
+      ctx.firstStrangerSync = ctx.isContext && ctx.strangerBaselineAt == null;
     }
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);
     else upsertConversations(db, ctx, snap);
     setBaseline(db, ctx.accountId, kind, ctx.at);
-    if (kind === 'dms' && snap.via === 'context') {
+    if (ctx.isContext) {
       setBaseline(db, ctx.accountId, 'dms:context', ctx.at);
       if (snap.hasStrangerList !== false) setBaseline(db, ctx.accountId, 'dms:stranger', ctx.at);
     }
