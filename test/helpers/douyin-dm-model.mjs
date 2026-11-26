@@ -131,3 +131,38 @@ export function sourceHistory(kind, seed, epoch) {
   const b = peer(1, time, 1);
   return [row(a), row(mine), row(b), row({ ...a, ids: 1, index: true, sdkIndex: 10 }), row({ ...b, index: true, sdkIndex: 20 })];
 }
+
+// 首屏暂缓后由另一份 SDK 观测补齐。变化量包括时间差、崩溃点及占位键的所属会话。
+export function pendingHistory(kind, seed, epoch) {
+  const second = epoch + 1000 * (1 + seed % 31);
+  const fraction = 1 + (seed * 137 % 999);
+  const mine = { thread: 1, number: -9, ms: epoch - 2000, mine: true, ids: 1 };
+  const other = { ...mine, thread: 2 + seed % 5, zero: kind === 'zero' };
+  const a = { thread: 1, number: 1, ms: second, ids: 1, text: 'same' };
+  const b = { ...a, number: 2, ms: second + fraction, ids: 2, zero: kind === 'zero' };
+  const full = { ...b, zero: false, ids: 3 };
+  const row = (dom, ctx = dom, extra = {}) => ({ dom: [dom], context: [ctx], via: 'api', crash: seed % 4, ...extra });
+  if (kind === 'upgrade-window') {
+    const fresh = { ...b, ms: epoch + 500 };
+    return [row(other, other, { legacy: true, commitAt: epoch + 1000 }), row(other, fresh), row(fresh), row(fresh, fresh, { via: 'dom' })];
+  }
+  if (kind === 'body' || kind === 'baseline-body') {
+    const initial = { ...a, ms: kind === 'body' ? second : epoch - 2000 + fraction, seconds: true, text: '' };
+    const complete = { ...initial, ms: kind === 'body' ? second + fraction : initial.ms, seconds: false, text: 'full' };
+    // 库里先有空正文；精度变化时同一服务端 ID 仍然可见。
+    return kind === 'body'
+      ? [row(mine), row(other, initial), row(initial), row(other, complete), row(other, complete)]
+      : [row(other, { ...initial, number: -1 }), row(other, { ...complete, number: -1 })];
+  }
+  const prefix = [row(other, other, { legacy: kind === 'zero' }), row(other, a), row(b)];
+  if (kind === 'replaced') {
+    const reply = { ...mine, ms: second + 2000 };
+    return [...prefix, row(reply, full), row(reply)];
+  }
+  if (kind === 'settled') {
+    const old = { ...a, number: -1 };
+    const serverOnly = { ...full, ids: 1 };
+    return [row(other, old), row(b), row(serverOnly), row(other, { ...old, ids: 3 }), row({ ...b, ms: second }), row(serverOnly)];
+  }
+  return [...prefix, row(full), row(full)];
+}

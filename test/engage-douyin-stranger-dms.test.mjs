@@ -17,7 +17,7 @@ import { deliverPending } from '../src/daemon/outbox.mjs';
 import { runRound, DM_DELAY_ALERT_MS, DM_DELAY_ALERT_COOLDOWN_MS } from '../src/daemon/sync.mjs';
 import { freshDb, douyin, comment, commentsSnap, conv, dmsSnap, T0, MIN, at } from './helpers/engage-fixtures.mjs';
 
-import { generateDmHistory, identityHistory, sourceHistory, modelItem, expectedDms } from './helpers/douyin-dm-model.mjs';
+import { generateDmHistory, identityHistory, sourceHistory, pendingHistory, modelItem, expectedDms } from './helpers/douyin-dm-model.mjs';
 import { pathToFileURL } from 'node:url';
 
 const HOUR = 3600_000;
@@ -357,7 +357,7 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     assert.equal(raw.conversations.length, 1);
   });
 
-  test('沿用 main 的占位键；Context 独有的空键不会让正常首屏的整轮校验失败', async () => {
+  test('空串与 0 使用会话时间键；Context 独有的空键仍可回落正常首屏', async () => {
     const visible = sdkConv('visible', { serverId: '0' });
     const hidden = sdkConv('hidden', { serverId: '', stranger: true });
     const ctx = { bytedIM: {}, loading: false, conversationList: [visible], strangerConversationList: [hidden] };
@@ -366,8 +366,8 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     assert.equal(raw.via, 'dom-fallback');
     const parsed = parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0).toISOString() });
     assert.deepEqual(shapeErrors(parsed), []);
-    assert.equal(parsed.messages[0].nativeId, '0');
-    assert.equal(parseFixtureDm('dom', T0, '').messages[0].nativeId, '');
+    assert.equal(parsed.messages[0].nativeId, `visible:${visible.lastMessage.createdAt}`);
+    assert.equal(parseFixtureDm('dom', T0, '').messages[0].nativeId, `thread:${T0}`);
   });
 
   test('无 ID 时 DOM 和 Context 都保留 main 的原始时间键；切换单位的行数与派发跟 main 一致', async () => {
@@ -1216,12 +1216,18 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
           const raw = await reader.rawDms(fakePage(), { readVia: r.via === 'dom' ? 'dom' : 'api', settleMs: 0, contextWaitMs: 0 });
           const snap = reader.parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0 + i * MIN).toISOString() });
           const ingest = () => {
-            const result = reader.ingestSnapshot(db, acc, snap, { now: at(T0 + i * MIN) });
+            const result = reader.ingestSnapshot(db, acc, snap, { now: at(r.commitAt ?? T0 + i * MIN) });
             for (const id of result.events) {
               const { text, conversationId } = JSON.parse(db.prepare('SELECT payload FROM events WHERE id=?').get(id).payload);
               const views = [...r.dom, ...(reader !== control && raw.via === 'context' ?
                 r.context.filter((c) => !r.dom.some((d) => d.thread === c.thread)) : [])];
               const labels = new Set(views.filter((m) => conversationId === `Douyin:thread-${m.thread}` && !m.mine && (m.text ?? String(m.number)) === text).map((m) => String(m.number)));
+              // 暂缓事件可以由同会话非末条的 Context 身份证据补派。
+              if (!labels.size && raw.via === 'context') {
+                for (const m of r.context) {
+                  if (!m.mine && conversationId === `Douyin:thread-${m.thread}` && (m.text ?? String(m.number)) === text) labels.add(String(m.number));
+                }
+              }
               assert.equal(labels.size, 1, 'fixture must identify the emitting observation');
               events.push(...labels);
             }
@@ -1357,6 +1363,47 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     }
     return [row(old, old, { legacy: true }), row(old, old, { checkLegacyAnchor: true }), row(old)];
   }
+  test('暂缓消息写入被忽略时，DOM 水位与会话更新一起回滚', async () => {
+    const db = freshDb(':memory:');
+    try {
+      const acc = douyin(db);
+      const other = sdkConv('other', { byMe: true });
+      const a = sdkConv('thread', { serverId: 'A', atMs: T0 + 1000, text: 'same' });
+      const b = sdkConv('thread', { serverId: '0', atMs: T0 + 1456, text: 'same' });
+      b.lastMessage.clientMessageId = 'B';
+      ingestSnapshot(db, acc, await collectFixture([other], 'api'), { now: at(T0) });
+      ingestSnapshot(db, acc, await collectFixture([a], 'api', [other]), { now: at(T0 + MIN) });
+      const state = db.prepare(`SELECT c.lastAt, b.domLastAt FROM conversations c JOIN douyin_dm_baselines b
+        ON c.id=b.conversationId WHERE c.id='Douyin:thread'`);
+      const before = state.get();
+      const snap = await collectFixture([b], 'api');
+      db.exec("CREATE TEMP TRIGGER ignore_pending BEFORE INSERT ON messages WHEN NEW.dmSource='dom-check' BEGIN SELECT RAISE(IGNORE); END");
+      assert.throws(() => ingestSnapshot(db, acc, snap), /暂缓私信未写入/);
+      assert.deepEqual(state.get(), before);
+      db.exec('DROP TRIGGER ignore_pending');
+      ingestSnapshot(db, acc, snap);
+      assert.equal(db.prepare("SELECT dmSource FROM messages WHERE id='Douyin:B'").get().dmSource, 'dom-check');
+      assert.equal(state.get().domLastAt, snap.messages[0].at);
+    } finally { db.close(); }
+  });
+  const pendingCases = ['zero', 'replaced', 'settled', 'baseline-body', 'body', 'upgrade-window'];
+  for (const kind of pendingCases) {
+    test('第十五轮：' + kind, async (t) => {
+      const { current, control, replay, dir } = await modelReplay(t);
+      const rounds = pendingHistory(kind, 3, T0);
+      const file = path.join(dir, 'pending.sqlite');
+      const main = kind === 'baseline-body' ? [] : kind === 'body' ? ['1'] : ['2'];
+      if (control) assert.deepEqual(await replay(rounds, control, file), main, '407500c');
+      const expected = ['zero', 'replaced'].includes(kind) ? ['1', '2'] : main;
+      assert.deepEqual(await replay(rounds, current, file), expected);
+      if (kind === 'upgrade-window') {
+        assert.deepEqual(await replay([rounds[0], rounds[1], rounds[3]], current, file), main);
+        const laterJob = [{ ...rounds[0], successAt: T0 + 2000 }, ...rounds.slice(1)];
+        if (control) assert.deepEqual(await replay(laterJob, control, file), main);
+        assert.deepEqual(await replay(laterJob, current, file), main);
+      }
+    });
+  }
   test('固定种子：首屏对照 main，首屏外读取 Context，重放与重启后逐条核对发件箱', async (t) => {
     const { check, dir, control, totals } = await modelReplay(t);
     const count = 2048;
@@ -1365,7 +1412,8 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
       const extra = identityHistory(['upgrade', 'alias', 'collision'][seed % 3], seed, T0);
       // 每 32 个序列使用真实文件、在故障点重开连接；其余使用内存 SQLite 验证事务。
       const file = seed % 32 === 0 ? path.join(dir, 'replay.sqlite') : ':memory:';
-      for (const sequence of [rounds, extra, sourceHistory(sourceCases[seed % sourceCases.length], seed, T0)]) {
+      for (const sequence of [rounds, extra, sourceHistory(sourceCases[seed % sourceCases.length], seed, T0),
+        pendingHistory(['zero', 'replaced', 'body'][seed % 3], seed, T0)]) {
         try { await check(sequence, file); } catch (error) {
           let minimal = sequence;
           for (let i = minimal.length - 1; i > 0; i--) {
@@ -1376,7 +1424,7 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
         }
       }
     }
-    t.diagnostic(`${count * 3} sequences; 0 failures; 192 file-backed sequences; main comparison=${!!control}; main excess deliveries=${totals.mainDuplicates}; old union only=${totals.excludedBySourcePolicy}`);
+    t.diagnostic(`${count * 4} sequences; 0 failures; 256 file-backed sequences; main comparison=${!!control}; main excess deliveries=${totals.mainDuplicates}; old union only=${totals.excludedBySourcePolicy}`);
   });
 
   test('占位昵称「陌生人消息」既不覆盖真实昵称，也不沿用旧行占位词到 payload.nickname', async () => {

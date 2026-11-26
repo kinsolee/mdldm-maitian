@@ -348,6 +348,7 @@ export function readDmPage(via = 'context') {
     const other = winner === item ? prev : item;
     byId.set(item.id, {
       ...winner,
+      ...(fromDom && other.lastMessage && !other.lastMessage.isFromMe ? { contextPeer: other.lastMessage } : {}),
       isStrangerChat: prev.isStrangerChat || item.isStrangerChat,
       name: (fromDom ? item.name : null) ?? winner.name ?? other.name ?? null,
       toParticipantUserId: winner.toParticipantUserId ?? other.toParticipantUserId ?? null,
@@ -547,24 +548,35 @@ function sdkTimestamp(message) {
 }
 const sdkIso = (seconds) => new Date(Math.round(seconds * 1000)).toISOString();
 
+// 同一解析器也处理首屏会话中用于补齐暂缓记录的 Context 观测。
+function parseDmMessage(id, lm) {
+  const at = lm?.createdAt ? isoOf(lm.createdAt) : null;
+  if (!at) return null;
+  const server = validDmId(lm.serverId), client = validDmId(lm.clientMessageId);
+  return { nativeId: server ?? client ?? `${id}:${lm.createdAt}`, conversationNativeId: id,
+    by: lm.isFromMe ? 'me' : 'peer', at, text: textOf(lm), type: TYPE(lm.type),
+    server, client, sdkAt: sdkIso(sdkTimestamp(lm)), ...(String(lm.serverId) === '0' ? { legacyZero: true } : {}) };
+}
+
 export function parseDms(raw, { accountUid, fetchedAt }) {
   if (!Array.isArray(raw.conversations)) adapterFail('no-data', '抖音私信会话列表读不到');
   if (!raw.conversations.length && !raw.emptyState) adapterFail('no-data', `抖音私信 0 个会话，但页面没显示空状态${raw.diag ? `：${JSON.stringify(raw.diag)}` : ''}`);
-  const conversations = [], messages = [];
+  const conversations = [], messages = [], contextPeers = [];
   for (const c of raw.conversations) {
     const id = String(c.id);
-    const lm = c.lastMessage;
-    const at = lm?.createdAt ? isoOf(lm.createdAt) : null;
-    const last = lm && at ? { by: lm.isFromMe ? 'me' : 'peer', at, text: textOf(lm), type: TYPE(lm.type) } : null;
+    const msg = parseDmMessage(id, c.lastMessage);
+    const last = msg && { by: msg.by, at: msg.at, text: msg.text, type: msg.type };
+    const evidence = parseDmMessage(id, c.contextPeer);
+    if (evidence) contextPeers.push(evidence);
     const rawName = typeof c.name === 'string' ? c.name.trim() : '';
     const nickname = rawName && rawName !== '陌生人消息' ? rawName : null;
     const onScreen = c.onScreen ?? raw.via !== 'context';
     conversations.push({ nativeId: id, onScreen, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
       unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}) });
-    if (last) messages.push({ nativeId: String(lm.serverId ?? lm.clientMessageId ?? `${id}:${lm.createdAt}`), conversationNativeId: id,
-      ...last, server: validDmId(lm.serverId), client: validDmId(lm.clientMessageId), sdkAt: sdkIso(sdkTimestamp(lm)) });
+    if (msg) messages.push(msg);
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
+  if (contextPeers.length) out.contextPeers = contextPeers;
   if (raw.collectionStartedAt) out.collectionStartedAt = raw.collectionStartedAt;
   if (raw.via === 'context' || raw.via === 'dom' || raw.via === 'dom-fallback') out.via = raw.via;
   if (typeof raw.strangerCount === 'number') out.strangerCount = raw.strangerCount;
