@@ -1200,6 +1200,13 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
           if (opener !== reader) {
             migrateEngage(db);
             opener = reader;
+            if (r.checkLegacyAnchor) {
+              const state = db.prepare(`SELECT c.lastAt, b.domLastAt FROM conversations c
+                LEFT JOIN douyin_dm_baselines b ON b.accountId=c.accountId AND b.conversationId=c.id
+                WHERE c.id=?`).get('Douyin:thread-1');
+              assert.ok(state.lastAt);
+              assert.equal(state.domLastAt, null);
+            }
           }
           const items = r.context.map(modelItem);
           const service = r.via === 'fallback' ? null : { bytedIM: {}, loading: false,
@@ -1229,6 +1236,12 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
             reopen();
           }
           ingest();
+          if (r.successAt) {
+            const params = { accountId: acc.id, platformCode: 'Douyin', kind: 'dms', now: at(r.successAt) };
+            const job = createJob(db, params);
+            startJob(db, job, params);
+            finishJob(db, job, { status: 'ok', now: at(r.successAt + 1000) });
+          }
           if (r.legacy && !control) {
             // 无历史代码的源码包仍测试旧行；移除新版独有的账本并恢复 main 的显示时间。
             db.exec(`DELETE FROM douyin_dm_baselines;
@@ -1299,6 +1312,50 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
       }
       await check(rounds, file);
     });
+  }
+  const handoffCases = ['different-server', 'late-stranger', 'context-baseline', 'main-baseline', 'after-recall'];
+  for (const kind of handoffCases) {
+    test('第十四轮：' + kind, async (t) => {
+      const { replay, current, control, dir } = await modelReplay(t);
+      const file = path.join(dir, 'upgraded.sqlite');
+      const rounds = handoffHistory(kind);
+      const expectedMain = { 'different-server': ['2'], 'late-stranger': ['2'], 'context-baseline': [], 'main-baseline': [], 'after-recall': ['2'] }[kind];
+      if (control) assert.deepEqual(await replay(rounds, control, file), expectedMain);
+      const expected = kind === 'different-server' ? ['1', '2'] : expectedMain;
+      assert.deepEqual(await replay(rounds, current, file), expected);
+      if (kind === 'different-server') {
+        assert.deepEqual(await replay(rounds.slice(0, 3), current, file), ['1']);
+        assert.deepEqual(await replay([...rounds.slice(0, 3), rounds[2]], current, file), ['1']);
+      }
+      if (kind === 'late-stranger') {
+        assert.deepEqual(await replay(rounds.slice(0, 2), current, file), []);
+        assert.deepEqual(await replay([rounds[0], rounds[1], rounds[3]], current, file), ['2']);
+      }
+    });
+  }
+  function handoffHistory(kind) {
+    const peer = (number, ms, ids = 1) => ({ thread: 1, number, ms: T0 + ms, ids, text: 'same' });
+    const other = { ...peer(-9, -2000), mine: true, thread: 0 };
+    const row = (dom, ctx = dom, extra = {}) => ({ dom: [dom], context: [ctx], via: 'api', crash: 3, ...extra });
+    const a = peer(1, 1000), b = peer(2, 1456, 2);
+    if (kind === 'different-server') {
+      return [row(other), row(other, a), row(b), row({ ...b, ids: 3 }), row({ ...b, ids: 3 })];
+    }
+    if (kind === 'late-stranger') {
+      return [row(other, other, { via: 'dom', successAt: T0 + MIN }), row(other, b), row(b), row(b, b, { via: 'dom' })];
+    }
+    const old = { ...peer(-1, -544), seconds: true };
+    if (kind === 'context-baseline') {
+      const fine = { ...old, seconds: false, ids: 2 };
+      return [row(other, old), row(other, fine), row(other, fine)];
+    }
+    if (kind === 'after-recall') {
+      const mine = { ...old, mine: true };
+      const recalled = { ...mine, ms: T0 - 2000 };
+      const delayed = { ...b, ms: T0 - 1000, ids: 1 };
+      return [row(mine), row(recalled), row(delayed), row(delayed)];
+    }
+    return [row(old, old, { legacy: true }), row(old, old, { checkLegacyAnchor: true }), row(old)];
   }
   test('固定种子：首屏对照 main，首屏外读取 Context，重放与重启后逐条核对发件箱', async (t) => {
     const { check, dir, control, totals } = await modelReplay(t);

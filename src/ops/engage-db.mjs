@@ -99,7 +99,7 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt)
   // 本分支早期建的 actions 没有 targetLastAt
   addColumnIfMissing(db, 'actions', 'targetLastAt', 'TEXT');
   for (const col of ['domLastAt', 'domSdkAt']) addColumnIfMissing(db, 'douyin_dm_baselines', col, 'TEXT');
-  // dmSource 为 dom/context 时代表基线或已入箱，seen 表示仅观察到，NULL 兼容 main 的旧行。
+  // dmSource 保存来源及暂缓原因；dom-check 等身份补齐，context-window 等进入首屏。NULL 兼容 main 的旧行。
   for (const col of ['dmSource', 'dmServer', 'dmClient', 'dmTime']) addColumnIfMissing(db, 'messages', col, 'TEXT');
   // 推送前过滤（filter.mjs）命中的规则名；没命中为 NULL
   addColumnIfMissing(db, 'events', 'filteredReason', 'TEXT');

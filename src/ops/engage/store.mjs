@@ -134,6 +134,8 @@ function upsertConversations(db, ctx, snap) {
     WHERE conversationId=? AND accountId=? AND by='peer' AND at BETWEEN ? AND ? AND type IS ? AND text IS ?
     AND (dmSource IS NULL OR dmSource!='seen')`);
   const sources = new Map();
+  // 首次走 Context 的任务水位可能晚于账号采集基线。夹在两者之间的首屏外消息留给 DOM。
+  const captureAt = ctx.code === 'Douyin' && (getBaselineAt(db, ctx.accountId, 'dms:capture') ?? getBaselineAt(db, ctx.accountId, 'dms'));
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
     const last = k.last;
@@ -174,39 +176,53 @@ function upsertConversations(db, ctx, snap) {
     const priorDom = anchor ? anchor.domLastAt : before?.lastAt;
     const cutoff = (k.onScreen || snap.via === 'dom-fallback' ? ctx.domCutoff : null) ?? ctx.contextCutoff;
     const advancesKnownThread = scoped && before?.lastAt && last?.at > (anchor?.lastAt ?? before.lastAt);
-    const historical = cutoff && last?.at < cutoff && !advancesKnownThread;
+    const domAdvanced = scoped && k.onScreen && priorDom && last?.at > priorDom;
+    const enteredDom = scoped && k.onScreen && anchor && !priorDom && captureAt && last?.at >= captureAt;
+    const historical = cutoff && last?.at < cutoff && !advancesKnownThread && !domAdvanced && !enteredDom;
     if (scoped) {
       const isBaseline = ctx.firstSync || historical;
       const baselineAt = before?.lastAt ?? (isBaseline ? last?.at : null) ?? null;
       const domAt = (k.onScreen && last ? last.at : priorDom) ?? null;
       saveBaseline.run(ctx.accountId, id, baselineAt, domAt, k.onScreen ? msg?.sdkAt ?? null : null);
-      sources.set(k.nativeId, isBaseline ? source : 'seen');
+      const windowOnly = historical && !k.onScreen && !ctx.firstSync && last?.at >= captureAt;
+      sources.set(k.nativeId, windowOnly ? 'context-window' : isBaseline ? source : 'seen');
     }
     if (ctx.firstSync || historical || last?.by !== 'peer' || !last.at) continue;
     const previous = scoped && k.onScreen ? priorDom : before?.lastAt;
-    if ((!scoped || k.onScreen) && previous && last.at <= previous) continue;
+    if (!scoped && previous && last.at <= previous) continue;
     if (scoped && !k.onScreen && anchor?.lastAt && last.at <= anchor.lastAt) continue;
     const at = msg?.sdkAt ?? last.at;
     if (scoped && msg) {
       // 首屏内外切换时，只在另一来源已处理相同可见内容且时间精度相容时沿用其结果。
       const second = at.slice(0, 19);
       const priorRows = prior.all(id, ctx.accountId, second + '.000Z', second + '.999Z', msg.type, msg.text);
-      const seen = priorRows.some((m) => {
-        if ((msg.server && m.dmServer === msg.server) || (msg.client && m.dmClient === msg.client)) return true;
-        if (k.onScreen && anchor?.domSdkAt === at && m.dmTime === at) return true;
-        if ((m.dmSource ?? 'dom') === source) return false;
-        if ((msg.server && m.dmServer && msg.server !== m.dmServer) || (msg.client && m.dmClient && msg.client !== m.dmClient)) return false;
+      const matchesId = (m) => (msg.server && m.dmServer === msg.server) || (msg.client && m.dmClient === msg.client);
+      const conflicts = (m) => (msg.server && m.dmServer && msg.server !== m.dmServer) ||
+        (msg.client && m.dmClient && msg.client !== m.dmClient);
+      // 只有曾经通过 DOM 水位、仅因精度不明而暂缓的这条消息，才允许补齐身份后再判一次。
+      const retry = k.onScreen && priorRows.some((m) => m.dmSource === 'dom-check' && !conflicts(m) &&
+        (matchesId(m) || (m.dmTime === at && msg.server)));
+      if (k.onScreen && previous && last.at <= previous && !retry) continue;
+      const processed = priorRows.filter((m) => m.dmSource !== 'dom-check' && !(k.onScreen && m.dmSource === 'context-window'));
+      if (processed.some(matchesId)) continue;
+      const compatible = processed.filter((m) => !conflicts(m));
+      if (k.onScreen && !retry && anchor?.domSdkAt === at && compatible.some((m) => m.dmTime === at)) continue;
+      const ambiguous = compatible.some((m) => {
+        if (k.onScreen && (m.dmSource ?? 'dom') === 'dom') return false;
         const observedAt = m.dmTime ?? m.at;
         return observedAt === at || observedAt.endsWith('.000Z') || at.endsWith('.000Z');
       });
-      if (seen) continue;
+      if (ambiguous) {
+        if (k.onScreen) sources.set(k.nativeId, 'dom-check');
+        continue;
+      }
       sources.set(k.nativeId, source);
     }
     emit(db, ctx, { id: `dm.received:${id}:${at}`, type: 'dm.received', subjectId: id, occurredAt: at,
       payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at } });
   }
   const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, dmSource, dmServer, dmClient, dmTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-  const mark = db.prepare(`UPDATE messages SET dmSource=CASE WHEN dmSource='seen' THEN ? ELSE dmSource END,
+  const mark = db.prepare(`UPDATE messages SET dmSource=CASE WHEN dmSource IN ('seen','dom-check','context-window') AND ?!='seen' THEN ? ELSE dmSource END,
     dmServer=coalesce(dmServer,?), dmClient=coalesce(dmClient,?) WHERE id=? AND accountId=? AND conversationId=?`);
   for (const m of snap.messages) {
     const id = joinId(code, m.nativeId), convId = joinId(code, m.conversationNativeId);
@@ -214,7 +230,7 @@ function upsertConversations(db, ctx, snap) {
     const r = insMsg.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at,
       source, m.server ?? null, m.client ?? null, m.sdkAt ?? null);
     if (r.changes) ctx.stats.inserted++;
-    else if (source) mark.run(source, m.server ?? null, m.client ?? null, id, ctx.accountId, convId);
+    else if (source) mark.run(source, source, m.server ?? null, m.client ?? null, id, ctx.accountId, convId);
   }
 }
 
