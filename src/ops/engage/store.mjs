@@ -123,7 +123,8 @@ const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生�
 
 // 抖音每个会话只带最后一条消息。把实际插入结果交给事件派发，重读和撤回也可以更新会话展示。
 function insertMessages(db, ctx, messages) {
-  const insert = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, douyinServerId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const confirmServer = db.prepare('UPDATE messages SET douyinServerId = ? WHERE id = ? AND conversationId = ? AND douyinServerId IS NULL');
   const remember = db.prepare('INSERT OR IGNORE INTO douyin_dm_client_ids (conversationId, clientId, serverId) VALUES (?, ?, ?)');
   const lookup = db.prepare('SELECT serverId FROM douyin_dm_client_ids WHERE conversationId = ? AND clientId = ?');
   const promoteClient = db.prepare('UPDATE OR IGNORE messages SET id = ? WHERE conversationId = ? AND id = ?');
@@ -156,10 +157,12 @@ function insertMessages(db, ctx, messages) {
         if (promoted.changes && timestampId !== id) remember.run(convId, m.legacy.timestampId, id);
       }
     }
-    const inserted = insert.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at).changes > 0;
+    const serverId = ctx.code === 'Douyin' ? m.serverId ?? null : null;
+    const inserted = insert.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at, serverId).changes > 0;
+    if (!inserted && serverId) confirmServer.run(serverId, id, convId);
     if (inserted) ctx.stats.inserted++;
     if (ctx.code === 'Douyin' && m.by === 'peer') {
-      douyinPeers.set(m.conversationNativeId, { at: m.at, nativeId: m.nativeId, usesTimestampKey: m.usesTimestampKey, inserted });
+      douyinPeers.set(m.conversationNativeId, { at: m.at, id, nativeId: m.nativeId, serverId, usesTimestampKey: m.usesTimestampKey, inserted });
     }
   }
   return douyinPeers;
@@ -172,6 +175,8 @@ function upsertConversations(db, ctx, snap) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
   const hasEventId = db.prepare('SELECT 1 FROM events WHERE id = ?');
+  const sameTimePeers = db.prepare(`SELECT count(*) AS total, count(CASE WHEN douyinServerId <> ? THEN 1 END) AS distinctServers
+    FROM messages WHERE conversationId = ? AND at = ? AND by = 'peer' AND id <> ?`);
   const peerMessages = insertMessages(db, ctx, snap.messages);
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
@@ -218,14 +223,25 @@ function upsertConversations(db, ctx, snap) {
     const baselineAt = k.isStranger ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt) : ctx.contextBaselineAt;
     const historical = baselineAt != null && incomingLastMs < Date.parse(baselineAt);
     if (before?.lastAt == null) {
-      if (historical || ctx.firstContextSync || (k.isStranger && ctx.firstStrangerSync)) continue;
+      const needsBaseline = ctx.firstContextSync || (k.isStranger && ctx.firstStrangerSync);
+      if (historical) continue;
+      if (needsBaseline && (!Number.isFinite(ctx.previousDmFinishMs) || incomingLastMs < ctx.previousDmFinishMs)) continue;
     } else {
       if (incomingLastMs < beforeLastMs) continue;
       // 只有会话摘要时沿用 main 的严格时间比较；抖音能从新插入的消息区分同毫秒的不同 ID。
       if (incomingLastMs === beforeLastMs && (historical || peerMessage?.at !== last.at || peerMessage.usesTimestampKey)) continue;
     }
     let eventId = `dm.received:${id}:${last.at}`;
-    if (peerMessage && hasEventId.get(eventId)) eventId += `:${peerMessage.nativeId}`;
+    if (peerMessage) {
+      // 新插入的 clientId / 时间键也可能来自同一条私信。只有能与每一条同时间 peer 行区分才派发。
+      const prior = sameTimePeers.get(peerMessage.serverId, id, last.at, peerMessage.id);
+      if (prior.total !== prior.distinctServers) continue;
+      if (!prior.total && before?.lastBy === 'peer' && beforeLastMs === incomingLastMs) continue;
+      if (hasEventId.get(eventId)) {
+        if (!prior.total) continue;
+        eventId += `:${peerMessage.nativeId}`;
+      }
+    }
     emit(db, ctx, { id: eventId, type: 'dm.received', subjectId: id, occurredAt: last.at,
       payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
   }
@@ -265,6 +281,12 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
       ctx.strangerBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:stranger');
       ctx.firstContextSync = ctx.isContext && ctx.contextBaselineAt == null;
       ctx.firstStrangerSync = ctx.isContext && ctx.strangerBaselineAt == null;
+      if (ctx.firstContextSync) {
+        const { finishedAt } = db.prepare(`SELECT max(finishedAt) AS finishedAt FROM sync_jobs
+          WHERE platformCode = ? AND accountId = ? AND kind = 'dms' AND status = 'ok'`).get(ctx.code, ctx.accountId);
+        // 没有成功任务可作水位时，首次读到的新会话仍只建基线。
+        ctx.previousDmFinishMs = Date.parse(finishedAt);
+      }
     }
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);

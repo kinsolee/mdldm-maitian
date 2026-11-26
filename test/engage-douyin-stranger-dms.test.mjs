@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { migrateEngage } from '../src/ops/engage-db.mjs';
 import { readDmContext, rawDms, parseDms } from '../src/ops/engage/adapters/douyin.mjs';
 import { shapeErrors } from '../src/ops/engage/adapters/shape.mjs';
-import { ingestSnapshot } from '../src/ops/engage/store.mjs';
+import { createJob, finishJob, ingestSnapshot } from '../src/ops/engage/store.mjs';
 import { listEvents } from '../src/ops/engage/query.mjs';
 import { subscribe } from '../src/ops/engage/subscribers.mjs';
 import { setCapability } from '../src/ops/accounts.mjs';
@@ -733,7 +733,7 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
 
     // 2. 撤回后对方发来时间戳与被撤回消息相同（t2）但 ID 不同（m3）的新消息 -> 正常更新并派发
     const rAfterRecallNew = ingestSnapshot(db, acc, {
-      ...dmsSnap([conv('c1', { by: 'peer', at: t2, text: '对方新消息m3' })], [{ nativeId: 'm3', conversationNativeId: 'c1', by: 'peer', at: t2, type: 'text', text: '对方新消息m3' }]),
+      ...dmsSnap([conv('c1', { by: 'peer', at: t2, text: '对方新消息m3' })], [{ nativeId: 'm3', serverId: 'm3', conversationNativeId: 'c1', by: 'peer', at: t2, type: 'text', text: '对方新消息m3' }]),
       via: 'dom',
     }, { now: at(T0 + 8 * MIN) });
     assert.deepEqual(rAfterRecallNew.events, [`dm.received:Douyin:c1:${t2}`]);
@@ -741,13 +741,13 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
 
     // 3. 未经撤回中间态、同一时间戳 t2 对方连发不同 ID 的新消息 m4 -> 也更新并派发，再次同步不重复
     const rSameTs = ingestSnapshot(db, acc, {
-      ...dmsSnap([conv('c1', { by: 'peer', at: t2, text: '同毫秒第二句m4' })], [{ nativeId: 'm4', conversationNativeId: 'c1', by: 'peer', at: t2, type: 'text', text: '同毫秒第二句m4' }]),
+      ...dmsSnap([conv('c1', { by: 'peer', at: t2, text: '同毫秒第二句m4' })], [{ nativeId: 'm4', serverId: 'm4', conversationNativeId: 'c1', by: 'peer', at: t2, type: 'text', text: '同毫秒第二句m4' }]),
       via: 'dom',
     }, { now: at(T0 + 9 * MIN) });
     assert.deepEqual(rSameTs.events, [`dm.received:Douyin:c1:${t2}:m4`]);
     assert.equal(db.prepare("SELECT lastText FROM conversations WHERE id = 'Douyin:c1'").get().lastText, '同毫秒第二句m4');
     const rSameTsRepeat = ingestSnapshot(db, acc, {
-      ...dmsSnap([conv('c1', { by: 'peer', at: t2, text: '同毫秒第二句m4' })], [{ nativeId: 'm4', conversationNativeId: 'c1', by: 'peer', at: t2, type: 'text', text: '同毫秒第二句m4' }]),
+      ...dmsSnap([conv('c1', { by: 'peer', at: t2, text: '同毫秒第二句m4' })], [{ nativeId: 'm4', serverId: 'm4', conversationNativeId: 'c1', by: 'peer', at: t2, type: 'text', text: '同毫秒第二句m4' }]),
       via: 'dom',
     }, { now: at(T0 + 10 * MIN) });
     assert.deepEqual(rSameTsRepeat.events, [], '重复同步同一 m4 不重复派发');
@@ -891,61 +891,125 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     return item;
   }
 
-  test('main 已派发的数值小数秒 + serverId="0" 重读时原行升级，不重复派发', async () => {
-    const db = freshDb(':memory:');
-    db.exec(mainPromotions);
-    const rows = db.prepare("SELECT id, at FROM messages WHERE conversationId='Douyin:legacy-zero'");
-    assert.equal(rows.get().at, '2026-11-19T02:00:00.000Z');
-    const item = oldZeroItem();
-    item.lastMessage.clientMessageId = null; // main 有无 clientId 生成的整份存量 fixture 完全相同
-    for (const via of ['dom', 'api']) {
-      const snap = await collectFixture([item], via);
+  for (const readVia of ['dom', 'api']) {
+    test(`${readVia}：main 已派发的数值小数秒 + serverId="0" 重读时原行升级，不重复派发`, async () => {
+      const db = freshDb(':memory:');
+      db.exec(mainPromotions);
+      const rows = db.prepare("SELECT id, at FROM messages WHERE conversationId='Douyin:legacy-zero'");
+      assert.equal(rows.get().at, '2026-11-19T02:00:00.000Z');
+      const item = oldZeroItem();
+      item.lastMessage.clientMessageId = null; // main 有无 clientId 生成的整份存量 fixture 完全相同
+      const snap = await collectFixture([item], readVia);
       assert.equal(snap.messages[0].at, '2026-11-19T02:00:00.456Z');
       const result = ingestSnapshot(db, douyin(db), snap, { now: at(T0 + MIN) });
       assert.deepEqual(result.events, []);
       assert.equal(result.inserted, 0);
-    }
-    assert.deepEqual(rows.all().map((r) => [r.id, r.at]), [['Douyin:legacy-zero:1795053600', '2026-11-19T02:00:00.456Z']]);
-    // 旧键先升级为 clientId，再补为 serverId，回放纯时间键的旧快照也不新增。
-    for (const [serverId, clientMessageId] of [['0', 'client-5'], ['server-5', 'client-5'], [null, null]]) {
-      Object.assign(item.lastMessage, { serverId, clientMessageId });
-      const r = ingestSnapshot(db, douyin(db), await collectFixture([item], 'dom'), { now: at(T0 + MIN) });
-      assert.equal(r.inserted, 0);
-      assert.deepEqual(r.events, []);
-    }
-    assert.equal(db.prepare("SELECT count(*) AS n FROM events WHERE subjectId='Douyin:legacy-zero'").get().n, 1);
-    db.close();
-  });
+      assert.deepEqual(rows.all().map((r) => [r.id, r.at]), [['Douyin:legacy-zero:1795053600', '2026-11-19T02:00:00.456Z']]);
+      // 旧键先升级为 clientId，再补为 serverId，回放纯时间键的旧快照也不新增。
+      for (const [serverId, clientMessageId] of [['0', 'client-5'], ['server-5', 'client-5'], [null, null]]) {
+        Object.assign(item.lastMessage, { serverId, clientMessageId });
+        const r = ingestSnapshot(db, douyin(db), await collectFixture([item], 'dom'), { now: at(T0 + MIN) });
+        assert.equal(r.inserted, 0);
+        assert.deepEqual(r.events, []);
+      }
+      assert.equal(db.prepare("SELECT count(*) AS n FROM events WHERE subjectId='Douyin:legacy-zero'").get().n, 1);
+      db.close();
+    });
 
-  test('main 的 0 键或时间兜底键直接补齐真实 serverId，仅更新旧行', async () => {
+    test(`${readVia}：main 的 0 键或时间兜底键直接补齐真实 serverId，仅更新旧行`, async () => {
+      const db = freshDb(':memory:');
+      db.exec(mainPromotions);
+      const zero = oldZeroItem();
+      const anon = sdkConv('legacy-time', { atMs: '1795053600.4567', text: 'fixture' });
+      // 同会话、同方向、同一时间的另一条已具备真实 ID 的消息，不能占用旧 0 键。
+      const other = oldZeroItem();
+      Object.assign(other.lastMessage, { serverId: 'distinct', clientMessageId: 'another-client', content: '{"text":"different"}' });
+      const control = freshDb(':memory:');
+      control.exec(mainPromotions);
+      const distinct = ingestSnapshot(control, douyin(control), await collectFixture([other], 'dom'), { now: at(T0 + MIN) });
+      assert.equal(distinct.inserted, 1);
+      assert.ok(control.prepare("SELECT 1 FROM messages WHERE id='Douyin:0'").get());
+      control.close();
+      zero.lastMessage.serverId = 'server-5';
+      anon.lastMessage.serverId = 'server-anon';
+      const sync = async (via) => {
+        const snap = await collectFixture([zero, anon], via);
+        const stats = ingestSnapshot(db, douyin(db), snap, { now: at(T0 + MIN) });
+        assert.deepEqual(stats.events, []);
+        assert.equal(stats.inserted, 0);
+      };
+      await sync(readVia);
+      // 另一条路径读回补齐前的快照，仍能找到同一行。
+      zero.lastMessage.serverId = '0';
+      anon.lastMessage.serverId = null;
+      await sync(readVia === 'dom' ? 'api' : 'dom');
+      assert.deepEqual(db.prepare('SELECT id FROM messages ORDER BY id').all().map((r) => r.id), ['Douyin:server-5', 'Douyin:server-anon']);
+      assert.equal(db.prepare("SELECT count(*) AS n FROM events WHERE type='dm.received'").get().n, 2);
+      db.close();
+    });
+
+    test(`${readVia}：同时间的 peer 消息必须能比较 serverId 才可再派发`, async () => {
+      // S4 原样重读，另外覆盖正文变化和服务端 ID 确实不同的对照。
+      for (const [oldServer, oldClient, newServer, newClient, expected] of [
+        ['S1', null, null, 'C1', 0], [null, 'C1', 'S2', null, 0],
+        [null, null, 'S2', null, 0], ['0', null, 'S2', null, 0],
+        ['S1', null, 'S2', null, 1],
+      ]) {
+        const db = freshDb(':memory:');
+        const acc = douyin(db);
+        const sync = async (items) => ingestSnapshot(db, acc, await collectFixture(items, readVia), { now: at(T0 + MIN) });
+        const seed = sdkConv('seed', { atMs: T0 });
+        await sync([seed]);
+        const item = sdkConv('thread', { atMs: T0 + 2 * MIN });
+        Object.assign(item.lastMessage, { serverId: oldServer, clientMessageId: oldClient });
+        assert.equal((await sync([item])).events.length, 1);
+        Object.assign(item.lastMessage, { serverId: newServer, clientMessageId: newClient });
+        if (oldServer !== 'S1' || newServer !== null) item.lastMessage.content = '{"text":"other"}';
+        assert.equal((await sync([item])).events.length, expected);
+        assert.equal((await sync([item])).events.length, 0);
+        db.close();
+      }
+    });
+
+    test(`${readVia}：旧库时间键、0 或空主键不能证明同时间出现了新的 peer 消息`, async () => {
+      for (const oldKey of ['Douyin:0', 'Douyin:', 'Douyin:old-zero:1795053600']) {
+        const db = freshDb(':memory:');
+        db.exec(mainRows);
+        db.prepare("UPDATE messages SET id = ? WHERE id = 'Douyin:0'").run(oldKey);
+        const item = sdkConv('old-zero', { atMs: '1795053600', serverId: 'S2', text: 'other' });
+        const snap = await collectFixture([item], readVia);
+        const result = ingestSnapshot(db, douyin(db), snap, { now: at(T0 + MIN) });
+        assert.equal(result.inserted, 1);
+        assert.deepEqual(result.events, []);
+        db.close();
+      }
+    });
+  }
+
+  test('首次开启 Context 按同账号上次成功私信任务的完成时间派发新会话', async () => {
     const db = freshDb(':memory:');
-    db.exec(mainPromotions);
-    const zero = oldZeroItem();
-    const anon = sdkConv('legacy-time', { atMs: '1795053600.4567', text: 'fixture' });
-    // 同会话、同方向、同一时间的另一条已具备真实 ID 的消息，不能占用旧 0 键。
-    const other = oldZeroItem();
-    Object.assign(other.lastMessage, { serverId: 'distinct', clientMessageId: 'another-client', content: '{"text":"different"}' });
-    const control = freshDb(':memory:');
-    control.exec(mainPromotions);
-    const distinct = ingestSnapshot(control, douyin(control), await collectFixture([other], 'dom'), { now: at(T0 + MIN) });
-    assert.equal(distinct.inserted, 1);
-    assert.ok(control.prepare("SELECT 1 FROM messages WHERE id='Douyin:0'").get());
-    control.close();
-    zero.lastMessage.serverId = 'server-5';
-    anon.lastMessage.serverId = 'server-anon';
-    const sync = async (via) => {
-      const snap = await collectFixture([zero, anon], via);
-      const stats = ingestSnapshot(db, douyin(db), snap, { now: at(T0 + MIN) });
-      assert.deepEqual(stats.events, []);
-      assert.equal(stats.inserted, 0);
-    };
-    await sync('api');
-    // 随后 DOM 又读到补齐前的快照，仍能找到同一行。
-    zero.lastMessage.serverId = '0';
-    anon.lastMessage.serverId = null;
-    await sync('dom');
-    assert.deepEqual(db.prepare('SELECT id FROM messages ORDER BY id').all().map((r) => r.id), ['Douyin:server-5', 'Douyin:server-anon']);
-    assert.equal(db.prepare("SELECT count(*) AS n FROM events WHERE type='dm.received'").get().n, 2);
+    const acc = douyin(db);
+    function job(accountId, kind, status, ms) {
+      const id = createJob(db, { accountId, kind, platformCode: 'Douyin', now: at(T0) });
+      finishJob(db, id, { status, now: at(ms) });
+    }
+    const seed = sdkConv('seed', { atMs: T0 });
+    ingestSnapshot(db, acc, await collectFixture([seed], 'dom'), { now: at(T0) });
+    job(acc.id, 'dms', 'ok', T0);
+    job(acc.id, 'dms', 'ok', T0 + MIN);
+    job(acc.id, 'dms', 'failed', T0 + 4 * MIN);
+    job(acc.id, 'comments', 'ok', T0 + 4 * MIN);
+    job('Douyin:other', 'dms', 'ok', T0 + 4 * MIN);
+    const items = [
+      sdkConv('old', { atMs: T0 + MIN - 1 }), sdkConv('equal', { atMs: T0 + MIN }),
+      sdkConv('new', { atMs: T0 + 2 * MIN }), sdkConv('stranger', { atMs: T0 + 3 * MIN, stranger: true }),
+    ];
+    const snap = await collectFixture(items, 'api');
+    const res = ingestSnapshot(db, acc, snap, { now: at(T0 + 5 * MIN) });
+    assert.equal(res.events.length, 3);
+    assert.deepEqual(db.prepare('SELECT subjectId FROM events ORDER BY subjectId').all().map((e) => e.subjectId),
+      ['Douyin:equal', 'Douyin:new', 'Douyin:stranger']);
+    assert.deepEqual(ingestSnapshot(db, acc, snap, { now: at(T0 + 6 * MIN) }).events, []);
     db.close();
   });
 

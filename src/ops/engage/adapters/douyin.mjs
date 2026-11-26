@@ -586,6 +586,7 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
       const nativeId = serverId ?? clientId ?? fallback;
       const mainId = String(lm.serverId ?? lm.clientMessageId ?? fallback);
       messages.push({ nativeId, conversationNativeId: id, by: last.by, at, type: last.type, text: last.text,
+        ...(serverId ? { serverId } : {}),
         ...(clientId ? { clientId } : {}),
         ...(!serverId && !clientId ? { usesTimestampKey: true } : {}),
         legacy: { nativeId: mainId, timestampId: fallback, at: isoOf(mainTimestamp) } });

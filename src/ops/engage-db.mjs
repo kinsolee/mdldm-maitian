@@ -102,6 +102,8 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt)
   addColumnIfMissing(db, 'events', 'filteredReason', 'TEXT');
   // 对方发出时间（ISO，UTC）：评论取 comments.createdAt，私信取 last.at；旧行与系统事件为 NULL。createdAt 保持入库时间不变
   addColumnIfMissing(db, 'events', 'occurredAt', 'TEXT');
+  // 只有 SDK 明确给出的 serverId 才能区分同时间的两条对方私信；旧行保留 NULL。
+  addColumnIfMissing(db, 'messages', 'douyinServerId', 'TEXT');
   // 自动关分两组：write（回复、私信）、moderate（删评论、拉黑、删会话）。旧记录 NULL 当 write
   addColumnIfMissing(db, 'engage_write_trips', 'family', 'TEXT');
 }
