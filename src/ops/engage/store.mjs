@@ -22,14 +22,14 @@ function tx(db, fn) {
 }
 
 /** 写一条事件；已存在（同 id）就什么都不做。返回是否新写了。 */
-export function insertEvent(db, { id, type, platformCode, accountId, subjectId, createdAt, payload }) {
-  const r = db.prepare('INSERT OR IGNORE INTO events (id, type, platformCode, accountId, subjectId, createdAt, payload) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(id, type, platformCode, accountId ?? null, subjectId ?? null, createdAt, JSON.stringify(payload ?? {}));
+export function insertEvent(db, { id, type, platformCode, accountId, subjectId, createdAt, occurredAt = null, payload }) {
+  const r = db.prepare('INSERT OR IGNORE INTO events (id, type, platformCode, accountId, subjectId, createdAt, occurredAt, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(id, type, platformCode, accountId ?? null, subjectId ?? null, createdAt, occurredAt ?? null, JSON.stringify(payload ?? {}));
   return r.changes > 0;
 }
 
 // 基线：这个账号这种 kind 成功入库过一次（哪怕是空的）。在 ingestSnapshot 的事务里写，和当前 job 有没有 finishJob 无关
-const hasBaseline = (db, accountId, kind) => !!db.prepare('SELECT 1 FROM engage_baselines WHERE accountId = ? AND kind = ?').get(accountId, kind);
+const getBaselineAt = (db, accountId, kind) => db.prepare('SELECT establishedAt FROM engage_baselines WHERE accountId = ? AND kind = ?').get(accountId, kind)?.establishedAt ?? null;
 const setBaseline = (db, accountId, kind, at) => db.prepare('INSERT OR IGNORE INTO engage_baselines (accountId, kind, establishedAt) VALUES (?, ?, ?)').run(accountId, kind, at);
 
 function upsertWorks(db, ctx, works) {
@@ -97,7 +97,7 @@ function upsertComments(db, ctx, snap) {
     ctx.stats.inserted++;
     if (ctx.firstSync || c.author?.isMe) continue;
     const w = workOf.get(workId) ?? {};   // upsertWorks 已先跑：库里是合并后的值（快照里 title 为 null 不会盖掉旧的）
-    emit(db, ctx, { id: `comment.created:${id}`, type: 'comment.created', subjectId: id,
+    emit(db, ctx, { id: `comment.created:${id}`, type: 'comment.created', subjectId: id, occurredAt: c.createdAt ?? null,
       payload: { workId, workTitle: w.title ?? null, workUrl: w.url ?? null, commentId: id, rootId: p.rootId, parentId: p.parentId, nickname: c.author?.nickname ?? null, text: snippet(c.text) } });
   }
   markGone(db, ctx, snap.scannedWorks, seen, unresolved);
@@ -118,31 +118,153 @@ function markGone(db, ctx, scannedWorks, seen, unresolved) {
   for (const workId of unresolved) partial.run(workId, 1, ctx.at);   // 没在 scannedWorks 里的作品
 }
 
+const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生人消息';
+
 function upsertConversations(db, ctx, snap) {
   const { code } = ctx;
-  const prev = db.prepare('SELECT lastAt FROM conversations WHERE id = ?');
+  const prev = db.prepare('SELECT peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend FROM conversations WHERE id = ?');
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
-  // last 为 null 是「这一轮没读到」（例如小红书没打开的会话），不是「没有最后一句」：库里已有的不动
-  const updKeepLast = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, canSend = ?, updatedAt = ? WHERE id = ?');
+  const messages = new Map(snap.messages.map((m) => [m.conversationNativeId, m]));
+  const baseline = db.prepare('SELECT lastAt, domLastAt, domSdkAt FROM douyin_dm_baselines WHERE accountId=? AND conversationId=?');
+  const saveBaseline = db.prepare(`INSERT INTO douyin_dm_baselines (accountId,conversationId,lastAt,domLastAt,domSdkAt) VALUES (?,?,?,?,?)
+    ON CONFLICT(accountId,conversationId) DO UPDATE SET domLastAt=coalesce(excluded.domLastAt,domLastAt), domSdkAt=coalesce(excluded.domSdkAt,domSdkAt)`);
+  // ID 已知时，正文和时间显示可以任意变化；仅在两路身份不可比时才比对同秒的可见内容。
+  const matching = db.prepare(`SELECT id, at, dmSource, dmServer, dmClient, dmTime, type, text FROM messages
+    WHERE conversationId=? AND accountId=? AND by='peer' AND (dmSource IS NULL OR dmSource!='seen')
+    AND (dmServer=? OR dmClient=? OR id IN (?,?) OR (at BETWEEN ? AND ? AND type IS ? AND text IS ?))`);
+  const settle = db.prepare(`UPDATE messages SET dmSource='dom', dmServer=coalesce(dmServer,?), dmClient=coalesce(dmClient,?)
+    WHERE id=? AND dmSource='dom-check'`);
+  function decide(msg, id, { onScreen, advanced, previousSdk, evidenceOnly = false }) {
+    const at = msg.sdkAt ?? msg.at;
+    const second = at.slice(0, 19);
+    const server = msg.server ?? null, client = msg.client ?? null;
+    const serverKey = server && joinId(code, server), clientKey = client && joinId(code, client);
+    const rows = matching.all(id, ctx.accountId, server, client, serverKey, clientKey,
+      second + '.000Z', second + '.999Z', msg.type, msg.text);
+    const sameId = (m) => (server && (server === m.dmServer || serverKey === m.id)) ||
+      (client && (client === m.dmClient || clientKey === m.id));
+    const conflicts = (m) => (server && m.dmServer && server !== m.dmServer) ||
+      (client && m.dmClient && client !== m.dmClient);
+    const waiting = rows.filter((m) => m.dmSource === 'dom-check' && !conflicts(m));
+    let pending = waiting.filter(sameId);
+    if (!pending.length && server) {
+      const exact = waiting.filter((m) => m.dmTime === at && m.type === msg.type && m.text === msg.text);
+      if (exact.length === 1) pending = exact;
+    }
+    if (!pending.length && (evidenceOnly || (onScreen && !advanced))) return 'seen';
+    const handled = rows.filter((m) => m.dmSource !== 'dom-check' && !(onScreen && m.dmSource === 'context-window'));
+    const known = handled.some(sameId);
+    if (!known) {
+      const compatible = handled.filter((m) => !conflicts(m));
+      if (onScreen && !pending.length && previousSdk === at && compatible.some((m) => m.dmTime === at)) return 'seen';
+      const ambiguous = compatible.some((m) => {
+        if (onScreen && (m.dmSource ?? 'dom') === 'dom') return false;
+        const observedAt = m.dmTime ?? m.at;
+        return observedAt === at || observedAt.endsWith('.000Z') || at.endsWith('.000Z');
+      });
+      if (ambiguous) return onScreen ? 'dom-check' : 'seen';
+    }
+    // 补派和结清所有匹配的旧键在同一事务；旧客户端键重现时也能命中。
+    for (const m of pending) settle.run(server, client, m.id);
+    return known ? 'seen' : 'emit';
+  }
+  const notifyPeer = (id, nickname, text, at) => emit(db, ctx, {
+    id: `dm.received:${id}:${at}`, type: 'dm.received', subjectId: id, occurredAt: at,
+    payload: { conversationId: id, nickname, text: snippet(text), at },
+  });
+  const sources = new Map();
+  // 首次走 Context 的任务水位可能晚于账号采集基线。夹在两者之间的首屏外消息留给 DOM。
+  const captureAt = ctx.code === 'Douyin' && (getBaselineAt(db, ctx.accountId, 'dms:capture') ?? ctx.domCutoff ?? getBaselineAt(db, ctx.accountId, 'dms'));
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
-    const last = k.last ?? null;
-    const vals = [ctx.accountId, code, k.peer?.uid ?? null, k.peer?.nickname ?? null, k.peer?.kind ?? null, k.unread ?? 0,
-      last?.by ?? null, last?.at ?? null, last?.text ?? null, last?.type ?? null, bool(k.canSend)];
+    const last = k.last;
     const before = prev.get(id);
-    if (before && !last) { updKeepLast.run(...vals.slice(0, 6), vals[10], ctx.at, id); ctx.stats.updated++; }
-    else if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; } else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
-    const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !ctx.firstSync;
-    if (last?.by !== 'peer' || !last.at || !isNewer) continue;
-    emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id,
-      payload: { conversationId: id, nickname: k.peer?.nickname ?? null, text: snippet(last.text), at: last.at } });
+    // last 为 null 是「这一轮没读到」（例如小红书没打开的会话），不是「没有最后一句」：库里已有的不动
+    // peerUid / peerNickname 读不到（例如首屏外 Context 会话没有 DOM 昵称）时保留库里已有值
+    const nextUid = k.peer?.uid ?? before?.peerUid ?? null;
+    const incomingNick = k.peer?.nickname != null && !isPlaceholderNick(k.peer.nickname) ? k.peer.nickname : null;
+    const prevNick = before?.peerNickname != null && !isPlaceholderNick(before.peerNickname) ? before.peerNickname : null;
+    const nextNick = incomingNick ?? prevNick;
+    const nextKind = k.peer?.kind ?? before?.peerKind ?? null;
+    const nextUnread = k.unread ?? 0;
+    const nextCanSend = bool(k.canSend);
+    const keepLast = !last;
+    const nextLastBy = keepLast ? (before?.lastBy ?? null) : (last.by ?? null);
+    const nextLastAt = keepLast ? (before?.lastAt ?? null) : (last.at ?? null);
+    const nextLastText = keepLast ? (before?.lastText ?? null) : (last.text ?? null);
+    const nextLastType = keepLast ? (before?.lastType ?? null) : (last.type ?? null);
+    const vals = [ctx.accountId, code, nextUid, nextNick, nextKind, nextUnread,
+      nextLastBy, nextLastAt, nextLastText, nextLastType, nextCanSend];
+    const changed = !before
+      || nextUid !== before.peerUid
+      || nextNick !== before.peerNickname
+      || nextKind !== before.peerKind
+      || nextUnread !== before.unread
+      || nextCanSend !== before.canSend
+      || nextLastBy !== before.lastBy
+      || nextLastAt !== before.lastAt
+      || nextLastText !== before.lastText
+      || nextLastType !== before.lastType;
+    if (changed) ctx.stats.changedConversations++;
+    if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
+    else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
+    const msg = messages.get(k.nativeId);
+    const scoped = code === 'Douyin' && k.onScreen != null;
+    const source = k.onScreen ? 'dom' : 'context';
+    const anchor = scoped && baseline.get(ctx.accountId, id);
+    const priorDom = anchor ? anchor.domLastAt : before?.lastAt;
+    const cutoff = (k.onScreen || snap.via === 'dom-fallback' ? ctx.domCutoff : null) ?? ctx.contextCutoff;
+    const advancesKnownThread = scoped && before?.lastAt && last?.at > (anchor?.lastAt ?? before.lastAt);
+    const domAdvanced = scoped && k.onScreen && priorDom && last?.at > priorDom;
+    const enteredDom = scoped && k.onScreen && anchor && !priorDom && captureAt && last?.at >= captureAt;
+    const historical = cutoff && last?.at < cutoff && !advancesKnownThread && !domAdvanced && !enteredDom;
+    if (scoped) {
+      const isBaseline = ctx.firstSync || historical;
+      const baselineAt = before?.lastAt ?? (isBaseline ? last?.at : null) ?? null;
+      const domAt = (k.onScreen && last ? last.at : priorDom) ?? null;
+      saveBaseline.run(ctx.accountId, id, baselineAt, domAt, k.onScreen ? msg?.sdkAt ?? null : null);
+      const windowOnly = historical && !k.onScreen && !ctx.firstSync && last?.at >= captureAt;
+      sources.set(k.nativeId, windowOnly ? 'context-window' : isBaseline ? source : 'seen');
+    }
+    if (ctx.firstSync || historical || last?.by !== 'peer' || !last.at) continue;
+    const previous = scoped && k.onScreen ? priorDom : before?.lastAt;
+    if (!scoped && previous && last.at <= previous) continue;
+    if (scoped && !k.onScreen && anchor?.lastAt && last.at <= anchor.lastAt) continue;
+    const at = msg?.sdkAt ?? last.at;
+    if (scoped && msg) {
+      const decision = decide(msg, id, { onScreen: k.onScreen, advanced: !previous || last.at > previous, previousSdk: anchor?.domSdkAt });
+      sources.set(k.nativeId, decision === 'emit' ? source : decision);
+      if (decision !== 'emit') continue;
+    }
+    notifyPeer(id, nextNick, last.text, at);
   }
-  const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const insMsg = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, dmSource, dmServer, dmClient, dmTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const mark = db.prepare(`UPDATE messages SET dmSource=CASE WHEN dmSource IN ('seen','dom-check','context-window') AND ?!='seen' THEN ? ELSE dmSource END,
+    dmServer=coalesce(dmServer,?), dmClient=coalesce(dmClient,?) WHERE id=? AND accountId=? AND conversationId=?`);
+  // 老版本可能用全局 0 键存过一行。仅原会话的原观测可沿用该行；新消息始终使用有效键。
+  const legacyZero = db.prepare(`SELECT id FROM messages WHERE id='Douyin:0' AND accountId=? AND conversationId=?
+    AND at=? AND by=? AND type IS ? AND text IS ? AND (dmClient IS NULL OR dmClient IS ?)`);
   for (const m of snap.messages) {
-    const r = insMsg.run(joinId(code, m.nativeId), joinId(code, m.conversationNativeId), ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at);
+    const convId = joinId(code, m.conversationNativeId);
+    const source = sources.get(m.conversationNativeId) ?? null;
+    const legacy = source !== 'dom-check' && m.legacyZero && legacyZero.get(ctx.accountId, convId, m.at, m.by, m.type, m.text, m.client);
+    const id = legacy?.id ?? joinId(code, m.nativeId);
+    const r = insMsg.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at,
+      source, m.server ?? null, m.client ?? null, m.sdkAt ?? null);
     if (r.changes) ctx.stats.inserted++;
+    else if (source) {
+      const updated = mark.run(source, source, m.server ?? null, m.client ?? null, id, ctx.accountId, convId);
+      if (source === 'dom-check' && !updated.changes) throw new Error('暂缓私信未写入，重试本轮采集');
+    }
+  }
+  // DOM 仍决定会话末条。覆盖它的 Context 观测只允许结清此前已由 DOM 暂缓的消息。
+  for (const m of snap.contextPeers ?? []) {
+    const id = joinId(code, m.conversationNativeId);
+    if (decide(m, id, { onScreen: true, evidenceOnly: true }) === 'emit') {
+      notifyPeer(id, prev.get(id).peerNickname, m.text, m.sdkAt ?? m.at);
+    }
   }
 }
 
@@ -161,13 +283,48 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
   const kind = snapshot.kind;
   if (!SYNC_KINDS.includes(kind)) throw new Error(`快照 kind 要是 comments 或 dms：${kind}`);
   const snap = { works: [], comments: [], scannedWorks: [], conversations: [], messages: [], ...snapshot };
-  const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats: { inserted: 0, updated: 0, gone: 0 } };
+  const stats = kind === 'dms'
+    ? {
+        inserted: 0, updated: 0, gone: 0,
+        changedConversations: 0,
+        strangerCount: typeof snap.strangerCount === 'number' ? snap.strangerCount : snap.conversations.filter((k) => k.isStranger === true).length,
+        ...(snap.via ? { via: snap.via } : {}),
+      }
+    : { inserted: 0, updated: 0, gone: 0 };
+  const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats };
   return tx(db, () => {
-    ctx.firstSync = !hasBaseline(db, ctx.accountId, kind);
+    const accountBaselineAt = getBaselineAt(db, ctx.accountId, kind);
+    ctx.firstSync = accountBaselineAt == null;
+    const douyinDms = kind === 'dms' && ctx.code === 'Douyin';
+    const context = douyinDms && snap.via === 'context';
+    const captureAt = snap.collectionStartedAt ?? snap.fetchedAt ?? ctx.at;
+    if (context || (douyinDms && snap.via === 'dom-fallback')) {
+      ctx.contextCutoff = getBaselineAt(db, ctx.accountId, 'dms:context');
+      ctx.domCutoff = getBaselineAt(db, ctx.accountId, 'dms:legacy-dom');
+      if (ctx.contextCutoff == null) {
+        const job = db.prepare(`SELECT startedAt FROM sync_jobs
+          WHERE platformCode = ? AND accountId = ? AND kind = 'dms' AND status = 'ok'
+          ORDER BY finishedAt DESC, rowid DESC LIMIT 1`).get(ctx.code, ctx.accountId);
+        const capturedBaseline = getBaselineAt(db, ctx.accountId, 'dms:capture');
+        const previousCapture = job?.startedAt ?? capturedBaseline;
+        ctx.contextCutoff = previousCapture ?? accountBaselineAt ?? captureAt;
+        if (accountBaselineAt && !capturedBaseline && !ctx.domCutoff) {
+          // main 旧库只记入库时间。上次已读到的最新消息是采集时刻的下界；
+          // 可见首屏沿用 main 处理两者之间的消息，Context 扩展出的历史列表仍用入库水位。
+          const { latest } = db.prepare(`SELECT max(at) AS latest FROM messages
+            WHERE accountId = ? AND firstSeenAt <= ? AND at <= ?`).get(ctx.accountId, accountBaselineAt, accountBaselineAt);
+          // 旧库空快照没有任何已见首屏消息。首屏继续按 main 处理，首屏外仍用 Context 水位。
+          ctx.domCutoff = latest ?? '0001-01-01T00:00:00.000Z';
+          setBaseline(db, ctx.accountId, 'dms:legacy-dom', ctx.domCutoff);
+        }
+      }
+    }
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);
     else upsertConversations(db, ctx, snap);
     setBaseline(db, ctx.accountId, kind, ctx.at);
+    if (douyinDms && ctx.firstSync) setBaseline(db, ctx.accountId, 'dms:capture', captureAt);
+    if (context) setBaseline(db, ctx.accountId, 'dms:context', ctx.contextCutoff);
     return { ...ctx.stats, events: ctx.events };
   });
 }

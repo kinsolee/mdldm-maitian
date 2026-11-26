@@ -21,10 +21,40 @@ import { acquireRoundLock, heldLock } from './round-lock.mjs';
 
 export const EXIT_LOCKED = 5;
 export const TICK_MS = 60_000;
+export const DM_DELAY_ALERT_MS = 2 * 3600_000;
+export const DM_DELAY_ALERT_COOLDOWN_MS = 6 * 3600_000;
 const CAP = { comments: 'readComments', dms: 'readDM' };
 const KIND_CN = { comments: '评论', dms: '私信' };
 const iso = (ms) => new Date(ms).toISOString();
 const localTime = (ms) => new Date(ms).toLocaleString('sv-SE', { hour12: false });
+
+function fmtDelay(ms) {
+  const mins = Math.round(ms / 60_000);
+  if (mins < 60) return `${mins} 分钟`;
+  return `${(ms / 3600_000).toFixed(1).replace(/\.0$/, '')} 小时`;
+}
+
+function checkDmDelay(db, eventIds, thresholdMs) {
+  if (!eventIds.length || !(thresholdMs > 0)) return null;
+  const get = db.prepare("SELECT createdAt, occurredAt FROM events WHERE id = ? AND type = 'dm.received' AND occurredAt IS NOT NULL");
+  let count = 0;
+  let maxDelayMs = 0;
+  for (const id of eventIds) {
+    const row = get.get(id);
+    if (!row) continue;
+    const delayMs = Date.parse(row.createdAt) - Date.parse(row.occurredAt);
+    if (Number.isFinite(delayMs) && delayMs >= thresholdMs) {
+      count++;
+      if (delayMs > maxDelayMs) maxDelayMs = delayMs;
+    }
+  }
+  return count ? { count, maxDelayMs } : null;
+}
+
+function recentlyDelayAlerted(db, accountId, nowMs) {
+  const cutoff = iso(nowMs - DM_DELAY_ALERT_COOLDOWN_MS);
+  return !!db.prepare("SELECT 1 FROM sync_jobs WHERE accountId = ? AND kind = 'dms' AND status = 'ok' AND finishedAt > ? AND json_extract(stats, '$.delayAlerted') = 1 LIMIT 1").get(accountId, cutoff);
+}
 
 /** 错误信息去敏（日志、库、飞书都用它），规则见 src/ops/engage/redact.mjs。 */
 export { redact };
@@ -60,7 +90,7 @@ async function safeNotify(notify, text, log) {
 }
 
 async function runJob(db, account, kind, jobId, deps) {
-  const { now, collect, notify, log } = deps;
+  const { now, collect, notify, log, dmDelayAlertMs = DM_DELAY_ALERT_MS } = deps;
   const name = `${PLATFORM_NAMES[account.platformCode] ?? account.platformCode}${KIND_CN[kind]}`;
   startJob(db, jobId, { now, accountId: account.id });
   let r;
@@ -70,12 +100,31 @@ async function runJob(db, account, kind, jobId, deps) {
   if (r?.ok === true) {
     try {
       const s = ingestSnapshot(db, account, r, { now });
-      const stats = { inserted: s.inserted, updated: s.updated, gone: s.gone, events: s.events.length };
+      const stats = kind === 'dms'
+        ? {
+            inserted: s.inserted, updated: s.updated, gone: s.gone, events: s.events.length,
+            changedConversations: s.changedConversations, strangerCount: s.strangerCount,
+            ...(s.via ? { via: s.via } : {}),
+          }
+        : { inserted: s.inserted, updated: s.updated, gone: s.gone, events: s.events.length };
       // 评论一入库就过滤：一轮要抓好几分钟，不等到最后推送前，免得中间 list_events({ unhandled: true }) 补漏先捞到。推送前还会再跑一次兜底。
       // 不看这次有没有新事件：已有事件的评论字段（例如 replyToUid）也可能在这次更新后才命中规则。放在 finishJob 之前，任务显示完成时过滤已落库
       let filtered = [];
       if (kind === 'comments') {
         try { filtered = applyEventFilters(db, { now }); } catch (e) { log(`${localTime(now())} [engage] 入库后过滤出错（推送前会再试）：${redact(e.message)}`); }
+      }
+      if (kind === 'dms') {
+        try {
+          const delay = checkDmDelay(db, s.events, dmDelayAlertMs);
+          if (delay) {
+            stats.maxDmDelayMs = delay.maxDelayMs;
+            if (!recentlyDelayAlerted(db, account.id, now())) {
+              log(`${localTime(now())} [engage] ${account.platformCode} dms 入库延迟告警：${delay.count} 条 dm.received 延迟超过 ${Math.round(dmDelayAlertMs / 60_000)} 分钟，最大延迟 ${fmtDelay(delay.maxDelayMs)}（via=${s.via ?? '-'}，陌生人=${s.strangerCount}）`);
+              const alerted = await safeNotify(notify, `⏰ ${name}入库延迟告警 | ${account.id}\n本轮 ${delay.count} 条新私信（dm.received）发出时间与入库时间差超过 ${Math.round(dmDelayAlertMs / 60_000)} 分钟，最大延迟 ${fmtDelay(delay.maxDelayMs)}。\n采集方式：${s.via ?? 'unknown'}，陌生人会话数：${s.strangerCount}，变更会话数：${s.changedConversations}。\n请检查采集方式与守护进程日志（抖音可核查 readViaApi 能力位；6 小时内不重复提醒）。`, log);
+              if (alerted) stats.delayAlerted = true;
+            }
+          }
+        } catch (e) { log(`${localTime(now())} [engage] 私信延迟自检出错：${redact(e.message)}`); }
       }
       finishJob(db, jobId, { status: 'ok', stats, now });
       return { ...out, status: 'ok', stats, ...(filtered.length ? { filtered } : {}) };
@@ -107,7 +156,12 @@ async function runJob(db, account, kind, jobId, deps) {
 
 function logJob(log, now, j) {
   const head = `${localTime(now())} [engage] ${j.platformCode} ${j.kind}`;
-  if (j.status === 'ok') log(`${head} ok 新增 ${j.stats.inserted} 更新 ${j.stats.updated} 消失 ${j.stats.gone} 事件 ${j.stats.events}`);
+  if (j.status === 'ok') {
+    const extra = j.kind === 'dms' && j.stats.changedConversations != null
+      ? ` 变更 ${j.stats.changedConversations} 陌生人 ${j.stats.strangerCount ?? 0}${j.stats.via ? ` via=${j.stats.via}` : ''}`
+      : '';
+    log(`${head} ok 新增 ${j.stats.inserted} 更新 ${j.stats.updated} 消失 ${j.stats.gone} 事件 ${j.stats.events}${extra}`);
+  }
   else if (j.status === 'skipped') log(`${head} 跳过（${j.skipped}）`);
   else log(`${head} 失败 ${j.error}`);
 }
@@ -121,13 +175,13 @@ function logJob(log, now, j) {
  */
 export async function runRound(db, {
   now = Date.now, collect, notify = defaultNotify, fetchImpl = fetch, platforms = ENGAGE_PLATFORMS, kinds = SYNC_KINDS,
-  trigger = 'schedule', lockPath = engageLockPath(), timeZone, log = console.log,
+  trigger = 'schedule', lockPath = engageLockPath(), timeZone, log = console.log, dmDelayAlertMs = DM_DELAY_ALERT_MS,
 } = {}) {
   if (typeof collect !== 'function') throw new Error('runRound 需要 collect');
   const lock = acquireRoundLock(lockPath, { now });
   if (!lock) return { ran: false, reason: 'locked' };
   if (lock.taken) log(`${localTime(now())} [engage] 接管了过期的轮锁`);
-  const deps = { now, collect, notify, log };
+  const deps = { now, collect, notify, log, dmDelayAlertMs };
   const jobs = [];
   const run = async (account, kind, jobId) => {
     let j;
@@ -252,7 +306,10 @@ function printStatus(st) {
   for (const p of st.platforms) {
     for (const kind of SYNC_KINDS) {
       const k = p.kinds[kind], j = k.lastJob;
-      const what = !j ? '还没跑过' : `${j.status}${j.status === 'ok' && j.stats ? `（新增 ${j.stats.inserted} 更新 ${j.stats.updated} 消失 ${j.stats.gone} 事件 ${j.stats.events}）` : j.error ? `（${j.error}）` : ''} ${j.finishedAt ?? j.requestedAt}`;
+      const extra = kind === 'dms' && j?.stats?.changedConversations != null
+        ? ` 变更 ${j.stats.changedConversations} 陌生人 ${j.stats.strangerCount ?? 0}${j.stats.via ? ` via=${j.stats.via}` : ''}`
+        : '';
+      const what = !j ? '还没跑过' : `${j.status}${j.status === 'ok' && j.stats ? `（新增 ${j.stats.inserted} 更新 ${j.stats.updated} 消失 ${j.stats.gone} 事件 ${j.stats.events}${extra}）` : j.error ? `（${j.error}）` : ''} ${j.finishedAt ?? j.requestedAt}`;
       console.log(`${p.platformCode.padEnd(10)} ${kind.padEnd(8)} ${what}${k.note ? `  不抓：${k.note}` : ''}`);
     }
     console.log(`${p.platformCode.padEnd(10)} 未处理事件 ${p.unhandledEvents}`);

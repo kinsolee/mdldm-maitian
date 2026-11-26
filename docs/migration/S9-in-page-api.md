@@ -9,7 +9,7 @@
 | 平台 | 读评论 | 读私信 | 回评论 | 发私信 |
 |---|---|---|---|---|
 | B站 | 接口（原来就是） | 接口（原来就是） | 接口（原来就是） | 接口（原来就是） |
-| 抖音 | **页面内接口（可选）**：页面评论服务 `awemeV1CommentListSelect` / `awemeV1CommentListReply` | DOM（IM SDK 的 fiber） | **页面内接口（可选）**：页面评论服务 `awemeV1CommentMultiPublish` | **页面内接口（可选）**：私信页的 `sendMessageWithAuth`，回读用 IM SDK 的 `getMessagesByConversation` |
+| 抖音 | **页面内接口（可选）**：页面评论服务 `awemeV1CommentListSelect` / `awemeV1CommentListReply` | **Context 读取（可选，挂 `readViaApi`）**：读聊天区 React Context 的 `conversationList` + `strangerConversationList`（含首屏外与陌生人会话），读不到或结构异常时退回 DOM（IM SDK 的 fiber） | **页面内接口（可选）**：页面评论服务 `awemeV1CommentMultiPublish` | **页面内接口（可选）**：私信页的 `sendMessageWithAuth`，回读用 IM SDK 的 `getMessagesByConversation` |
 | 视频号 | **页面内接口（可选）**：沙箱 iframe 里的评论服务 `getCommentList` | DOM（Vue 组件数据） | **页面内接口（可选）**：同一个服务的 `createComment` | DOM |
 | 小红书 | 不变（抄页面自己的响应） | 不变 | 不变（DOM） | 不变（DOM） |
 
@@ -21,9 +21,13 @@
 
 | 能力位 | 打开后 |
 |---|---|
-| `readViaApi` | 抖音、视频号的评论采集改成调页面服务，不再点作品、不点展开。私信不变 |
+| `readViaApi` | 抖音、视频号的评论采集改成调页面服务（不再点作品、不点展开）；抖音私信采集改为读聊天区 React Context（`conversationList` + `strangerConversationList`，首次 Context 同步按采集水位过滤旧私信，Context 不可用或结构异常时自动回落 DOM）；视频号私信不变 |
 | `writeViaApi` | 抖音、视频号的 `reply_comment` 改成调页面服务。`send_dm` 不受它影响 |
 | `writeDmViaApi` | 抖音的 `send_dm` 改成调私信页自己的发送函数。`reply_comment` 不受它影响 |
+
+每轮为每个抖音会话保存一份末条摘要。首屏有这个会话就使用 DOM，包括撤回、己方回复和空末条；首屏外才使用 Context。两者共用 DOM 的消息解析和消息表原生键，文本只取可见正文。首屏按前一次 DOM 末条的时间判断更新。Context 不推进 DOM 水位。两路切换时比较已入库的原生 ID，遇到只有一边保留毫秒的读数，再核对同会话、方向、类型和可见正文。原始 SDK 时间用于事件去重，保留可用的毫秒。消息表保留已经处理的来源。若一条本应由 DOM 派发的消息只因与 Context 旧行同秒同文而暂缓，重启后读到可区分的 ID 时仍可派发。首屏末条已被替换时，也用 Context 提供的身份补齐暂缓记录；派发与结清关联键在同一事务中完成。有有效 ID 时，正文补齐不重复派发。新消息忽略空或 0 的 ID，依次使用有效服务端 ID、客户端 ID、会话时间键。
+
+首次开启 Context 时优先使用同账号上次成功私信任务的开始时间，再使用已保存的采集时间。若旧库只有基线入库时间，首屏外未见过的旧消息按该时间建基线；首屏使用上次已观察到的最新发送时间。旧库为空时，首屏沿用 main 的派发行为。账号采集基线之后、成功任务开始之前的首屏外消息先入库；进入首屏时按 DOM 判断派发。会话首次采集的历史末条单独保留，撤回不改变基线。关闭 `readViaApi` 可恢复纯 DOM 采集；回滚代码时可以保留新增表和可空列。
 
 ```sh
 node src/hub.mjs ops accounts set-cap Douyin:106707338905 readViaApi true
