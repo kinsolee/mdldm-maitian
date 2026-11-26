@@ -268,7 +268,8 @@ export function readDmContext() {
     let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
     const it = f?.memoizedProps?.item;
     if (!it || it.id == null) continue;
-    const rawName = (li.querySelector('[class*=item-header], [class*=name]')?.innerText ?? li.innerText ?? '').split('\n')[0]?.trim() || null;
+    const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
+    const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
     if (rawName && rawName !== '陌生人消息') domNames.set(String(it.id), rawName);
   }
   const nameFromMap = (uid) => {
@@ -289,7 +290,14 @@ export function readDmContext() {
   };
   const tsOf = (v) => {
     if (v == null || v === '') return null;
-    const ms = v instanceof Date ? v.getTime() : (typeof v === 'number' ? v : (Number(v) || Date.parse(String(v))));
+    let ms;
+    if (typeof v === 'number') ms = v;
+    else if (typeof v?.getTime === 'function') ms = v.getTime();
+    else {
+      const s = String(v).trim();
+      if (!s) return null;
+      ms = /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : Date.parse(s);
+    }
     if (!Number.isFinite(ms) || ms <= 0) return null;
     return String(ms < 1e12 ? ms * 1000 : ms);
   };
@@ -335,13 +343,19 @@ export function readDmContext() {
       ...winner,
       isStrangerChat: prev.isStrangerChat || item.isStrangerChat,
       name: winner.name ?? other.name ?? null,
+      toParticipantUserId: winner.toParticipantUserId ?? other.toParticipantUserId ?? null,
+      unreadCount: Math.max(prev.unreadCount, item.unreadCount),
     });
   };
   for (const it of normal) put(shape(it, false));
   for (const it of strangers) put(shape(it, true));
   const conversations = [...byId.values()];
+  if ((normal.length > 0 || strangers.length > 0) && !conversations.length) {
+    return { ok: false, code: 'no-valid-items', domRows: domItems.length };
+  }
   const strangerCount = conversations.filter((c) => c.isStrangerChat).length;
-  return { ok: true, conversations, strangerCount, hasStrangerList, domRows: domItems.length };
+  const emptyConfirmed = normal.length === 0 && strangers.length === 0 && svc.loading === false && domItems.length === 0;
+  return { ok: true, conversations, strangerCount, hasStrangerList, emptyConfirmed, domRows: domItems.length };
 }
 
 export async function rawDms(page, o = {}) {
@@ -370,10 +384,10 @@ export async function rawDms(page, o = {}) {
           conversations: r.conversations,
           strangerCount: r.strangerCount ?? r.conversations.filter((c) => c.isStrangerChat).length,
           hasStrangerList: r.hasStrangerList !== false,
-          emptyState: r.conversations.length === 0 && (r.domRows ?? 0) === 0,
+          emptyState: r.emptyConfirmed === true,
         };
       }
-      if ((r?.code === 'service-missing' || r?.code === 'empty-with-dom') && (r.domRows ?? 0) > 0) {
+      if ((r?.code === 'service-missing' || r?.code === 'empty-with-dom' || r?.code === 'no-valid-items') && (r.domRows ?? 0) > 0) {
         if (missingWithDomSince == null) missingWithDomSince = Date.now();
         if (Date.now() - missingWithDomSince >= graceMs) break;
       }

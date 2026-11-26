@@ -165,6 +165,45 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     assert.equal(raw.conversations.length, 1);
     assert.equal(raw.conversations[0].id, '0:1:me:u1');
   });
+
+  test('Context 列表非空但项结构漂移缺 id：不误判空状态，带 no-valid-items 回落 DOM', async () => {
+    const c1 = sdkConv('0:1:me:u1', { uid: 'u1', text: 'DOM兜底', atMs: T0 - MIN });
+    const brokenCtx = { bytedIM: {}, loading: false, conversationList: [{ badField: 1 }], strangerConversationList: [] };
+    installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '普通甲', ctxValue: brokenCtx })] });
+
+    const ctxRes = readDmContext();
+    assert.equal(ctxRes.ok, false);
+    assert.equal(ctxRes.code, 'no-valid-items');
+
+    const raw = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0, contextPollMs: 0 });
+    assert.equal(raw.via, 'dom');
+    assert.match(raw.apiFallback, /no-valid-items/);
+    assert.equal(raw.conversations.length, 1);
+
+    // 若 DOM 也为空，不得误报 emptyState=true，parseDms 应报错
+    const chatEl = { __reactFiber$test: { memoizedProps: { value: brokenCtx }, return: null } };
+    installFakeDoc({ domLis: [], chatEls: [chatEl] });
+    const rawNoDom = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0, contextPollMs: 0 });
+    assert.equal(rawNoDom.via, 'dom');
+    assert.equal(rawNoDom.emptyState, false);
+    assert.throws(() => parseDms(rawNoDom, { accountUid: ME, fetchedAt: new Date(T0).toISOString() }), /没显示空状态/);
+  });
+
+  test('tsOf("0") 返回 null 不产生 2000 年伪时间，且兼容跨 realm Date 对象', () => {
+    const zeroTs = sdkConv('0:1:me:z1', { uid: 'z1', text: '零时间戳' });
+    zeroTs.lastMessage.createdAt = '0';
+    const crossRealmDate = sdkConv('0:1:me:d1', { uid: 'd1', text: '跨realm时间' });
+    crossRealmDate.lastMessage.createdAt = { getTime: () => T0 - 5 * MIN };
+    const ctx = { bytedIM: {}, loading: false, conversationList: [zeroTs, crossRealmDate], strangerConversationList: [] };
+    const chatEl = { __reactFiber$test: { memoizedProps: { value: ctx }, return: null } };
+    installFakeDoc({ domLis: [], chatEls: [chatEl] });
+
+    const ctxRes = readDmContext();
+    assert.equal(ctxRes.ok, true);
+    const byId = new Map(ctxRes.conversations.map((c) => [c.id, c]));
+    assert.equal(byId.get('0:1:me:z1').lastMessage.createdAt, null, '"0" 不得回落到 Date.parse("0")');
+    assert.equal(byId.get('0:1:me:d1').lastMessage.createdAt, String(T0 - 5 * MIN));
+  });
 });
 
 describe('首次基线、changedConversations 与 events.occurredAt', () => {
@@ -227,6 +266,45 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     ]);
     assert.equal(r3.changedConversations, 2);
     assert.equal(r3.strangerCount, 2);
+  });
+
+  test('首轮 strangerConversationList 为空、次轮延迟加载出历史陌生人：早于基线的旧陌生人不灌事件，基线后的新陌生人正常发事件', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    // 第 1 轮（T0）：strangerConversationList 尚未拉回（空数组），建立 dms:stranger 基线
+    const r1 = ingestSnapshot(db, acc, {
+      ...dmsSnap([conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() })]),
+      via: 'context',
+      strangerCount: 0,
+      hasStrangerList: true,
+    }, { now: at(T0) });
+    assert.deepEqual(r1.events, []);
+
+    // 第 2 轮（T0 + 15m）：strangerConversationList 延迟加载出 1 条历史旧陌生人（24h 前）+ 1 条基线后新陌生人（T0 + 10m）
+    const r2 = ingestSnapshot(db, acc, {
+      ...dmsSnap([
+        conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() }),
+        { ...conv('s_old', { nick: '历史陌生人', at: new Date(T0 - 24 * HOUR).toISOString(), text: '昨天的旧消息' }), isStranger: true },
+        { ...conv('s_new', { nick: '新陌生人', at: new Date(T0 + 10 * MIN).toISOString(), text: '刚刚发来' }), isStranger: true },
+      ]),
+      via: 'context',
+      strangerCount: 2,
+      hasStrangerList: true,
+    }, { now: at(T0 + 15 * MIN) });
+    assert.deepEqual(r2.events, [`dm.received:Douyin:s_new:${new Date(T0 + 10 * MIN).toISOString()}`]);
+    assert.equal(r2.changedConversations, 2);
+    // s_old 已建基线入库，后续再发新消息会正常出事件
+    const r3 = ingestSnapshot(db, acc, {
+      ...dmsSnap([
+        conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() }),
+        { ...conv('s_old', { nick: '历史陌生人', at: new Date(T0 + 20 * MIN).toISOString(), text: '又发了一条' }), isStranger: true },
+        { ...conv('s_new', { nick: '新陌生人', at: new Date(T0 + 10 * MIN).toISOString(), text: '刚刚发来' }), isStranger: true },
+      ]),
+      via: 'context',
+      strangerCount: 2,
+      hasStrangerList: true,
+    }, { now: at(T0 + 30 * MIN) });
+    assert.deepEqual(r3.events, [`dm.received:Douyin:s_old:${new Date(T0 + 20 * MIN).toISOString()}`]);
   });
 
   test('events.occurredAt 写入对方发出时间，createdAt 保持入库时间且水位语义不变；迁移可重复且兼容旧 NULL 行', () => {
@@ -292,23 +370,23 @@ describe('sync 自检统计与私信入库延迟告警', () => {
       { ...dmsSnap([conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() })]), via: 'context', strangerCount: 0, hasStrangerList: true },
       // 第 2 轮：无变化，changedConversations=0，不告警
       { ...dmsSnap([conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() })]), via: 'context', strangerCount: 0, hasStrangerList: true },
-      // 第 3 轮：新陌生人私信发出时间距入库 5 小时（超过 2h 阈值）→ 告警
+      // 第 3 轮（T0 + 6h）：基线后发出的新陌生人私信延迟 5 小时才入库（超过 2h 阈值）→ 告警
       { ...dmsSnap([
         conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() }),
-        { ...conv('s1', { at: new Date(T0 + 30 * MIN - 5 * HOUR).toISOString(), text: '绝密私信正文不可进日志和告警' }), isStranger: true },
+        { ...conv('s1', { at: new Date(T0 + 1 * HOUR).toISOString(), text: '绝密私信正文不可进日志和告警' }), isStranger: true },
       ]), via: 'context', strangerCount: 1, hasStrangerList: true },
-      // 第 4 轮（15 分钟后，冷却期内）：又一条延迟 4 小时的新私信 → 写日志但不重复发飞书
+      // 第 4 轮（T0 + 6h15m，冷却期内）：又一条延迟 4 小时的新私信 → 写日志但不重复发飞书
       { ...dmsSnap([
         conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() }),
-        { ...conv('s1', { at: new Date(T0 + 30 * MIN - 5 * HOUR).toISOString(), text: '绝密私信正文不可进日志和告警' }), isStranger: true },
-        { ...conv('s2', { at: new Date(T0 + 45 * MIN - 4 * HOUR).toISOString(), text: '第二条绝密正文' }), isStranger: true },
+        { ...conv('s1', { at: new Date(T0 + 1 * HOUR).toISOString(), text: '绝密私信正文不可进日志和告警' }), isStranger: true },
+        { ...conv('s2', { at: new Date(T0 + 2 * HOUR + 15 * MIN).toISOString(), text: '第二条绝密正文' }), isStranger: true },
       ]), via: 'context', strangerCount: 2, hasStrangerList: true },
       // 第 5 轮（超过 6h 冷却）：又一条延迟 3 小时的新私信 → 再次发飞书
       { ...dmsSnap([
         conv('c1', { at: new Date(T0 - 5 * MIN).toISOString() }),
-        { ...conv('s1', { at: new Date(T0 + 30 * MIN - 5 * HOUR).toISOString(), text: '绝密私信正文不可进日志和告警' }), isStranger: true },
-        { ...conv('s2', { at: new Date(T0 + 45 * MIN - 4 * HOUR).toISOString(), text: '第二条绝密正文' }), isStranger: true },
-        { ...conv('s3', { at: new Date(T0 + 45 * MIN + DM_DELAY_ALERT_COOLDOWN_MS + 15 * MIN - 3 * HOUR).toISOString(), text: '第三条' }), isStranger: true },
+        { ...conv('s1', { at: new Date(T0 + 1 * HOUR).toISOString(), text: '绝密私信正文不可进日志和告警' }), isStranger: true },
+        { ...conv('s2', { at: new Date(T0 + 2 * HOUR + 15 * MIN).toISOString(), text: '第二条绝密正文' }), isStranger: true },
+        { ...conv('s3', { at: new Date(T0 + 6 * HOUR + 15 * MIN + DM_DELAY_ALERT_COOLDOWN_MS + 15 * MIN - 3 * HOUR).toISOString(), text: '第三条' }), isStranger: true },
       ]), via: 'dom', strangerCount: 3 },
     ];
     const collect = async () => snaps.shift();
@@ -326,7 +404,7 @@ describe('sync 自检统计与私信入库延迟告警', () => {
     assert.equal(r2.jobs[0].stats.updated, 1);
     assert.equal(notices.length, 0);
 
-    nowMs += 15 * MIN;
+    nowMs = T0 + 6 * HOUR;
     const r3 = await runRound(db, base);
     assert.equal(r3.jobs[0].stats.changedConversations, 1);
     assert.equal(r3.jobs[0].stats.strangerCount, 1);

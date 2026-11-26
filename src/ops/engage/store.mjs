@@ -30,6 +30,7 @@ export function insertEvent(db, { id, type, platformCode, accountId, subjectId, 
 
 // 基线：这个账号这种 kind 成功入库过一次（哪怕是空的）。在 ingestSnapshot 的事务里写，和当前 job 有没有 finishJob 无关
 const hasBaseline = (db, accountId, kind) => !!db.prepare('SELECT 1 FROM engage_baselines WHERE accountId = ? AND kind = ?').get(accountId, kind);
+const getBaselineAt = (db, accountId, kind) => db.prepare('SELECT establishedAt FROM engage_baselines WHERE accountId = ? AND kind = ?').get(accountId, kind)?.establishedAt ?? null;
 const setBaseline = (db, accountId, kind, at) => db.prepare('INSERT OR IGNORE INTO engage_baselines (accountId, kind, establishedAt) VALUES (?, ?, ?)').run(accountId, kind, at);
 
 function upsertWorks(db, ctx, works) {
@@ -154,9 +155,15 @@ function upsertConversations(db, ctx, snap) {
     if (changed) ctx.stats.changedConversations++;
     if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
     else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
+    const isHistoricalStranger = !before
+      && k.isStranger === true
+      && ctx.strangerBaselineAt != null
+      && last?.at != null
+      && Date.parse(last.at) < Date.parse(ctx.strangerBaselineAt);
     const baselineOnly = ctx.firstSync
       || (ctx.firstContextSync && !before)
-      || (ctx.firstStrangerSync && k.isStranger === true && !before);
+      || (ctx.firstStrangerSync && k.isStranger === true && !before)
+      || isHistoricalStranger;
     const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !baselineOnly;
     if (last?.by !== 'peer' || !last.at || !isNewer) continue;
     emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id, occurredAt: last.at,
@@ -197,7 +204,8 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
     ctx.firstSync = !hasBaseline(db, ctx.accountId, kind);
     if (kind === 'dms') {
       ctx.firstContextSync = snap.via === 'context' && !hasBaseline(db, ctx.accountId, 'dms:context');
-      ctx.firstStrangerSync = snap.via === 'context' && !hasBaseline(db, ctx.accountId, 'dms:stranger');
+      ctx.strangerBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:stranger');
+      ctx.firstStrangerSync = snap.via === 'context' && ctx.strangerBaselineAt == null;
     }
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);
