@@ -9,8 +9,7 @@
 | 平台 | 读评论 | 读私信 | 回评论 | 发私信 |
 |---|---|---|---|---|
 | B站 | 接口（原来就是） | 接口（原来就是） | 接口（原来就是） | 接口（原来就是） |
-| 抖音 | **页面内接口（可选）**：页面评论服务 `awemeV1CommentListSelect` / `awemeV1CommentListReply` | DOM（IM SDK 的 fiber） | **页面内接口（可选）**：页面评论服务 `awemeV1CommentMultiPublish` | **页面内接口（可选）**：私信页的 `sendMessageWithAuth`，回读用 IM SDK 的 `getMessagesByConversation` |
-| | | **Context 读取（可选，挂 `readViaApi`）**：读聊天区 React Context 的 `conversationList` + `strangerConversationList`，读不到时退回 DOM | | |
+| 抖音 | **页面内接口（可选）**：页面评论服务 `awemeV1CommentListSelect` / `awemeV1CommentListReply` | **Context 读取（可选，挂 `readViaApi`）**：读聊天区 React Context 的 `conversationList` + `strangerConversationList`（含首屏外与陌生人会话），读不到或结构异常时退回 DOM（IM SDK 的 fiber） | **页面内接口（可选）**：页面评论服务 `awemeV1CommentMultiPublish` | **页面内接口（可选）**：私信页的 `sendMessageWithAuth`，回读用 IM SDK 的 `getMessagesByConversation` |
 | 视频号 | **页面内接口（可选）**：沙箱 iframe 里的评论服务 `getCommentList` | DOM（Vue 组件数据） | **页面内接口（可选）**：同一个服务的 `createComment` | DOM |
 | 小红书 | 不变（抄页面自己的响应） | 不变 | 不变（DOM） | 不变（DOM） |
 
@@ -22,8 +21,7 @@
 
 | 能力位 | 打开后 |
 |---|---|
-| `readViaApi` | 抖音、视频号的评论采集改成调页面服务，不再点作品、不点展开。私信不变 |
-| `readViaApi`（抖音私信补充，KIN-340） | 抖音私信采集同时改为读聊天区 React Context（`conversationList` + `strangerConversationList`），首次 Context 同步只建基线不推旧私信，Context 读不到时自动回落 DOM |
+| `readViaApi` | 抖音、视频号的评论采集改成调页面服务（不再点作品、不点展开）；抖音私信采集改为读聊天区 React Context（`conversationList` + `strangerConversationList`，首次 Context 同步只建基线不推旧私信，Context 不可用或结构异常时自动回落 DOM）；视频号私信不变 |
 | `writeViaApi` | 抖音、视频号的 `reply_comment` 改成调页面服务。`send_dm` 不受它影响 |
 | `writeDmViaApi` | 抖音的 `send_dm` 改成调私信页自己的发送函数。`reply_comment` 不受它影响 |
 

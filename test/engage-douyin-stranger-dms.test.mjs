@@ -10,7 +10,9 @@ import { readDmContext, rawDms, parseDms } from '../src/ops/engage/adapters/douy
 import { shapeErrors } from '../src/ops/engage/adapters/shape.mjs';
 import { ingestSnapshot } from '../src/ops/engage/store.mjs';
 import { listEvents } from '../src/ops/engage/query.mjs';
+import { subscribe } from '../src/ops/engage/subscribers.mjs';
 import { setCapability } from '../src/ops/accounts.mjs';
+import { deliverPending } from '../src/daemon/outbox.mjs';
 import { runRound, DM_DELAY_ALERT_MS, DM_DELAY_ALERT_COOLDOWN_MS } from '../src/daemon/sync.mjs';
 import { freshDb, douyin, comment, commentsSnap, conv, dmsSnap, T0, MIN, at } from './helpers/engage-fixtures.mjs';
 
@@ -30,14 +32,14 @@ function makeLi({ item, headerText, innerText, ctxValue }) {
   };
 }
 
-function installFakeDoc({ domLis = [], chatEls = [], emptyNode = false, bodyText = '' } = {}) {
+function installFakeDoc({ domLis = [], chatEls = [], semiListEls = [], emptyNode = false, bodyText = '' } = {}) {
   globalThis.document = {
     body: { innerText: bodyText },
     querySelector: (sel) => (sel === '.semi-list-empty' && emptyNode ? {} : null),
     querySelectorAll: (sel) => {
       if (sel === 'li.semi-list-item') return domLis;
       if (sel === '[class*=chat-]') return chatEls;
-      if (sel === '[class*=semi-list]') return [];
+      if (sel === '[class*=semi-list]') return semiListEls;
       if (sel === 'li') return domLis;
       return [];
     },
@@ -140,10 +142,10 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     assert.equal(domOnly.conversations.length, 1);
   });
 
-  test('Context 明确加载完成且为空列表：emptyState=true，parseDms 返回合法空结果', async () => {
+  test('Context 明确加载完成且页面显示空状态 UI：emptyState=true，parseDms 返回合法空结果', async () => {
     const ctx = { bytedIM: {}, loading: false, conversationList: [], strangerConversationList: [] };
     const chatEl = { __reactFiber$test: { memoizedProps: { value: ctx }, return: null } };
-    installFakeDoc({ domLis: [], chatEls: [chatEl] });
+    installFakeDoc({ domLis: [], chatEls: [chatEl], emptyNode: true });
 
     const raw = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0 });
     assert.equal(raw.via, 'context');
@@ -152,6 +154,190 @@ describe('抖音私信 React Context 读取与 DOM 回落', () => {
     const parsed = parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0).toISOString() });
     assert.deepEqual(shapeErrors(parsed), []);
     assert.equal(parsed.conversations.length, 0);
+  });
+
+  test('无空状态 UI 时，空 Context 不判 emptyState（U1 契约）', async () => {
+    const ctx = { bytedIM: {}, loading: false, conversationList: [], strangerConversationList: [] };
+    const chatEl = { __reactFiber$test: { memoizedProps: { value: ctx }, return: null } };
+    installFakeDoc({ domLis: [], chatEls: [chatEl], emptyNode: false, bodyText: '' });
+
+    const ctxRes = readDmContext();
+    assert.equal(ctxRes.ok, false);
+    assert.equal(ctxRes.code, 'empty-unconfirmed');
+
+    const raw = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0, contextPollMs: 0 });
+    assert.equal(raw.via, 'dom');
+    assert.match(raw.apiFallback, /empty-unconfirmed/);
+    assert.equal(raw.emptyState, false);
+    assert.throws(() => parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0).toISOString() }), /没显示空状态/);
+  });
+
+  test('loading=true 时即使普通列表非空也不返回半截列表，等加载完成后再返回完整列表', async () => {
+    const c1 = sdkConv('0:1:me:u1', { uid: 'u1', text: '普通1', atMs: T0 - MIN });
+    const s1 = sdkConv('0:1:me:s1', { uid: 's1', stranger: true, text: '陌生人1', atMs: T0 - 2 * MIN });
+    const ctx = { bytedIM: {}, loading: true, conversationList: [c1], strangerConversationList: [] };
+    installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '普通甲', ctxValue: ctx })] });
+
+    const half = readDmContext();
+    assert.equal(half.ok, false);
+    assert.equal(half.code, 'list-loading');
+
+    // 持续 loading=true 超时后不报 via=context，退回 DOM
+    const timedOut = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0, contextPollMs: 0 });
+    assert.equal(timedOut.via, 'dom');
+    assert.match(timedOut.apiFallback, /list-loading/);
+
+    // 轮询期间先 loading=true，下一轮 loading=false 且陌生人列表就绪 -> 返回完整列表
+    let calls = 0;
+    const page = {
+      waitForSelector: async () => true,
+      evaluate: async (fn, ...args) => {
+        calls++;
+        if (calls >= 2) {
+          ctx.loading = false;
+          ctx.strangerConversationList = [s1];
+        }
+        return fn(...args);
+      },
+    };
+    const full = await rawDms(page, { readVia: 'api', settleMs: 5, contextWaitMs: 500, contextPollMs: 5 });
+    assert.equal(full.via, 'context');
+    assert.equal(full.conversations.length, 2);
+    assert.equal(full.strangerCount, 1);
+  });
+
+  test('Context 部分漂移回落 DOM：陌生人列表缺失或任一列表项全缺 id 都不得报 via=context', async () => {
+    const c1 = sdkConv('0:1:me:u1', { uid: 'u1', text: '普通会话', atMs: T0 - MIN });
+    const s1 = sdkConv('0:1:me:s1', { uid: 's1', stranger: true, text: '陌生人', atMs: T0 - 2 * MIN });
+
+    // 场景 1：普通列表有效，但 strangerConversationList 缺失
+    const missingStrangerCtx = { bytedIM: {}, loading: false, conversationList: [c1] };
+    installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '普通甲', ctxValue: missingStrangerCtx })] });
+    assert.equal(readDmContext().ok, false);
+    assert.equal(readDmContext().code, 'stranger-list-missing');
+    const fb1 = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0, contextPollMs: 0 });
+    assert.equal(fb1.via, 'dom');
+    assert.match(fb1.apiFallback, /stranger-list-missing/);
+
+    // 场景 2：普通列表有效，但陌生人列表非空且全缺 id
+    const brokenStrangerCtx = { bytedIM: {}, loading: false, conversationList: [c1], strangerConversationList: [{ badField: 1 }] };
+    installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '普通甲', ctxValue: brokenStrangerCtx })] });
+    assert.equal(readDmContext().ok, false);
+    assert.equal(readDmContext().code, 'no-valid-items');
+    const fb2 = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0, contextPollMs: 0 });
+    assert.equal(fb2.via, 'dom');
+    assert.match(fb2.apiFallback, /no-valid-items/);
+
+    // 场景 3：陌生人列表有效，但普通列表非空且全缺 id
+    const brokenNormalCtx = { bytedIM: {}, loading: false, conversationList: [{ badField: 1 }], strangerConversationList: [s1] };
+    installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '普通甲', ctxValue: brokenNormalCtx })] });
+    assert.equal(readDmContext().ok, false);
+    assert.equal(readDmContext().code, 'no-valid-items');
+    const fb3 = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0, contextPollMs: 0 });
+    assert.equal(fb3.via, 'dom');
+    assert.match(fb3.apiFallback, /no-valid-items/);
+  });
+
+  test('无 li.semi-list-item 且 [class*=chat-] 超过 30 个时，仍能从 [class*=semi-list] 找到 Context', () => {
+    const c1 = sdkConv('0:1:me:u1', { uid: 'u1', text: '列表里', atMs: T0 - MIN });
+    const ctx = { bytedIM: {}, loading: false, conversationList: [c1], strangerConversationList: [] };
+    const noiseChats = Array.from({ length: 40 }, () => ({ __reactFiber$test: { memoizedProps: {}, return: null } }));
+    const semiList = { __reactFiber$test: { memoizedProps: { value: ctx }, return: null } };
+    installFakeDoc({ domLis: [], chatEls: noiseChats, semiListEls: [semiList] });
+
+    const res = readDmContext();
+    assert.equal(res.ok, true);
+    assert.equal(res.conversations.length, 1);
+  });
+
+  test('missingWithDomSince 回到 list-loading 时重置，不会因早期瞬时 service-missing 过早回落 DOM', async () => {
+    const c1 = sdkConv('0:1:me:u1', { uid: 'u1', text: '晚到', atMs: T0 - MIN });
+    const ctx = { bytedIM: {}, loading: true, conversationList: [], strangerConversationList: [] };
+    let step = 0;
+    const page = {
+      waitForSelector: async () => true,
+      evaluate: async (fn, ...args) => {
+        step++;
+        if (step === 1) {
+          installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '甲', ctxValue: null })] });
+        } else if (step <= 3) {
+          ctx.loading = true;
+          installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '甲', ctxValue: ctx })] });
+        } else {
+          ctx.loading = false;
+          ctx.conversationList = [c1];
+          installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '甲', ctxValue: ctx })] });
+        }
+        return fn(...args);
+      },
+    };
+    const raw = await rawDms(page, { readVia: 'api', settleMs: 0, contextWaitMs: 500, contextPollMs: 10, contextFallbackGraceMs: 15 });
+    assert.equal(raw.via, 'context');
+    assert.equal(raw.conversations.length, 1);
+  });
+
+  test('serverId / clientMessageId 为 "" 或 "0" 时视为无效 id：不触发 shape 校验失败也不撞成 Douyin:0', async () => {
+    const atMs = T0 - 5 * MIN;
+    const emptyIds = sdkConv('0:1:me:e1', { uid: 'e1', text: '空串id', atMs });
+    emptyIds.lastMessage.serverId = '';
+    emptyIds.lastMessage.clientMessageId = '';
+    const zeroIds = sdkConv('0:1:me:e2', { uid: 'e2', text: '零id', atMs });
+    zeroIds.lastMessage.serverId = '0';
+    zeroIds.lastMessage.clientMessageId = '0';
+    const fallbackClient = sdkConv('0:1:me:e3', { uid: 'e3', text: '回退clientId', atMs });
+    fallbackClient.lastMessage.serverId = '0';
+    fallbackClient.lastMessage.clientMessageId = '';
+    fallbackClient.lastMessage.clientId = 'cli-valid-3';
+
+    const ctx = { bytedIM: {}, loading: false, conversationList: [emptyIds, zeroIds, fallbackClient], strangerConversationList: [] };
+    installFakeDoc({ domLis: [makeLi({ item: emptyIds, headerText: '甲', ctxValue: ctx })] });
+
+    const raw = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0 });
+    assert.equal(raw.via, 'context');
+    const parsed = parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0).toISOString() });
+    assert.deepEqual(shapeErrors(parsed), []);
+    const msgByConv = new Map(parsed.messages.map((m) => [m.conversationNativeId, m.nativeId]));
+    assert.equal(msgByConv.get('0:1:me:e1'), `0:1:me:e1:${atMs}`);
+    assert.equal(msgByConv.get('0:1:me:e2'), `0:1:me:e2:${atMs}`);
+    assert.equal(msgByConv.get('0:1:me:e3'), 'cli-valid-3');
+    assert.notEqual(msgByConv.get('0:1:me:e1'), msgByConv.get('0:1:me:e2'), '不同会话不得主键碰撞');
+  });
+
+  test('无 server/client id 时 Context↔DOM 切换（秒/毫秒时间戳）生成一致去重键，messages 不重复入库', async () => {
+    const sec = Math.floor((T0 - 10 * MIN) / 1000);
+    const ms = sec * 1000;
+    const domItem = sdkConv('0:1:me:u1', { uid: 'u1', text: '同一条消息', atMs: ms });
+    domItem.lastMessage.serverId = null;
+    domItem.lastMessage.clientMessageId = null;
+    domItem.lastMessage.createdAt = String(sec); // 秒级
+
+    const ctxItem = sdkConv('0:1:me:u1', { uid: 'u1', text: '同一条消息', atMs: ms });
+    ctxItem.lastMessage.serverId = '';
+    ctxItem.lastMessage.clientMessageId = '0';
+    ctxItem.lastMessage.createdAt = String(ms); // 毫秒级
+
+    // 先走 DOM
+    installFakeDoc({ domLis: [makeLi({ item: domItem, headerText: '普通甲', ctxValue: null })] });
+    const rawDom = await rawDms(fakePage(), { readVia: 'dom', settleMs: 0 });
+    const parsedDom = parseDms(rawDom, { accountUid: ME, fetchedAt: new Date(T0).toISOString() });
+    assert.deepEqual(shapeErrors(parsedDom), []);
+
+    // 再切 Context
+    const ctx = { bytedIM: {}, loading: false, conversationList: [ctxItem], strangerConversationList: [] };
+    installFakeDoc({ domLis: [makeLi({ item: ctxItem, headerText: '普通甲', ctxValue: ctx })] });
+    const rawCtx = await rawDms(fakePage(), { readVia: 'api', settleMs: 0, contextWaitMs: 0 });
+    const parsedCtx = parseDms(rawCtx, { accountUid: ME, fetchedAt: new Date(T0 + MIN).toISOString() });
+    assert.deepEqual(shapeErrors(parsedCtx), []);
+
+    assert.equal(parsedDom.messages[0].nativeId, parsedCtx.messages[0].nativeId);
+    assert.equal(parsedDom.messages[0].nativeId, `0:1:me:u1:${ms}`);
+
+    const db = freshDb();
+    const acc = douyin(db);
+    ingestSnapshot(db, acc, parsedDom, { now: at(T0) });
+    ingestSnapshot(db, acc, parsedCtx, { now: at(T0 + MIN) });
+    const rows = db.prepare("SELECT id FROM messages WHERE conversationId = 'Douyin:0:1:me:u1'").all();
+    assert.equal(rows.length, 1, 'Context↔DOM 切换只保留 1 行消息');
   });
 
   test('Context 报空数组但 DOM 存在会话行：不误判空状态，退回 DOM 读出会话', async () => {
@@ -266,6 +452,215 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     ]);
     assert.equal(r3.changedConversations, 2);
     assert.equal(r3.strangerCount, 2);
+  });
+
+  test('Context 历史旧私信四种场景均挡住：首轮空后加载旧普通会话、首轮 last 为空次轮补旧消息、旧 DOM 不回退 lastAt、删近期会话露出历史会话', async () => {
+    // 场景 1：首轮空快照建基线，次轮旧普通会话加载进来 -> 不发事件
+    {
+      const db = freshDb();
+      const acc = douyin(db);
+      const r1 = ingestSnapshot(db, acc, { ...dmsSnap([]), via: 'context', strangerCount: 0, hasStrangerList: true }, { now: at(T0) });
+      assert.deepEqual(r1.events, []);
+      const r2 = ingestSnapshot(db, acc, {
+        ...dmsSnap([
+          conv('c_old', { nick: '旧普通', at: new Date(T0 - 6 * HOUR).toISOString(), text: '六小时前' }),
+          conv('c_new', { nick: '新普通', at: new Date(T0 + 5 * MIN).toISOString(), text: '基线后新消息' }),
+        ]),
+        via: 'context',
+        strangerCount: 0,
+        hasStrangerList: true,
+      }, { now: at(T0 + 10 * MIN) });
+      assert.deepEqual(r2.events, [`dm.received:Douyin:c_new:${new Date(T0 + 5 * MIN).toISOString()}`]);
+    }
+
+    // 场景 2：会话首轮 last 为空（before.lastAt == null），次轮补出旧消息 -> 不发事件；之后新消息照发
+    {
+      const db = freshDb();
+      const acc = douyin(db);
+      ingestSnapshot(db, acc, {
+        ...dmsSnap([conv('c1', { last: null })]),
+        via: 'context',
+        strangerCount: 0,
+        hasStrangerList: true,
+      }, { now: at(T0) });
+      const r2 = ingestSnapshot(db, acc, {
+        ...dmsSnap([conv('c1', { at: new Date(T0 - 5 * HOUR).toISOString(), text: '历史旧消息' })]),
+        via: 'context',
+        strangerCount: 0,
+        hasStrangerList: true,
+      }, { now: at(T0 + 10 * MIN) });
+      assert.deepEqual(r2.events, [], 'before.lastAt==null 补出早于基线的旧消息不得发事件');
+      const r3 = ingestSnapshot(db, acc, {
+        ...dmsSnap([conv('c1', { at: new Date(T0 + 15 * MIN).toISOString(), text: '新消息' })]),
+        via: 'context',
+        strangerCount: 0,
+        hasStrangerList: true,
+      }, { now: at(T0 + 20 * MIN) });
+      assert.deepEqual(r3.events, [`dm.received:Douyin:c1:${new Date(T0 + 15 * MIN).toISOString()}`]);
+    }
+
+    // 场景 3：旧 DOM 快照不得让 conversations.lastAt 回退，后续重读已建基线消息不重发事件
+    {
+      const db = freshDb();
+      const acc = douyin(db);
+      const tBase = new Date(T0 - 5 * MIN).toISOString();
+      const tStale = new Date(T0 - 3 * HOUR).toISOString();
+      ingestSnapshot(db, acc, { ...dmsSnap([conv('c1', { at: tBase, text: '基线最新' })]), via: 'context', strangerCount: 0, hasStrangerList: true }, { now: at(T0) });
+      const rStale = ingestSnapshot(db, acc, { ...dmsSnap([conv('c1', { at: tStale, text: '过时DOM' })]), via: 'dom', strangerCount: 0 }, { now: at(T0 + 5 * MIN) });
+      assert.deepEqual(rStale.events, []);
+      assert.equal(db.prepare("SELECT lastAt FROM conversations WHERE id = 'Douyin:c1'").get().lastAt, tBase, 'lastAt 只能前进不能回退');
+      const rAgain = ingestSnapshot(db, acc, { ...dmsSnap([conv('c1', { at: tBase, text: '基线最新' })]), via: 'context', strangerCount: 0, hasStrangerList: true }, { now: at(T0 + 10 * MIN) });
+      assert.deepEqual(rAgain.events, [], '重读已建基线消息不重复发事件');
+    }
+
+    // 场景 4：删掉近期会话后，更早的首屏外历史会话进入窗口 -> 不发事件
+    {
+      const db = freshDb();
+      const acc = douyin(db);
+      ingestSnapshot(db, acc, {
+        ...dmsSnap([
+          conv('c_recent', { at: new Date(T0 - 10 * MIN).toISOString() }),
+          conv('c_mid', { at: new Date(T0 - 2 * HOUR).toISOString() }),
+        ]),
+        via: 'context',
+        strangerCount: 0,
+        hasStrangerList: true,
+      }, { now: at(T0) });
+      // 删掉 c_recent，窗口补进 c_ancient（2 天前）
+      const r2 = ingestSnapshot(db, acc, {
+        ...dmsSnap([
+          conv('c_mid', { at: new Date(T0 - 2 * HOUR).toISOString() }),
+          conv('c_ancient', { at: new Date(T0 - 48 * HOUR).toISOString(), text: '两天前旧私信' }),
+        ]),
+        via: 'context',
+        strangerCount: 0,
+        hasStrangerList: true,
+      }, { now: at(T0 + 15 * MIN) });
+      assert.deepEqual(r2.events, [], '窗口前移露出的历史旧会话不发事件');
+    }
+  });
+
+  test('关闭 readViaApi 切回 DOM 路径时，派发结果与 origin/main 一致（Context 基线不压掉 DOM 读到的陌生人私信）', () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    // 先跑过一轮 Context（写下 dms / dms:context / dms:stranger 基线于 T0）
+    ingestSnapshot(db, acc, {
+      ...dmsSnap([conv('c1', { at: new Date(T0 - 10 * MIN).toISOString() })]),
+      via: 'context',
+      strangerCount: 0,
+      hasStrangerList: true,
+    }, { now: at(T0) });
+
+    // 随后关闭 readViaApi 回到 DOM 路径：DOM 折叠行读到一个陌生人会话（last.at 早于 T0）
+    const domStrangerAt = new Date(T0 - 3 * HOUR).toISOString();
+    const rDom = ingestSnapshot(db, acc, {
+      ...dmsSnap([
+        conv('c1', { at: new Date(T0 - 10 * MIN).toISOString() }),
+        { ...conv('s_dom', { nick: '陌生人甲', at: domStrangerAt, text: 'DOM先读到' }), isStranger: true },
+      ]),
+      via: 'dom',
+      strangerCount: 1,
+    }, { now: at(T0 + 15 * MIN) });
+    assert.deepEqual(rDom.events, [`dm.received:Douyin:s_dom:${domStrangerAt}`], 'DOM 路径行为与 origin/main 一致，不被 Context 基线压掉');
+  });
+
+  test('占位昵称「陌生人消息」既不覆盖真实昵称，也不沿用旧行占位词到 payload.nickname', async () => {
+    // 1. 回落 DOM 时，折叠行 header='陌生人消息' 不覆盖库里真实昵称
+    const c1 = sdkConv('0:1:me:s1', { uid: 's1', stranger: true, text: '新消息', atMs: T0 + 5 * MIN });
+    installFakeDoc({ domLis: [makeLi({ item: c1, headerText: '陌生人消息\n刚刚', ctxValue: null })] });
+    const rawDom = await rawDms(fakePage(), { readVia: 'dom', settleMs: 0 });
+    assert.equal(rawDom.conversations[0].name, null);
+    const parsedDom = parseDms(rawDom, { accountUid: ME, fetchedAt: new Date(T0 + 5 * MIN).toISOString() });
+    assert.equal(parsedDom.conversations[0].peer.nickname, null);
+
+    const db = freshDb();
+    const acc = douyin(db);
+    ingestSnapshot(db, acc, dmsSnap([conv('0:1:me:s1', { nick: '真实昵称', at: new Date(T0 - 10 * MIN).toISOString() })]), { now: at(T0) });
+    // 即使上层直接塞入占位昵称，也不得覆盖
+    ingestSnapshot(db, acc, dmsSnap([conv('0:1:me:s1', { nick: '陌生人消息', at: new Date(T0 + 5 * MIN).toISOString() })]), { now: at(T0 + 6 * MIN) });
+    assert.equal(db.prepare("SELECT peerNickname FROM conversations WHERE id = 'Douyin:0:1:me:s1'").get().peerNickname, '真实昵称');
+
+    // 2. 升级前旧行存了 '陌生人消息'：Context 昵称为 null 时，库里清洗为 null 且事件 payload.nickname 不带占位词
+    db.prepare("UPDATE conversations SET peerNickname = '陌生人消息' WHERE id = 'Douyin:0:1:me:s1'").run();
+    const nextAt = new Date(T0 + 15 * MIN).toISOString();
+    const r = ingestSnapshot(db, acc, {
+      ...dmsSnap([{ ...conv('0:1:me:s1', { at: nextAt, text: '再问一句' }), peer: { uid: 's1', nickname: null, kind: 'user' }, isStranger: true }]),
+      via: 'context',
+      strangerCount: 1,
+      hasStrangerList: true,
+    }, { now: at(T0 + 16 * MIN) });
+    assert.equal(r.events.length, 1);
+    assert.equal(db.prepare("SELECT peerNickname FROM conversations WHERE id = 'Douyin:0:1:me:s1'").get().peerNickname, null);
+    const evPayload = JSON.parse(db.prepare('SELECT payload FROM events WHERE id = ?').get(r.events[0]).payload);
+    assert.equal(evPayload.nickname, null, 'payload.nickname 不得沿用旧行占位词');
+  });
+
+  test('双连接并发迁移不报 duplicate column name: occurredAt', () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kin340-conc-')), 'ops.db');
+    const setup = new DatabaseSync(file);
+    setup.exec(`
+      CREATE TABLE events (
+        id TEXT PRIMARY KEY, type TEXT NOT NULL, platformCode TEXT NOT NULL, accountId TEXT, subjectId TEXT,
+        createdAt TEXT NOT NULL, payload TEXT NOT NULL,
+        handledAt TEXT, handledOutcome TEXT, handledNote TEXT, actionId TEXT
+      );
+    `);
+    setup.close();
+
+    const db1 = new DatabaseSync(file);
+    const db2 = new DatabaseSync(file);
+    db1.exec('PRAGMA busy_timeout=5000;');
+    db2.exec('PRAGMA busy_timeout=5000;');
+    // 确定性交错：db2 的 PRAGMA table_info(events) 看到缺 occurredAt 后，db1 抢先完成 ALTER
+    const origPrepare = db2.prepare.bind(db2);
+    let raced = false;
+    db2.prepare = (sql) => {
+      const stmt = origPrepare(sql);
+      if (sql === 'PRAGMA table_info(events)' && !raced) {
+        const origAll = stmt.all.bind(stmt);
+        stmt.all = (...args) => {
+          const cols = origAll(...args);
+          if (!raced && !cols.some((c) => c.name === 'occurredAt')) {
+            raced = true;
+            migrateEngage(db1);
+          }
+          return cols;
+        };
+      }
+      return stmt;
+    };
+    assert.doesNotThrow(() => migrateEngage(db2));
+    assert.equal(raced, true, '确实触发了双连接并发竞争');
+    assert.ok(db2.prepare('PRAGMA table_info(events)').all().some((c) => c.name === 'occurredAt'));
+    db1.close();
+    db2.close();
+  });
+
+  test('deliverPending 实际推送的 webhook JSON 字段集合不变（不泄漏 occurredAt）', async () => {
+    const db = freshDb();
+    const acc = douyin(db);
+    subscribe(db, { subscriberId: 'bot-kin340', url: 'https://bot.example.test/hook', types: ['dm.received'] }, { now: at(T0 - MIN) });
+    const sentAt = new Date(T0 - 30 * MIN).toISOString();
+    const ingestMs = T0 + 5 * MIN;
+    ingestSnapshot(db, acc, dmsSnap([conv('k0')]), { now: at(T0) });
+    ingestSnapshot(db, acc, dmsSnap([conv('k0'), conv('k1', { nick: '张三', at: sentAt, text: '你好' })]), { now: at(ingestMs) });
+
+    const posted = [];
+    const fetchImpl = async (url, init) => {
+      posted.push({ url, body: JSON.parse(init.body) });
+      return { ok: true, status: 200, text: async () => 'ok' };
+    };
+    await deliverPending(db, { now: at(ingestMs + MIN), fetchImpl, notify: async () => true });
+    assert.equal(posted.length, 1);
+    const body = posted[0].body;
+    assert.deepEqual(Object.keys(body).sort(), ['batchId', 'events', 'sentAt', 'subscriberId']);
+    assert.equal(body.events.length, 1);
+    const ev = body.events[0];
+    assert.deepEqual(Object.keys(ev).sort(), ['accountId', 'createdAt', 'delivery', 'handled', 'id', 'payload', 'platform', 'subjectId', 'type']);
+    assert.equal('occurredAt' in ev, false, 'webhook JSON 不增加 occurredAt 字段');
+    assert.deepEqual(Object.keys(ev.payload).sort(), ['at', 'conversationId', 'nickname', 'text']);
+    assert.equal(ev.createdAt, new Date(ingestMs).toISOString());
+    assert.equal(ev.payload.at, sentAt);
   });
 
   test('首轮 strangerConversationList 为空、次轮延迟加载出历史陌生人：早于基线的旧陌生人不灌事件，基线后的新陌生人正常发事件', () => {
@@ -422,7 +817,7 @@ describe('sync 自检统计与私信入库延迟告警', () => {
     assert.equal(r4.jobs[0].stats.maxDmDelayMs, 4 * HOUR);
     assert.equal(r4.jobs[0].stats.delayAlerted, undefined, '6 小时冷却内不重复发飞书');
     assert.equal(notices.length, 1);
-    assert.equal(logs.filter((l) => l.includes('入库延迟告警')).length, 2, '冷却期内日志仍记录');
+    assert.equal(logs.filter((l) => l.includes('入库延迟告警')).length, 1, '冷却期内不重复写告警日志');
 
     nowMs += DM_DELAY_ALERT_COOLDOWN_MS + 15 * MIN;
     const r5 = await runRound(db, base);

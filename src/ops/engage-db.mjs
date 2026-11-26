@@ -1,6 +1,15 @@
 // S6a 评论私信、事件发件箱、订阅、抓取任务的表。都是 IF NOT EXISTS，重复跑不动已有数据。
 // 主键一律存拼好的 <platformCode>:<原生 id>；时间一律 ISO 字符串（UTC）。
 // engage_works：评论所属作品的基本信息（S6a 自己的表）。S3（KIN-328）的作品和指标在 works 表（src/ops/works-db.mjs），两张表同库不同名，互不覆盖。
+function addColumnIfMissing(db, table, col, type) {
+  if (db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) return;
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+  } catch (e) {
+    if (!/duplicate column name/i.test(String(e?.message ?? ''))) throw e;
+  }
+}
+
 export function migrateEngage(db) {
   db.exec(`
 CREATE TABLE IF NOT EXISTS engage_works (
@@ -83,11 +92,11 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'comments', min(firstSe
 INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt) FROM conversations GROUP BY accountId;
 `);
   // 本分支早期建的 actions 没有 targetLastAt
-  if (!db.prepare('PRAGMA table_info(actions)').all().some((c) => c.name === 'targetLastAt')) db.exec('ALTER TABLE actions ADD COLUMN targetLastAt TEXT');
+  addColumnIfMissing(db, 'actions', 'targetLastAt', 'TEXT');
   // 推送前过滤（filter.mjs）命中的规则名；没命中为 NULL
-  if (!db.prepare('PRAGMA table_info(events)').all().some((c) => c.name === 'filteredReason')) db.exec('ALTER TABLE events ADD COLUMN filteredReason TEXT');
+  addColumnIfMissing(db, 'events', 'filteredReason', 'TEXT');
   // 对方发出时间（ISO，UTC）：评论取 comments.createdAt，私信取 last.at；旧行与系统事件为 NULL。createdAt 保持入库时间不变
-  if (!db.prepare('PRAGMA table_info(events)').all().some((c) => c.name === 'occurredAt')) db.exec('ALTER TABLE events ADD COLUMN occurredAt TEXT');
+  addColumnIfMissing(db, 'events', 'occurredAt', 'TEXT');
   // 自动关分两组：write（回复、私信）、moderate（删评论、拉黑、删会话）。旧记录 NULL 当 write
-  if (!db.prepare('PRAGMA table_info(engage_write_trips)').all().some((c) => c.name === 'family')) db.exec('ALTER TABLE engage_write_trips ADD COLUMN family TEXT');
+  addColumnIfMissing(db, 'engage_write_trips', 'family', 'TEXT');
 }

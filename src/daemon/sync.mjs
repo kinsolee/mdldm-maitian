@@ -118,8 +118,8 @@ async function runJob(db, account, kind, jobId, deps) {
           const delay = checkDmDelay(db, s.events, dmDelayAlertMs);
           if (delay) {
             stats.maxDmDelayMs = delay.maxDelayMs;
-            log(`${localTime(now())} [engage] ${account.platformCode} dms 入库延迟告警：${delay.count} 条 dm.received 延迟超过 ${Math.round(dmDelayAlertMs / 60_000)} 分钟，最大延迟 ${fmtDelay(delay.maxDelayMs)}（via=${s.via ?? '-'}，陌生人=${s.strangerCount}）`);
             if (!recentlyDelayAlerted(db, account.id, now())) {
+              log(`${localTime(now())} [engage] ${account.platformCode} dms 入库延迟告警：${delay.count} 条 dm.received 延迟超过 ${Math.round(dmDelayAlertMs / 60_000)} 分钟，最大延迟 ${fmtDelay(delay.maxDelayMs)}（via=${s.via ?? '-'}，陌生人=${s.strangerCount}）`);
               const alerted = await safeNotify(notify, `⏰ ${name}入库延迟告警 | ${account.id}\n本轮 ${delay.count} 条新私信（dm.received）发出时间与入库时间差超过 ${Math.round(dmDelayAlertMs / 60_000)} 分钟，最大延迟 ${fmtDelay(delay.maxDelayMs)}。\n采集方式：${s.via ?? 'unknown'}，陌生人会话数：${s.strangerCount}，变更会话数：${s.changedConversations}。\n请检查采集方式与守护进程日志（抖音可核查 readViaApi 能力位；6 小时内不重复提醒）。`, log);
               if (alerted) stats.delayAlerted = true;
             }

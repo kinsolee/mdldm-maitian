@@ -119,6 +119,8 @@ function markGone(db, ctx, scannedWorks, seen, unresolved) {
   for (const workId of unresolved) partial.run(workId, 1, ctx.at);   // 没在 scannedWorks 里的作品
 }
 
+const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生人消息';
+
 function upsertConversations(db, ctx, snap) {
   const { code } = ctx;
   const prev = db.prepare('SELECT peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend FROM conversations WHERE id = ?');
@@ -132,14 +134,19 @@ function upsertConversations(db, ctx, snap) {
     // last 为 null 是「这一轮没读到」（例如小红书没打开的会话），不是「没有最后一句」：库里已有的不动
     // peerUid / peerNickname 读不到（例如首屏外 Context 会话没有 DOM 昵称）时保留库里已有值
     const nextUid = k.peer?.uid ?? before?.peerUid ?? null;
-    const nextNick = k.peer?.nickname ?? before?.peerNickname ?? null;
+    const incomingNick = k.peer?.nickname != null && !isPlaceholderNick(k.peer.nickname) ? k.peer.nickname : null;
+    const prevNick = before?.peerNickname != null && !isPlaceholderNick(before.peerNickname) ? before.peerNickname : null;
+    const nextNick = incomingNick ?? prevNick;
     const nextKind = k.peer?.kind ?? before?.peerKind ?? null;
     const nextUnread = k.unread ?? 0;
     const nextCanSend = bool(k.canSend);
-    const nextLastBy = last ? (last.by ?? null) : (before?.lastBy ?? null);
-    const nextLastAt = last ? (last.at ?? null) : (before?.lastAt ?? null);
-    const nextLastText = last ? (last.text ?? null) : (before?.lastText ?? null);
-    const nextLastType = last ? (last.type ?? null) : (before?.lastType ?? null);
+    const beforeLastMs = before?.lastAt ? Date.parse(before.lastAt) : NaN;
+    const incomingLastMs = last?.at ? Date.parse(last.at) : NaN;
+    const keepLast = !last?.at || (Number.isFinite(beforeLastMs) && Number.isFinite(incomingLastMs) && incomingLastMs < beforeLastMs);
+    const nextLastBy = keepLast ? (before?.lastBy ?? null) : (last.by ?? null);
+    const nextLastAt = keepLast ? (before?.lastAt ?? null) : (last.at ?? null);
+    const nextLastText = keepLast ? (before?.lastText ?? null) : (last.text ?? null);
+    const nextLastType = keepLast ? (before?.lastType ?? null) : (last.type ?? null);
     const vals = [ctx.accountId, code, nextUid, nextNick, nextKind, nextUnread,
       nextLastBy, nextLastAt, nextLastText, nextLastType, nextCanSend];
     const changed = !before
@@ -155,16 +162,26 @@ function upsertConversations(db, ctx, snap) {
     if (changed) ctx.stats.changedConversations++;
     if (before) { upd.run(...vals, ctx.at, id); ctx.stats.updated++; }
     else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
-    const isHistoricalStranger = !before
-      && k.isStranger === true
-      && ctx.strangerBaselineAt != null
-      && last?.at != null
-      && Date.parse(last.at) < Date.parse(ctx.strangerBaselineAt);
-    const baselineOnly = ctx.firstSync
-      || (ctx.firstContextSync && !before)
-      || (ctx.firstStrangerSync && k.isStranger === true && !before)
-      || isHistoricalStranger;
-    const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !baselineOnly;
+    const isFreshLast = !before || before.lastAt == null;
+    let isNewer;
+    if (isFreshLast) {
+      if (ctx.isContext) {
+        const effectiveBaselineAt = k.isStranger === true
+          ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt)
+          : ctx.contextBaselineAt;
+        const baselineMs = effectiveBaselineAt ? Date.parse(effectiveBaselineAt) : NaN;
+        const historical = Number.isFinite(baselineMs) && Number.isFinite(incomingLastMs) && incomingLastMs < baselineMs;
+        const baselineOnly = ctx.firstSync
+          || ctx.firstContextSync
+          || (k.isStranger === true && ctx.firstStrangerSync)
+          || historical;
+        isNewer = !baselineOnly;
+      } else {
+        isNewer = before ? true : !ctx.firstSync;
+      }
+    } else {
+      isNewer = Number.isFinite(incomingLastMs) && Number.isFinite(beforeLastMs) && incomingLastMs > beforeLastMs;
+    }
     if (last?.by !== 'peer' || !last.at || !isNewer) continue;
     emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id, occurredAt: last.at,
       payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
@@ -202,10 +219,12 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
   const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats };
   return tx(db, () => {
     ctx.firstSync = !hasBaseline(db, ctx.accountId, kind);
-    if (kind === 'dms') {
-      ctx.firstContextSync = snap.via === 'context' && !hasBaseline(db, ctx.accountId, 'dms:context');
+    ctx.isContext = kind === 'dms' && snap.via === 'context';
+    if (ctx.isContext) {
+      ctx.contextBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:context');
       ctx.strangerBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:stranger');
-      ctx.firstStrangerSync = snap.via === 'context' && ctx.strangerBaselineAt == null;
+      ctx.firstContextSync = ctx.contextBaselineAt == null;
+      ctx.firstStrangerSync = ctx.strangerBaselineAt == null;
     }
     upsertWorks(db, ctx, snap.works);
     if (kind === 'comments') upsertComments(db, ctx, snap);
