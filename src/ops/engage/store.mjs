@@ -126,9 +126,17 @@ function upsertConversations(db, ctx, snap) {
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
+  const storedMessage = db.prepare('SELECT at FROM messages WHERE id = ? AND accountId = ? AND conversationId = ? AND by = ?');
+  const dmMessages = code === 'Douyin' ? new Map(snap.messages.map((m) => [m.conversationNativeId, m])) : null;
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
-    const last = k.last ?? null;
+    const observed = dmMessages?.get(k.nativeId);
+    const message = observed && observed.at === k.last?.at && observed.by === k.last?.by ? observed : null;
+    const stored = message
+      ? storedMessage.get(joinId(code, message.nativeId), ctx.accountId, id, message.by) : null;
+    // 同一个服务端 ID 沿用首次入库时间，使两条读取路径共用 main 的时间型事件 ID。
+    const last = stored?.at && k.lastServerId === message.nativeId
+      ? { ...k.last, at: stored.at } : k.last;
     const before = prev.get(id);
     // last 为 null 是「这一轮没读到」（例如小红书没打开的会话），不是「没有最后一句」：库里已有的不动
     // peerUid / peerNickname 读不到（例如首屏外 Context 会话没有 DOM 昵称）时保留库里已有值
@@ -161,9 +169,13 @@ function upsertConversations(db, ctx, snap) {
     else { ins.run(...vals, id, ctx.at, ctx.at); ctx.stats.inserted++; }
     const isNewer = before ? before.lastAt == null || Date.parse(last?.at) > Date.parse(before.lastAt) : !ctx.firstSync;
     if (last?.by !== 'peer' || !last.at || !isNewer) continue;
-    const domPeer = !k.isStranger && (snap.via === 'dom-fallback' || k.domPeerAt === last.at);
+    const domPeer = snap.via === 'dom-fallback' || k.domPeerAt === k.last.at;
     const cutoff = domPeer ? ctx.domCutoff ?? ctx.contextCutoff : ctx.contextCutoff;
-    if (cutoff && Date.parse(last.at) < Date.parse(cutoff)) continue;
+    if (cutoff && Date.parse(last.at) < Date.parse(cutoff)) {
+      // 首次加载或重读历史行只建基线。已知会话已观察到的末条之后，新出现的消息按 main 派发。
+      const unseen = message && stored?.at !== last.at;
+      if (!before?.lastAt || !unseen) continue;
+    }
     emit(db, ctx, { id: `dm.received:${id}:${last.at}`, type: 'dm.received', subjectId: id, occurredAt: last.at,
       payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
   }
@@ -207,18 +219,18 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
     if (context || (douyinDms && snap.via === 'dom-fallback')) {
       ctx.contextCutoff = getBaselineAt(db, ctx.accountId, 'dms:context');
       ctx.domCutoff = getBaselineAt(db, ctx.accountId, 'dms:legacy-dom');
-      if (context && ctx.contextCutoff == null) {
+      if (ctx.contextCutoff == null) {
         const job = db.prepare(`SELECT startedAt FROM sync_jobs
           WHERE platformCode = ? AND accountId = ? AND kind = 'dms' AND status = 'ok'
           ORDER BY finishedAt DESC, rowid DESC LIMIT 1`).get(ctx.code, ctx.accountId);
         const previousCapture = job?.startedAt ?? getBaselineAt(db, ctx.accountId, 'dms:capture');
         ctx.contextCutoff = previousCapture ?? accountBaselineAt ?? captureAt;
-        if (accountBaselineAt && !previousCapture) {
+        if (accountBaselineAt && !previousCapture && !ctx.domCutoff) {
           // main 旧库只记入库时间。上次已读到的最新消息是采集时刻的下界；
-          // 普通首屏沿用 main 处理两者之间的消息，Context 扩展出的历史列表仍用入库水位。
+          // 可见首屏沿用 main 处理两者之间的消息，Context 扩展出的历史列表仍用入库水位。
           const { latest } = db.prepare(`SELECT max(at) AS latest FROM messages
             WHERE accountId = ? AND firstSeenAt <= ? AND at <= ?`).get(ctx.accountId, accountBaselineAt, accountBaselineAt);
-          ctx.domCutoff = latest ?? iso(0);
+          ctx.domCutoff = latest ?? accountBaselineAt;
           setBaseline(db, ctx.accountId, 'dms:legacy-dom', ctx.domCutoff);
         }
       }

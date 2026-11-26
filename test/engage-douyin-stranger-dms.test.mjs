@@ -1044,6 +1044,80 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     }
   });
 
+  // 第十轮：同一批页面快照分别用原 DOM 与新读取路径回放。每次重开临时库验证累计派发。
+  async function replayDms(t, rounds, { legacy = false, job = false } = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin340-r10-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, 'fixture.sqlite');
+    let db = freshDb(file);
+    const acc = douyin(db);
+    if (legacy) db.exec(mainBaseline);
+    db.close();
+    for (const [i, { dom, context = dom, via = 'context' }] of rounds.entries()) {
+      const service = via === 'dom-fallback' ? null : {
+        bytedIM: {}, loading: false,
+        conversationList: context.filter((k) => !k.isStrangerChat),
+        strangerConversationList: context.filter((k) => k.isStrangerChat),
+      };
+      installFakeDoc({ domLis: dom.map((item) => makeLi({ item, ctxValue: service })),
+        chatEls: service ? [{ __reactFiber$fixture: { memoizedProps: { value: service } } }] : [] });
+      const raw = await rawDms(fakePage(), { readVia: via === 'dom' ? 'dom' : 'api', settleMs: 0, contextWaitMs: 0 });
+      assert.equal(raw.via, via);
+      const snap = parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0 + i * MIN).toISOString() });
+      db = freshDb(file);
+      ingestSnapshot(db, acc, snap, { now: at(T0 + (i + 1) * MIN) });
+      if (i === 0 && job) {
+        const id = createJob(db, { accountId: acc.id, kind: 'dms', platformCode: 'Douyin', now: at(T0) });
+        startJob(db, id, { now: at(T0) });
+        finishJob(db, id, { status: 'ok', now: at(T0 + MIN) });
+      }
+      db.close();
+    }
+    db = freshDb(file);
+    const events = db.prepare('SELECT payload FROM events ORDER BY rowid').all().map((r) => JSON.parse(r.payload).text);
+    const ids = db.prepare('SELECT id FROM messages ORDER BY id').all().map((r) => r.id);
+    db.close();
+    return { events, ids };
+  }
+
+  test('第十轮：旧库基线写入前，已到达且在首屏可见的陌生人消息派发一次', async (t) => {
+    const fresh = sdkConv('stranger', { stranger: true, atMs: T0 + 500, text: 'fresh' });
+    for (const via of ['context', 'dom-fallback']) {
+      const r = await replayDms(t, [
+        { dom: [sdkConv('thread', { atMs: T0, text: 'baseline' })], via },
+        { dom: [fresh], via }, { dom: [fresh], via }, { dom: [fresh] },
+      ], { legacy: true });
+      assert.deepEqual(r.events, ['fresh'], via);
+    }
+  });
+
+  test('第十轮：已知会话晚出现的私信比旧末条新，即使早于 startedAt 也派发一次', async (t) => {
+    const old = sdkConv('known', { atMs: T0 - 2 * MIN, text: 'old' });
+    const delayed = sdkConv('known', { atMs: T0 - MIN, text: 'delayed' });
+    const r = await replayDms(t, [{ dom: [old], via: 'dom' }, { dom: [delayed] }, { dom: [delayed] }], { job: true });
+    assert.deepEqual(r.events, ['delayed']);
+  });
+
+  test('第十轮：DOM 已看到的对方消息在下一轮被己方回复取代，仍入库并派发一次', async (t) => {
+    const old = sdkConv('known', { atMs: T0 - MIN, byMe: true });
+    const fresh = sdkConv('known', { atMs: T0 + 1, serverId: 'peer-new', text: 'fresh' });
+    const mine = sdkConv('known', { atMs: T0 + MIN, byMe: true });
+    const r = await replayDms(t, [{ dom: [old] }, { dom: [fresh], context: [old] }, { dom: [mine] }, { dom: [mine] }]);
+    assert.deepEqual(r.events, ['fresh']);
+    assert.ok(r.ids.includes('Douyin:peer-new'));
+  });
+
+  test('第十轮：同一 serverId 的 DOM 小数秒与 Context 整数毫秒只派发一次', async (t) => {
+    const old = sdkConv('known', { atMs: T0 - MIN, byMe: true });
+    const coarse = sdkConv('known', { serverId: 'peer', text: 'one' });
+    coarse.lastMessage.createdAt = T0 / 1000 + 0.456;
+    const precise = sdkConv('known', { atMs: T0 + 456, serverId: 'peer', text: 'one' });
+    const r = await replayDms(t, [{ dom: [old], via: 'dom' }, { dom: [coarse], via: 'dom' },
+      { dom: [coarse], context: [precise] }, { dom: [sdkConv('other', { byMe: true })], context: [precise] }, { dom: [coarse], via: 'dom' }]);
+    assert.deepEqual(r.events, ['one']);
+    assert.equal(r.ids.filter((id) => id === 'Douyin:peer').length, 1);
+  });
+
   test('占位昵称「陌生人消息」既不覆盖真实昵称，也不沿用旧行占位词到 payload.nickname', async () => {
     // 1. 回落 DOM 时，折叠行 header='陌生人消息' 不覆盖库里真实昵称
     const c1 = sdkConv('0:1:me:s1', { uid: 's1', stranger: true, text: '新消息', atMs: T0 + 5 * MIN });

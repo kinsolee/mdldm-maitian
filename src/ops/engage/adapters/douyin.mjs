@@ -249,19 +249,18 @@ export function readDmPage(via = 'context') {
     createdAt: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null,
     content: lm.content ?? null,
   } : null;
-  if (via === 'dom') {
-    return domItems.map((li) => {
-      let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
-      const it = f?.memoizedProps?.item;
-      if (!it || it.id == null || String(it.id).trim() === '') return null;
-      const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
-      const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
-      const name = rawName && rawName !== '陌生人消息' ? rawName : null;
-      return { id: it.id, shortId: it.shortId != null ? String(it.shortId) : null, toParticipantUserId: it.toParticipantUserId != null ? String(it.toParticipantUserId) : null, isStrangerChat: !!it.isStrangerChat,
-        isGroupChat: !!(it.isGroupChat ?? it.type === 2), unreadCount: it.unreadCount ?? 0, name,
-        lastMessage: messageOf(it.lastMessage) };
-    }).filter(Boolean);
-  }
+  const readDom = () => domItems.map((li) => {
+    let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
+    const it = f?.memoizedProps?.item;
+    if (!it || it.id == null || String(it.id).trim() === '') return null;
+    const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
+    const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
+    const name = rawName && rawName !== '陌生人消息' ? rawName : null;
+    return { id: it.id, shortId: it.shortId != null ? String(it.shortId) : null, toParticipantUserId: it.toParticipantUserId != null ? String(it.toParticipantUserId) : null, isStrangerChat: !!it.isStrangerChat,
+      isGroupChat: !!(it.isGroupChat ?? it.type === 2), unreadCount: it.unreadCount ?? 0, name,
+      lastMessage: messageOf(it.lastMessage) };
+  }).filter(Boolean);
+  if (via === 'dom') return readDom();
   const seenEl = new Set();
   const starts = [];
   const addStarts = (els, cap) => {
@@ -301,18 +300,6 @@ export function readDmPage(via = 'context') {
     return { ok: true, conversations: [], strangerCount: 0, hasStrangerList: true, emptyConfirmed: true, domRows: 0 };
   }
 
-  const domNames = new Map();
-  const domPeerTimes = new Map();
-  for (const li of domItems) {
-    let f = fiberOf(li); for (let i = 0; i < 2 && f; i++) f = f.return;
-    const it = f?.memoizedProps?.item;
-    if (!it || it.id == null) continue;
-    const lm = messageOf(it.lastMessage);
-    if (lm && !lm.isFromMe) domPeerTimes.set(String(it.id), lm.createdAt);
-    const hdr = li.querySelector('[class*=item-header], [class*=name]')?.innerText?.trim();
-    const rawName = (hdr || li.innerText || '').split('\n')[0]?.trim() || null;
-    if (rawName && rawName !== '陌生人消息') domNames.set(String(it.id), rawName);
-  }
   const nameFromMap = (uid) => {
     if (!uid) return null;
     for (const m of [svc.userInfoMap, svc.userMap, svc.profileMap]) {
@@ -324,7 +311,7 @@ export function readDmPage(via = 'context') {
     return null;
   };
   const pickName = (it, id, uid) => {
-    for (const x of [domNames.get(id), it.name, it.coreInfo?.name, it.nickname, it.peerNickname, it.userInfo?.nickname, it.toUserInfo?.nickname, nameFromMap(uid)]) {
+    for (const x of [it.name, it.coreInfo?.name, it.nickname, it.peerNickname, it.userInfo?.nickname, it.toUserInfo?.nickname, nameFromMap(uid)]) {
       if (typeof x === 'string' && x.trim() && x.trim() !== '陌生人消息') return x.trim();
     }
     return null;
@@ -341,7 +328,6 @@ export function readDmPage(via = 'context') {
       isGroupChat: !!(it.isGroupChat === true || it.type === 2),
       unreadCount: Number(it.unreadCount) || 0,
       name: pickName(it, id, uid),
-      domPeerTime: domPeerTimes.get(id),
       lastMessage: messageOf(it.lastMessage),
     };
   };
@@ -351,18 +337,19 @@ export function readDmPage(via = 'context') {
     return t < 1e12 ? t * 1000 : t;
   };
   const byId = new Map();
-  const put = (item) => {
+  const put = (item, fromDom = false) => {
     if (!item) return;
     const prev = byId.get(item.id);
     if (!prev) { byId.set(item.id, item); return; }
     const prevTs = millis(prev.lastMessage);
     const nextTs = millis(item.lastMessage);
-    const winner = nextTs > prevTs ? item : prev;
+    const winner = nextTs > prevTs || (fromDom && nextTs === prevTs) ? item : prev;
     const other = winner === item ? prev : item;
     byId.set(item.id, {
       ...winner,
       isStrangerChat: prev.isStrangerChat || item.isStrangerChat,
-      name: winner.name ?? other.name ?? null,
+      name: (fromDom ? item.name : null) ?? winner.name ?? other.name ?? null,
+      domPeerTime: item.domPeerTime ?? prev.domPeerTime,
       toParticipantUserId: winner.toParticipantUserId ?? other.toParticipantUserId ?? null,
       unreadCount: Math.max(prev.unreadCount, item.unreadCount),
     });
@@ -389,6 +376,10 @@ export function readDmPage(via = 'context') {
   }
   for (const item of shapedNormal) put(item);
   for (const item of shapedStrangers) put(item);
+  // DOM 可能先于 Context 更新，甚至已有 Context 尚未列出的会话。
+  for (const row of readDom()) {
+    put({ ...row, id: String(row.id), domPeerTime: row.lastMessage?.isFromMe === false ? row.lastMessage.createdAt : null }, true);
+  }
   const conversations = [...byId.values()];
   if (conversations.some(({ lastMessage: m }) => m?.createdAt && (m.serverId ?? m.clientMessageId) === '')) {
     return { ok: false, code: 'empty-message-id', domRows: domItems.length };
@@ -557,11 +548,14 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
     const id = String(c.id);
     const lm = c.lastMessage;
     const at = lm?.createdAt ? isoOf(lm.createdAt) : null;
+    const serverId = String(lm?.serverId ?? '').trim();
     const last = lm && at ? { by: lm.isFromMe ? 'me' : 'peer', at, text: textOf(lm), type: TYPE(lm.type) } : null;
     const rawName = typeof c.name === 'string' ? c.name.trim() : '';
     const nickname = rawName && rawName !== '陌生人消息' ? rawName : null;
     conversations.push({ nativeId: id, peer: { uid: c.isGroupChat ? null : str(c.toParticipantUserId), nickname, kind: c.isGroupChat ? 'group' : 'user' },
-      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}), ...(c.domPeerTime ? { domPeerAt: isoOf(c.domPeerTime) } : {}) });
+      unread: Number(c.unreadCount) || 0, last, canSend: !c.isGroupChat, ...(c.isStrangerChat ? { isStranger: true } : {}),
+      ...(serverId && serverId !== '0' ? { lastServerId: String(lm.serverId) } : {}),
+      ...(c.domPeerTime ? { domPeerAt: isoOf(c.domPeerTime) } : {}) });
     if (last) messages.push({ nativeId: String(lm.serverId ?? lm.clientMessageId ?? `${id}:${lm.createdAt}`), conversationNativeId: id, by: last.by, at, type: last.type, text: last.text });
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
