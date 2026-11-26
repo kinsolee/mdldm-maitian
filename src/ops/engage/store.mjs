@@ -29,7 +29,6 @@ export function insertEvent(db, { id, type, platformCode, accountId, subjectId, 
 }
 
 // 基线：这个账号这种 kind 成功入库过一次（哪怕是空的）。在 ingestSnapshot 的事务里写，和当前 job 有没有 finishJob 无关
-const hasBaseline = (db, accountId, kind) => !!db.prepare('SELECT 1 FROM engage_baselines WHERE accountId = ? AND kind = ?').get(accountId, kind);
 const getBaselineAt = (db, accountId, kind) => db.prepare('SELECT establishedAt FROM engage_baselines WHERE accountId = ? AND kind = ?').get(accountId, kind)?.establishedAt ?? null;
 const setBaseline = (db, accountId, kind, at) => db.prepare('INSERT OR IGNORE INTO engage_baselines (accountId, kind, establishedAt) VALUES (?, ?, ?)').run(accountId, kind, at);
 
@@ -123,18 +122,28 @@ const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生�
 
 // 抖音每个会话只带最后一条消息。把实际插入结果交给事件派发，重读和撤回也可以更新会话展示。
 function insertMessages(db, ctx, messages) {
-  const insert = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, douyinServerId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO messages (id, conversationId, accountId, by, at, type, text, firstSeenAt, douyinServerId, douyinRawTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
   const confirmServer = db.prepare('UPDATE messages SET douyinServerId = ? WHERE id = ? AND conversationId = ? AND douyinServerId IS NULL');
   const remember = db.prepare('INSERT OR IGNORE INTO douyin_dm_client_ids (conversationId, clientId, serverId) VALUES (?, ?, ?)');
   const lookup = db.prepare('SELECT serverId FROM douyin_dm_client_ids WHERE conversationId = ? AND clientId = ?');
   const promoteClient = db.prepare('UPDATE OR IGNORE messages SET id = ? WHERE conversationId = ? AND id = ?');
+  // 先后只见 serverId、clientId 会留下待判行；SDK 同时给出两个 ID 时可确认它们是一条。
+  const mergeClient = db.prepare(`UPDATE messages AS srv SET douyinDispatch =
+    CASE WHEN cli.douyinDispatch LIKE 'dm.received:%' OR srv.douyinDispatch = 'pending'
+      THEN cli.douyinDispatch ELSE srv.douyinDispatch END
+    FROM messages AS cli WHERE srv.id = ? AND cli.id = ? AND srv.conversationId = ?
+      AND cli.conversationId = srv.conversationId AND (srv.douyinDispatch = 'pending' OR cli.douyinDispatch = 'pending')`);
+  const removeClient = db.prepare('DELETE FROM messages WHERE id = ? AND conversationId = ?');
   const moveAliases = db.prepare('UPDATE douyin_dm_client_ids SET serverId = ? WHERE conversationId = ? AND serverId = ?');
   // main 的占位行没有保存原 clientId。只在本会话、方向及旧时间相符时接续；
   // 当前输入已换键时，再核对旧行的类型和正文，避免认领同时间的另一条消息。
-  const promoteLegacy = db.prepare(`UPDATE OR IGNORE messages SET id = :id, at = :at
+  // 无原始时间的旧时间键只能用键中保留下来的值作证，不能用取整后的 at 认领。
+  const promoteLegacy = db.prepare(`UPDATE OR IGNORE messages SET id = :id, at = :at, douyinRawTimestamp = :rawTimestamp
     WHERE id = (SELECT id FROM messages
       WHERE conversationId = :convId AND by = :by AND id IN (:mainId, :timestampId, 'Douyin:0', 'Douyin:')
-        AND (at = :mainAt OR (id = :timestampId AND at = :at))
+        AND CASE WHEN douyinRawTimestamp IS NOT NULL THEN douyinRawTimestamp = :rawTimestamp
+                 WHEN id = :timestampId THEN id = :convId || ':' || :rawTimestamp
+                 ELSE at = :mainAt END
         AND (id = :mainId OR (type IS :type AND text IS :text))
       ORDER BY (id = :mainId) DESC, (id = :timestampId) DESC, id LIMIT 1)
       AND id <> :id`);
@@ -146,26 +155,54 @@ function insertMessages(db, ctx, messages) {
       if (m.clientId && m.clientId !== m.nativeId) {
         const clientKey = joinId(ctx.code, m.clientId);
         remember.run(convId, m.clientId, id);
-        if (promoteClient.run(id, convId, clientKey).changes) moveAliases.run(id, convId, clientKey);
+        if (promoteClient.run(id, convId, clientKey).changes) {
+          moveAliases.run(id, convId, clientKey);
+        } else if (mergeClient.run(id, clientKey, convId).changes) {
+          removeClient.run(clientKey, convId);
+          moveAliases.run(id, convId, clientKey);
+        }
       } else if (m.clientId || m.usesTimestampKey) {
         id = lookup.get(convId, m.nativeId)?.serverId ?? id;
       }
       if (m.legacy?.at) {
         const timestampId = joinId(ctx.code, m.legacy.timestampId);
         const promoted = promoteLegacy.run({ id, convId, timestampId, mainId: joinId(ctx.code, m.legacy.nativeId),
-          mainAt: m.legacy.at, at: m.at, by: m.by, type: m.type, text: m.text });
+          mainAt: m.legacy.at, rawTimestamp: m.legacy.rawTimestamp, at: m.at, by: m.by, type: m.type, text: m.text });
         if (promoted.changes && timestampId !== id) remember.run(convId, m.legacy.timestampId, id);
       }
     }
     const serverId = ctx.code === 'Douyin' ? m.serverId ?? null : null;
-    const inserted = insert.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at, serverId).changes > 0;
+    const inserted = insert.run(id, convId, ctx.accountId, m.by, m.at ?? null, m.type ?? null, m.text ?? null, ctx.at, serverId, m.legacy?.rawTimestamp ?? null).changes > 0;
     if (!inserted && serverId) confirmServer.run(serverId, id, convId);
     if (inserted) ctx.stats.inserted++;
     if (ctx.code === 'Douyin' && m.by === 'peer') {
-      douyinPeers.set(m.conversationNativeId, { at: m.at, id, nativeId: m.nativeId, serverId, usesTimestampKey: m.usesTimestampKey, inserted });
+      douyinPeers.set(m.conversationNativeId, { at: m.at, id, inserted });
     }
   }
   return douyinPeers;
+}
+
+function emitDm(db, ctx, conversationId, at, text, nickname, messageId) {
+  let id = `dm.received:${conversationId}:${at}`;
+  if (messageId && db.prepare('SELECT 1 FROM events WHERE id = ?').get(id)) id += `:${splitId(messageId).nativeId}`;
+  emit(db, ctx, { id, type: 'dm.received', subjectId: conversationId, occurredAt: at,
+    payload: { conversationId, nickname, text: snippet(text), at } });
+  if (messageId) db.prepare('UPDATE messages SET douyinDispatch = ? WHERE id = ?').run(id, messageId);
+}
+
+// 即使已经不是会话末条，也会随该账号下一轮私信同步重查。基线行没有 pending 标记。
+function retryPendingDms(db, ctx) {
+  const pending = db.prepare(`SELECT m.id, m.conversationId, m.at, m.text, m.douyinServerId, c.peerNickname
+    FROM messages m JOIN conversations c ON c.id = m.conversationId
+    WHERE m.accountId = ? AND m.douyinDispatch = 'pending' ORDER BY m.at, m.id`).all(ctx.accountId);
+  const prior = db.prepare(`SELECT count(*) AS total, count(CASE WHEN douyinServerId <> ? THEN 1 END) AS distinctServers
+    FROM messages WHERE conversationId = ? AND at = ? AND by = 'peer' AND douyinDispatch IS NOT 'pending'`);
+  for (const m of pending) {
+    const peers = prior.get(m.douyinServerId, m.conversationId, m.at);
+    if (peers.total && peers.total === peers.distinctServers) {
+      emitDm(db, ctx, m.conversationId, m.at, m.text, m.peerNickname, m.id);
+    }
+  }
 }
 
 function upsertConversations(db, ctx, snap) {
@@ -174,9 +211,8 @@ function upsertConversations(db, ctx, snap) {
   const ins = db.prepare(`INSERT INTO conversations (accountId, platformCode, peerUid, peerNickname, peerKind, unread, lastBy, lastAt, lastText, lastType, canSend, id, firstSeenAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const upd = db.prepare('UPDATE conversations SET accountId = ?, platformCode = ?, peerUid = ?, peerNickname = ?, peerKind = ?, unread = ?, lastBy = ?, lastAt = ?, lastText = ?, lastType = ?, canSend = ?, updatedAt = ? WHERE id = ?');
-  const hasEventId = db.prepare('SELECT 1 FROM events WHERE id = ?');
-  const sameTimePeers = db.prepare(`SELECT count(*) AS total, count(CASE WHEN douyinServerId <> ? THEN 1 END) AS distinctServers
-    FROM messages WHERE conversationId = ? AND at = ? AND by = 'peer' AND id <> ?`);
+  const defer = db.prepare("UPDATE messages SET douyinDispatch = 'pending' WHERE id = ? AND douyinDispatch IS NULL");
+  const hasPeerAt = db.prepare("SELECT 1 FROM messages WHERE conversationId = ? AND at = ? AND by = 'peer' AND id <> ? LIMIT 1");
   const peerMessages = insertMessages(db, ctx, snap.messages);
   for (const k of snap.conversations) {
     const id = joinId(code, k.nativeId);
@@ -220,31 +256,18 @@ function upsertConversations(db, ctx, snap) {
     if (last?.by !== 'peer' || !last.at || ctx.firstSync) continue;
     const peerMessage = peerMessages.get(k.nativeId);
     if (peerMessage && !peerMessage.inserted) continue;
-    const baselineAt = k.isStranger ? (ctx.strangerBaselineAt ?? ctx.contextBaselineAt) : ctx.contextBaselineAt;
-    const historical = baselineAt != null && incomingLastMs < Date.parse(baselineAt);
-    if (before?.lastAt == null) {
-      const needsBaseline = ctx.firstContextSync || (k.isStranger && ctx.firstStrangerSync);
-      if (historical) continue;
-      if (needsBaseline && (!Number.isFinite(ctx.previousDmFinishMs) || incomingLastMs < ctx.previousDmFinishMs)) continue;
-    } else {
-      if (incomingLastMs < beforeLastMs) continue;
-      // 只有会话摘要时沿用 main 的严格时间比较；抖音能从新插入的消息区分同毫秒的不同 ID。
-      if (incomingLastMs === beforeLastMs && (historical || peerMessage?.at !== last.at || peerMessage.usesTimestampKey)) continue;
-    }
-    let eventId = `dm.received:${id}:${last.at}`;
-    if (peerMessage) {
-      // 新插入的 clientId / 时间键也可能来自同一条私信。只有能与每一条同时间 peer 行区分才派发。
-      const prior = sameTimePeers.get(peerMessage.serverId, id, last.at, peerMessage.id);
-      if (prior.total !== prior.distinctServers) continue;
-      if (!prior.total && before?.lastBy === 'peer' && beforeLastMs === incomingLastMs) continue;
-      if (hasEventId.get(eventId)) {
-        if (!prior.total) continue;
-        eventId += `:${peerMessage.nativeId}`;
+    const baselineAt = (k.isStranger ? ctx.strangerBaselineAt : null) ?? ctx.contextBaselineAt ?? ctx.firstContextCutoff;
+    if (incomingLastMs < Date.parse(baselineAt)) continue;
+    if (incomingLastMs <= beforeLastMs) {
+      if (peerMessage?.at !== last.at || incomingLastMs < Date.parse(ctx.dmBaselineAt)) continue;
+      if ((incomingLastMs === beforeLastMs && before.lastBy === 'peer') || hasPeerAt.get(id, last.at, peerMessage.id)) {
+        defer.run(peerMessage.id);
+        continue;
       }
     }
-    emit(db, ctx, { id: eventId, type: 'dm.received', subjectId: id, occurredAt: last.at,
-      payload: { conversationId: id, nickname: nextNick, text: snippet(last.text), at: last.at } });
+    emitDm(db, ctx, id, last.at, last.text, nextNick, peerMessage?.id);
   }
+  if (code === 'Douyin') retryPendingDms(db, ctx);
 }
 
 function emit(db, ctx, e) {
@@ -272,7 +295,9 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
     : { inserted: 0, updated: 0, gone: 0 };
   const ctx = { code: account.platformCode, accountId: account.id, at: iso(now()), events: [], stats };
   return tx(db, () => {
-    ctx.firstSync = !hasBaseline(db, ctx.accountId, kind);
+    const accountBaselineAt = getBaselineAt(db, ctx.accountId, kind);
+    ctx.firstSync = accountBaselineAt == null;
+    if (kind === 'dms') ctx.dmBaselineAt = accountBaselineAt;
     ctx.isContext = kind === 'dms' && snap.via === 'context';
     ctx.isDomFallback = kind === 'dms' && snap.via === 'dom-fallback';
     ctx.useContextBaseline = ctx.isContext || ctx.isDomFallback;
@@ -281,11 +306,11 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
       ctx.strangerBaselineAt = getBaselineAt(db, ctx.accountId, 'dms:stranger');
       ctx.firstContextSync = ctx.isContext && ctx.contextBaselineAt == null;
       ctx.firstStrangerSync = ctx.isContext && ctx.strangerBaselineAt == null;
-      if (ctx.firstContextSync) {
-        const { finishedAt } = db.prepare(`SELECT max(finishedAt) AS finishedAt FROM sync_jobs
-          WHERE platformCode = ? AND accountId = ? AND kind = 'dms' AND status = 'ok'`).get(ctx.code, ctx.accountId);
-        // 没有成功任务可作水位时，首次读到的新会话仍只建基线。
-        ctx.previousDmFinishMs = Date.parse(finishedAt);
+      if (ctx.firstContextSync || ctx.firstStrangerSync) {
+        const job = db.prepare(`SELECT startedAt FROM sync_jobs
+          WHERE platformCode = ? AND accountId = ? AND kind = 'dms' AND status = 'ok'
+          ORDER BY finishedAt DESC, rowid DESC LIMIT 1`).get(ctx.code, ctx.accountId);
+        ctx.firstContextCutoff = job?.startedAt ?? accountBaselineAt ?? ctx.at;
       }
     }
     upsertWorks(db, ctx, snap.works);
@@ -293,8 +318,8 @@ export function ingestSnapshot(db, account, snapshot, { now = Date.now } = {}) {
     else upsertConversations(db, ctx, snap);
     setBaseline(db, ctx.accountId, kind, ctx.at);
     if (ctx.isContext) {
-      setBaseline(db, ctx.accountId, 'dms:context', ctx.at);
-      if (snap.hasStrangerList !== false) setBaseline(db, ctx.accountId, 'dms:stranger', ctx.at);
+      setBaseline(db, ctx.accountId, 'dms:context', ctx.firstContextCutoff ?? ctx.at);
+      if (snap.hasStrangerList !== false) setBaseline(db, ctx.accountId, 'dms:stranger', ctx.firstContextCutoff ?? ctx.at);
     }
     return { ...ctx.stats, events: ctx.events };
   });

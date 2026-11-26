@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { migrateEngage } from '../src/ops/engage-db.mjs';
 import { readDmContext, rawDms, parseDms } from '../src/ops/engage/adapters/douyin.mjs';
 import { shapeErrors } from '../src/ops/engage/adapters/shape.mjs';
-import { createJob, finishJob, ingestSnapshot } from '../src/ops/engage/store.mjs';
+import { createJob, startJob, finishJob, ingestSnapshot } from '../src/ops/engage/store.mjs';
 import { listEvents } from '../src/ops/engage/query.mjs';
 import { subscribe } from '../src/ops/engage/subscribers.mjs';
 import { setCapability } from '../src/ops/accounts.mjs';
@@ -986,12 +986,13 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     });
   }
 
-  test('首次开启 Context 按同账号上次成功私信任务的完成时间派发新会话', async () => {
+  test('首次开启 Context 按同账号最近完成的成功私信任务的开始时间派发新会话', async () => {
     const db = freshDb(':memory:');
     const acc = douyin(db);
     function job(accountId, kind, status, ms) {
       const id = createJob(db, { accountId, kind, platformCode: 'Douyin', now: at(T0) });
-      finishJob(db, id, { status, now: at(ms) });
+      startJob(db, id, { accountId, now: at(ms) });
+      finishJob(db, id, { status, now: at(ms + 1000) });
     }
     const seed = sdkConv('seed', { atMs: T0 });
     ingestSnapshot(db, acc, await collectFixture([seed], 'dom'), { now: at(T0) });
@@ -1002,7 +1003,7 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     job('Douyin:other', 'dms', 'ok', T0 + 4 * MIN);
     const items = [
       sdkConv('old', { atMs: T0 + MIN - 1 }), sdkConv('equal', { atMs: T0 + MIN }),
-      sdkConv('new', { atMs: T0 + 2 * MIN }), sdkConv('stranger', { atMs: T0 + 3 * MIN, stranger: true }),
+      sdkConv('new', { atMs: T0 + MIN + 500 }), sdkConv('stranger', { atMs: T0 + 3 * MIN, stranger: true }),
     ];
     const snap = await collectFixture(items, 'api');
     const res = ingestSnapshot(db, acc, snap, { now: at(T0 + 5 * MIN) });
@@ -1010,6 +1011,128 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     assert.deepEqual(db.prepare('SELECT subjectId FROM events ORDER BY subjectId').all().map((e) => e.subjectId),
       ['Douyin:equal', 'Douyin:new', 'Douyin:stranger']);
     assert.deepEqual(ingestSnapshot(db, acc, snap, { now: at(T0 + 6 * MIN) }).events, []);
+    db.close();
+  });
+
+  test('已有私信基线但无成功任务，首次 Context 从 dms 基线派发', async () => {
+    const db = freshDb(':memory:');
+    const acc = douyin(db);
+    ingestSnapshot(db, acc, dmsSnap([]), { now: at(T0) });
+    const items = [sdkConv('past', { atMs: T0 - 1 }), sdkConv('fresh', { atMs: T0 + 500 })];
+    const snap = await collectFixture(items, 'api');
+    const sync = () => ingestSnapshot(db, acc, snap, { now: at(T0 + MIN) });
+    assert.deepEqual(sync().events, [`dm.received:Douyin:fresh:${new Date(T0 + 500).toISOString()}`]);
+    assert.deepEqual(sync().events, []);
+    // 首轮 Context 没读到的会话稍后出现，仍用同一水位，旧会话也不能进入补派队列。
+    const late = await collectFixture([items[0], sdkConv('late', { atMs: T0 + 750 })], 'api');
+    for (let i = 0; i < 2; i++) ingestSnapshot(db, acc, late, { now: at(T0 + 2 * MIN) });
+    assert.deepEqual(db.prepare('SELECT subjectId FROM events ORDER BY subjectId').all().map((e) => e.subjectId),
+      ['Douyin:fresh', 'Douyin:late']);
+    assert.equal(db.prepare("SELECT douyinDispatch FROM messages WHERE conversationId='Douyin:past'").get().douyinDispatch, null);
+    db.close();
+  });
+
+  test('撤回后末条时间回退，新消息与历史 peer 行同时间仍派发一次', async () => {
+    for (const via of ['dom', 'api']) {
+      for (const clientOnly of [true, false]) {
+        const db = freshDb(':memory:');
+        const acc = douyin(db);
+        const sync = async (item) => ingestSnapshot(db, acc, await collectFixture([item], via), { now: at(T0) });
+        const a = sdkConv('thread', { atMs: T0, serverId: 'A', text: 'A' });
+        await sync(a);
+        if (!clientOnly) db.prepare('UPDATE messages SET douyinServerId = NULL').run(); // main 存量
+        const recalled = sdkConv('thread', { atMs: T0 - MIN, serverId: 'earlier', byMe: true });
+        assert.deepEqual((await sync(recalled)).events, []);
+        const b = sdkConv('thread', { atMs: T0, text: 'B', serverId: 'B' });
+        if (clientOnly) Object.assign(b.lastMessage, { serverId: null, clientMessageId: 'client-B' });
+        assert.equal((await sync(b)).events.length, 1);
+        assert.deepEqual((await sync(b)).events, []);
+        db.close();
+      }
+    }
+  });
+
+  test('整秒旧时间键不会升级为晚 .456 秒的同正文新消息', async () => {
+    for (const via of ['dom', 'api']) {
+      const db = freshDb(':memory:');
+      db.exec(mainRows); // precision-0 是 main 真实生成的无 ID 整秒行
+      const item = sdkConv('precision-0', { text: 'fixture', serverId: 'later' });
+      Object.assign(item.lastMessage, { createdAt: 1795053600.456, indexInConversation: 2 });
+      const snap = await collectFixture([item], via);
+      const sync = () => ingestSnapshot(db, douyin(db), snap, { now: at(T0 + MIN) });
+      const result = sync();
+      assert.equal(result.inserted, 1);
+      assert.equal(result.events.length, 1);
+      const rows = db.prepare("SELECT id, at FROM messages WHERE conversationId='Douyin:precision-0' ORDER BY at").all();
+      assert.deepEqual(rows.map((r) => [r.id, r.at]), [
+        ['Douyin:precision-0:1795053600', '2026-11-19T02:00:00.000Z'], ['Douyin:later', '2026-11-19T02:00:00.456Z'],
+      ]);
+      assert.deepEqual(sync().events, []);
+      db.close();
+    }
+  });
+
+  test('两条私信的旧时间键和显示毫秒都相同，只有原始 SDK 时间相同才能补 ID', async () => {
+    const db = freshDb(':memory:');
+    const acc = douyin(db);
+    const item = sdkConv('fraction', { text: 'fixture' });
+    const read = async (rawTime, serverId) => {
+      Object.assign(item.lastMessage, { createdAt: rawTime, serverId });
+      return ingestSnapshot(db, acc, await collectFixture([item], 'api'), { now: at(T0) });
+    };
+    await read(1795053600.4561, null);
+    assert.equal((await read(1795053600.4562, 'second')).inserted, 1);
+    assert.equal((await read(1795053600.4561, 'first')).inserted, 0);
+    assert.deepEqual(db.prepare('SELECT id FROM messages ORDER BY id').all().map((r) => r.id),
+      ['Douyin:first', 'Douyin:second']);
+    db.close();
+  });
+
+  test('S1–S4：多轮切换 ID 或重放后，每条真实私信累计只有一个事件', async () => {
+    for (const via of ['dom', 'api']) {
+      for (const rounds of [
+        [['0', null], ['S', null]],
+        [[null, null], ['S', null]],
+        [[null, 'C'], ['S', 'C']],
+        [['S', null], [null, 'C'], ['S', 'C']],
+      ]) {
+        const db = freshDb(':memory:');
+        const acc = douyin(db);
+        const sync = async (items) => ingestSnapshot(db, acc, await collectFixture(items, via), { now: at(T0) });
+        await sync([sdkConv('seed')]);
+        const item = sdkConv('thread', { atMs: T0 + MIN });
+        for (const [serverId, clientMessageId] of [...rounds, ...rounds]) {
+          Object.assign(item.lastMessage, { serverId, clientMessageId });
+          await sync([item]);
+        }
+        assert.deepEqual(db.prepare("SELECT douyinDispatch FROM messages WHERE conversationId='Douyin:thread'").all()
+          .map((m) => m.douyinDispatch), db.prepare('SELECT id FROM events').all().map((e) => e.id));
+        assert.equal(db.prepare('SELECT count(*) AS n FROM events').get().n, 1);
+        db.close();
+      }
+    }
+  });
+
+  test('暂缓的对方消息跨重启保留，旧行补齐不同 serverId 后，即使不在快照里也补派一次', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin340-retry-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, 'fixture.sqlite');
+    let db = freshDb(file);
+    const acc = douyin(db);
+    const sync = async (item) => ingestSnapshot(db, acc, await collectFixture([item], 'api'), { now: at(T0) });
+    await sync(sdkConv('seed'));
+    const a = sdkConv('thread', { atMs: T0 + MIN, text: 'A' });
+    Object.assign(a.lastMessage, { serverId: null, clientMessageId: 'C-A' });
+    const b = sdkConv('thread', { atMs: T0 + MIN, text: 'B', serverId: 'S-B' });
+    await sync(a);
+    assert.deepEqual((await sync(b)).events, []);
+    assert.equal(db.prepare("SELECT douyinDispatch FROM messages WHERE id='Douyin:S-B'").get().douyinDispatch, 'pending');
+    db.close();
+    db = freshDb(file);
+    a.lastMessage.serverId = 'S-A';
+    assert.equal((await sync(a)).events.length, 1);
+    for (const item of [a, b, a]) assert.deepEqual((await sync(item)).events, []);
+    assert.deepEqual(db.prepare('SELECT payload FROM events ORDER BY rowid').all().map((e) => JSON.parse(e.payload).text), ['A', 'B']);
     db.close();
   });
 

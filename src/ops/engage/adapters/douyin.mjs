@@ -267,6 +267,7 @@ export function readDmPage(via = 'context') {
       clientId: lm.clientId != null ? String(lm.clientId) : null,
       // 逐字沿用 main 的 SDK 时间序列化；排序与展示仍使用 createdAt。
       keyTimestamp: lm.createdAt != null ? String(new Date(lm.createdAt).getTime() || Number(lm.createdAt) || '') || null : null,
+      rawTimestamp: lm.createdAt == null ? null : String(lm.createdAt?.getTime?.() ?? lm.createdAt),
       createdAt: tsOf(lm.createdAt), type: lm.type, isFromMe: !!lm.isFromMe, content,
     };
   };
@@ -589,7 +590,7 @@ export function parseDms(raw, { accountUid, fetchedAt }) {
         ...(serverId ? { serverId } : {}),
         ...(clientId ? { clientId } : {}),
         ...(!serverId && !clientId ? { usesTimestampKey: true } : {}),
-        legacy: { nativeId: mainId, timestampId: fallback, at: isoOf(mainTimestamp) } });
+        legacy: { nativeId: mainId, timestampId: fallback, rawTimestamp: lm.rawTimestamp ?? String(lm.createdAt), at: isoOf(mainTimestamp) } });
     }
   }
   const out = okResult({ platformCode: 'Douyin', accountUid, kind: 'dms', fetchedAt, conversations, messages });
