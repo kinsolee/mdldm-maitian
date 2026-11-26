@@ -122,54 +122,109 @@ const isPlaceholderNick = (v) => typeof v === 'string' && v.trim() === '陌生�
 
 // 同一事务记录所有已知身份。原生 messages 主键和对外 event id 继续兼容旧库。
 function douyinReceipts(db, ctx) {
-  // 每个索引先按消息身份定位。SDK 字段不完整时才用同会话的原始时间、方向及内容佐证。
-  const cols = 'rowid, server, client, sdkIndex, disposition';
+  const cols = 'rowid, server, client, sdkIndex, signature, disposition, observedAt, eventId';
   const by = (field) => db.prepare(`SELECT ${cols} FROM douyin_dm_receipts WHERE accountId=? AND conversationId=? AND ${field}=?`);
   const byServer = by('server'), byClient = by('client'), byIndex = by('sdkIndex');
-  const bySignature = db.prepare(`SELECT ${cols} FROM douyin_dm_receipts WHERE accountId=? AND conversationId=? AND signature=?
-    AND (server IS NULL OR $server IS NULL OR server=$server)
-    AND (client IS NULL OR $client IS NULL OR client=$client)
-    AND (sdkIndex IS NULL OR $idx IS NULL OR sdkIndex=$idx) LIMIT 1`);
-  const insert = db.prepare('INSERT INTO douyin_dm_receipts VALUES (?, ?, ?, ?, ?, ?, ?)');
+  const candidates = db.prepare(`SELECT ${cols} FROM douyin_dm_receipts
+    WHERE accountId=? AND conversationId=? AND (signature=? OR secondKey=?)`);
+  const insert = db.prepare(`INSERT INTO douyin_dm_receipts
+    (accountId, conversationId,server,client,sdkIndex,signature,disposition,secondKey,observedAt) VALUES (?,?,?,?,?,?,?,?,?)`);
   const update = db.prepare(`UPDATE douyin_dm_receipts SET server=coalesce(server,?), client=coalesce(client,?),
-    sdkIndex=coalesce(sdkIndex,?), disposition=? WHERE rowid=?`);
+    sdkIndex=coalesce(sdkIndex,?), disposition=?, secondKey=coalesce(secondKey,?), observedAt=coalesce(observedAt,?) WHERE rowid=?`);
+  const removeAlias = db.prepare('DELETE FROM douyin_dm_receipts WHERE rowid=?');
   const legacy = db.prepare('SELECT 1 FROM messages WHERE id=? AND accountId=? AND conversationId=? AND by=? AND receiptManaged IS NULL');
+  const legacyAnonymous = db.prepare(`SELECT id, at FROM messages WHERE accountId=? AND conversationId=? AND by='peer'
+    AND at IN (?, ?, ?) AND type IS ? AND text IS ? AND receiptManaged IS NULL`);
+  const setSent = db.prepare("UPDATE douyin_dm_receipts SET disposition='sent', eventId=? WHERE rowid=?");
+  function dispatch(receiptId, id, at, nickname, text) {
+    const eventId = `dm.received:${id}:${at}`;
+    if (emit(db, ctx, { id: eventId, type: 'dm.received', subjectId: id, occurredAt: at,
+      payload: { conversationId: id, nickname, text: snippet(text), at } })) setSent.run(eventId, receiptId);
+  }
+  const afterIndex = (later, earlier) => /^\d+$/.test(later) && /^\d+$/.test(earlier) && BigInt(later) > BigInt(earlier);
+  const anonymous = (r) => !r.server && !r.client && !r.sdkIndex;
+  const hash = (fields) => createHash('sha256').update(JSON.stringify(fields)).digest('hex');
   return (id, before, anchor, nickname, read) => {
-    const { msg, server, client, sdkIndex, fromDom, sdkSeconds, content } = read;
+    const { msg, server, client, sdkIndex, fromDom, sdkSeconds, content, occurredAt } = read;
     if (msg.by !== 'peer') return;
-    const signature = createHash('sha256').update(JSON.stringify([sdkSeconds, msg.type, content])).digest('hex');
-    const receipt = (server && byServer.get(ctx.accountId, id, server))
-      ?? (client && byClient.get(ctx.accountId, id, client))
-      ?? (sdkIndex && byIndex.get(ctx.accountId, id, sdkIndex))
-      ?? bySignature.get({ server, client, idx: sdkIndex }, ctx.accountId, id, signature);
-    let state = receipt?.disposition;
-    if (state === 'pending') state = null;
-    if (!receipt) {
-      // 在引入凭据表之前，messages 可能只保存了客户端键。
-      const oldIds = new Set([server, client, msg.nativeId]);
-      const old = [...oldIds].some((v) => v && v !== '0' && legacy.get(joinId(ctx.code, v), ctx.accountId, id, msg.by));
-      if (old) state = 'baseline';
+    const scope = [ctx.accountId, id];
+    const signature = hash([sdkSeconds, msg.type, content]);
+    const wholeSecond = iso(Math.floor(sdkSeconds) * 1000);
+    const secondKey = hash([wholeSecond, msg.type, content]);
+    const similar = candidates.all(...scope, signature, secondKey).filter((r) =>
+      r.signature === signature || (!(anonymous(read) && anonymous(r)) && (wholeSecond === occurredAt || r.observedAt === wholeSecond)));
+    // 只用 SDK 身份连接有键的行。两种键后来一起出现时，在入库事务内合并先前的候选。
+    const strong = [server && byServer.get(...scope, server), client && byClient.get(...scope, client),
+      sdkIndex && byIndex.get(...scope, sdkIndex)].filter(Boolean);
+    const receipt = strong.find((r) => r.disposition === 'sent') ?? strong.find((r) => r.disposition === 'baseline')
+      ?? strong[0] ?? (anonymous(read) && similar.find((r) => anonymous(r) && r.signature === signature));
+    const aliases = new Map(strong.map((r) => [r.rowid, r]));
+    const evidence = { server, client, sdkIndex };
+    for (const r of aliases.values()) {
+      evidence.server ??= r.server;
+      evidence.client ??= r.client;
+      evidence.sdkIndex ??= r.sdkIndex;
+      if (r.rowid !== receipt.rowid) removeAlias.run(r.rowid);
     }
+    let state = receipt?.disposition;
+    if (['pending', 'unresolved', 'candidate'].includes(state)) state = null;
     if (!state) {
+      const oldIds = new Set([server, client]);
+      const old = !receipt && [...oldIds].some((v) => v && v !== '0' && legacy.get(joinId(ctx.code, v), ...scope, msg.by));
+      // main 会把数值型小数秒写成整秒；0 键只在相同会话、方向、类型、正文和时间内可作候选。
+      const oldAnon = !receipt && !similar.some(anonymous) && legacyAnonymous.all(...scope, msg.at, occurredAt, wholeSecond, msg.type, msg.text)
+        .find((r) => r.id === joinId(ctx.code, '0') ||
+          (r.id.startsWith(id + ':') && Number.isFinite(Number(r.id.slice(id.length + 1)))));
+      if (old) state = 'baseline';
+      if (oldAnon) {
+        // 历史匿名行也保留为独立证据，不能把第一次补来的有效 ID 永久认作基线。
+        if (anonymous(read)) state = 'baseline';
+        else {
+          const { lastInsertRowid } = insert.run(...scope, null, null, null, signature, 'baseline', secondKey, occurredAt);
+          similar.push({ rowid: lastInsertRowid, signature, disposition: 'baseline' });
+        }
+      }
+    }
+    if (ctx.firstSync) state = 'baseline';
+    if (!state) {
+      // 单方有键或两侧的 ID 不可比较时，保留独立行，禁止把指纹当作已确认的关联。
+      const others = similar.filter((r) => !aliases.has(r.rowid) && r.rowid !== receipt?.rowid);
+      const compatible = others.filter((r) => !(r.server && server && r.server !== server)
+        && !(r.client && client && r.client !== client) && !(r.sdkIndex && sdkIndex && r.sdkIndex !== sdkIndex));
+      const weakBaseline = compatible.some((r) => r.disposition === 'baseline');
+      // 若旧匿名基线随后出现两个不同的 SDK 序号，较晚的那条已可区分。
+      const later = compatible.some((r) => anonymous(r) && r.disposition === 'baseline') && others.some((r) =>
+        r.signature === signature && afterIndex(evidence.sdkIndex, r.sdkIndex));
+      if (weakBaseline || compatible.some((r) => r.disposition === 'sent')) {
+        const rebound = receipt?.disposition === 'candidate' || (before?.lastAt && before.lastAt < msg.at);
+        state = weakBaseline && rebound && evidence.sdkIndex ? (later ? 'ready' : 'candidate') : 'unresolved';
+      }
+    }
+    if (!state || state === 'ready') {
       const cutoff = (fromDom && ctx.domCutoff) || ctx.contextCutoff || (before?.lastAt && ctx.accountBaselineAt);
       // 老库的会话末条只有 main 的显示精度，首次比较沿用它。之后均可使用 SDK 原始精度。
       const sentAt = before && !anchor ? msg.at : read.occurredAt;
       const baselineLastAt = anchor ? anchor.lastAt : before?.lastAt;
       const afterBaselineLast = baselineLastAt && sentAt > baselineLastAt;
-      if (ctx.firstSync || (cutoff && sentAt < cutoff && !afterBaselineLast)) state = 'baseline';
-      else if (before?.lastAt === sentAt) state = 'pending'; // main 的同毫秒行为；撤回后可重判
-      else {
-        const at = read.occurredAt;
-        emit(db, ctx, { id: `dm.received:${id}:${at}`, type: 'dm.received', subjectId: id, occurredAt: at,
-          payload: { conversationId: id, nickname, text: snippet(msg.text), at } });
-        state = 'sent';
+      if (state !== 'ready' && cutoff && sentAt < cutoff && !afterBaselineLast) state = 'baseline';
+      else if (before?.lastAt === sentAt && state !== 'ready') state = 'pending'; // main 的同毫秒行为；撤回后可重判
+      else state = 'dispatch';
+    }
+    const disposition = state === 'dispatch' ? 'sent' : state;
+    let rowid = receipt?.rowid;
+    if (rowid) {
+      if (!receipt.observedAt || disposition !== receipt.disposition || aliases.size > 1 ||
+          (server && !receipt.server) || (client && !receipt.client) || (sdkIndex && !receipt.sdkIndex)) {
+        update.run(evidence.server, evidence.client, evidence.sdkIndex, disposition, secondKey, occurredAt, rowid);
+      }
+    } else rowid = insert.run(...scope, server, client, sdkIndex, signature, disposition, secondKey, occurredAt).lastInsertRowid;
+    if (state === 'dispatch') dispatch(rowid, id, occurredAt, nickname, msg.text);
+    // 即便 B 不再出现在窗口里，A 后补的更早 SDK 序号也能解除 B 的待判。
+    if (evidence.sdkIndex && similar.some((r) => anonymous(r) && r.disposition === 'baseline')) {
+      for (const r of similar) {
+        if (r.disposition === 'candidate' && r.signature === signature && afterIndex(r.sdkIndex, evidence.sdkIndex)) dispatch(r.rowid, id, r.observedAt, nickname, msg.text);
       }
     }
-    if (receipt) {
-      if (state !== receipt.disposition || (server && !receipt.server) || (client && !receipt.client) || (sdkIndex && !receipt.sdkIndex)) {
-        update.run(server, client, sdkIndex, state, receipt.rowid);
-      }
-    } else insert.run(ctx.accountId, id, server, client, sdkIndex, signature, state);
   };
 }
 
@@ -242,7 +297,9 @@ function upsertConversations(db, ctx, snap) {
 }
 
 function emit(db, ctx, e) {
-  if (insertEvent(db, { ...e, platformCode: ctx.code, accountId: ctx.accountId, createdAt: ctx.at })) ctx.events.push(e.id);
+  const inserted = insertEvent(db, { ...e, platformCode: ctx.code, accountId: ctx.accountId, createdAt: ctx.at });
+  if (inserted) ctx.events.push(e.id);
+  return inserted;
 }
 
 /**

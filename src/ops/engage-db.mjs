@@ -106,6 +106,11 @@ INSERT OR IGNORE INTO engage_baselines SELECT accountId, 'dms', min(firstSeenAt)
 `);
   // 本分支早期建的 actions 没有 targetLastAt
   addColumnIfMissing(db, 'actions', 'targetLastAt', 'TEXT');
+  // 旧版 receipt 只有精确摘要；新增字段只用来查找可能是同一条的候选，不作为身份键。
+  addColumnIfMissing(db, 'douyin_dm_receipts', 'secondKey', 'TEXT');
+  addColumnIfMissing(db, 'douyin_dm_receipts', 'observedAt', 'TEXT');
+  addColumnIfMissing(db, 'douyin_dm_receipts', 'eventId', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS dm_receipt_second ON douyin_dm_receipts(accountId, conversationId, secondKey)');
   // 推送前过滤（filter.mjs）命中的规则名；没命中为 NULL
   addColumnIfMissing(db, 'events', 'filteredReason', 'TEXT');
   // 对方发出时间（ISO，UTC）：评论取 comments.createdAt，私信取 last.at；旧行与系统事件为 NULL。createdAt 保持入库时间不变

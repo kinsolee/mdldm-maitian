@@ -17,7 +17,7 @@ import { deliverPending } from '../src/daemon/outbox.mjs';
 import { runRound, DM_DELAY_ALERT_MS, DM_DELAY_ALERT_COOLDOWN_MS } from '../src/daemon/sync.mjs';
 import { freshDb, douyin, comment, commentsSnap, conv, dmsSnap, T0, MIN, at } from './helpers/engage-fixtures.mjs';
 
-import { generateDmHistory, modelItem, expectedDms } from './helpers/douyin-dm-model.mjs';
+import { generateDmHistory, identityHistory, modelItem, expectedDms } from './helpers/douyin-dm-model.mjs';
 import { pathToFileURL } from 'node:url';
 
 const HOUR = 3600_000;
@@ -1169,8 +1169,7 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     });
   }
 
-  test('固定种子：跨视图、撤回、身份变化、事务回滚与重启后，每条可见的新私信恰好一个事件', async (t) => {
-    // 可选对照目录为 git archive 407500c 的临时解包；只导出该版本的私有 rawDms。
+  async function modelReplay(t) {
     const ref = process.env.KIN340_MAIN_FIXTURE;
     let control;
     if (ref) {
@@ -1186,23 +1185,48 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin340-model-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     async function replay(rounds, api, file) {
-      let db = api.freshDb(file);
+      let opener = rounds[0]?.legacy && control ? control : api;
+      let db = opener.freshDb(file);
       const acc = api.douyin(db);
       const reopen = () => {
         if (file === ':memory:') return;
         db.close();
-        db = api.freshDb(file);
+        db = opener.freshDb(file);
       };
+      const events = [];
       try {
         for (const [i, r] of rounds.entries()) {
+          const reader = r.legacy && control ? control : api;
+          if (opener !== reader) {
+            migrateEngage(db);
+            opener = reader;
+          }
           const items = r.context.map(modelItem);
           const service = r.via === 'fallback' ? null : { bytedIM: {}, loading: false,
             conversationList: items.filter((k) => !k.isStrangerChat), strangerConversationList: items.filter((k) => k.isStrangerChat) };
           installFakeDoc({ domLis: r.dom.map((m) => makeLi({ item: modelItem(m), ctxValue: service })),
             chatEls: service ? [{ __reactFiber$fixture: { memoizedProps: { value: service } } }] : [], emptyNode: !r.dom.length });
-          const raw = await api.rawDms(fakePage(), { readVia: r.via === 'dom' ? 'dom' : 'api', settleMs: 0, contextWaitMs: 0 });
-          const snap = api.parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0 + i * MIN).toISOString() });
-          const ingest = () => api.ingestSnapshot(db, acc, snap, { now: at(T0 + i * MIN) });
+          const raw = await reader.rawDms(fakePage(), { readVia: r.via === 'dom' ? 'dom' : 'api', settleMs: 0, contextWaitMs: 0 });
+          const snap = reader.parseDms(raw, { accountUid: ME, fetchedAt: new Date(T0 + i * MIN).toISOString() });
+          const ingest = () => {
+            const result = reader.ingestSnapshot(db, acc, snap, { now: at(T0 + i * MIN) });
+            for (const id of result.events) {
+              const { text } = JSON.parse(db.prepare('SELECT payload FROM events WHERE id=?').get(id).payload);
+              const sent = reader !== control && db.prepare('SELECT server,client,sdkIndex FROM douyin_dm_receipts WHERE eventId=?').get(id);
+              const evidence = sent && (sent.server ?? sent.client);
+              if (evidence) {
+                const label = evidence.slice(1);
+                const truth = rounds.flatMap((round) => [...round.dom, ...round.context]).find((m) => String(m.number) === label);
+                assert.equal(text, truth.text ?? String(truth.number), 'outbox payload and identity agree');
+                events.push(label);
+                continue;
+              }
+              const views = reader === control || raw.via !== 'context' ? r.dom : [...r.dom, ...r.context];
+              const labels = new Set(views.filter((m) => !m.mine && (m.text ?? String(m.number)) === text).map((m) => String(m.number)));
+              assert.equal(labels.size, 1, 'fixture must identify the emitting observation');
+              events.push(...labels);
+            }
+          };
           if (r.crash === 1) reopen();  // 已读页面、尚未提交
           if (r.crash === 2) {
             // ingestSnapshot 的最后一步写基线；此时事件、会话、消息均已尝试写入。
@@ -1213,37 +1237,71 @@ describe('首次基线、changedConversations 与 events.occurredAt', () => {
             reopen();
           }
           ingest();
-          if (r.crash === 3) { reopen(); ingest(); } // 已提交、尚未写任务结果
+          if (r.legacy && !control) {
+            // 无历史代码的源码包仍测试旧行；移除新版独有的账本并恢复 main 的显示时间。
+            db.exec(`DELETE FROM douyin_dm_receipts; DELETE FROM douyin_dm_baselines;
+              DELETE FROM engage_baselines WHERE kind!='dms'; UPDATE messages SET receiptManaged=NULL;
+              UPDATE conversations SET lastAt=(SELECT at FROM messages WHERE conversationId=conversations.id)`);
+          }
+          if (!r.legacy && r.crash === 3) { reopen(); ingest(); } // 已提交、尚未写任务结果
         }
-        return db.prepare("SELECT payload FROM events WHERE type='dm.received'").all().map((row) => JSON.parse(row.payload).text).sort();
+        assert.equal(events.length, db.prepare("SELECT count(*) AS n FROM events WHERE type='dm.received'").get().n);
+        return events.sort();
       } finally {
         db.close();
         if (file !== ':memory:') fs.rmSync(file, { force: true });
       }
     }
+    const totals = { mainDuplicates: 0 };
     async function check(rounds, file) {
       const actual = await replay(rounds, current, file);
       assert.deepEqual(actual, expectedDms(rounds));
       if (control) {
         const main = await replay(rounds, control, file);
-        for (const label of main) if (Number(label) > 0) assert.ok(actual.includes(label), 'main delivered ' + label);
+        for (const label of new Set(main)) {
+          const observed = actual.filter((id) => id === label).length;
+          const reference = main.filter((id) => id === label).length;
+          if (Number(label) > 0) {
+            // main 可能因精度变化重复派发；一个真实消息最多一个事件优先。
+            if (reference > 1) totals.mainDuplicates += reference - 1;
+            assert.equal(observed, Math.min(1, reference), `message ${label}: actual=${observed}, main=${reference}`);
+          } else assert.equal(observed, 0, 'baseline ' + label);
+        }
       }
     }
+    return { check, replay, current, control, dir, totals };
+  }
+  for (const kind of ['upgrade', 'alias', 'collision']) {
+    test('第十二轮：' + kind, async (t) => {
+      const { check, replay, control, dir } = await modelReplay(t);
+      for (const seed of [2, 3]) {
+        const rounds = identityHistory(kind, seed, T0);
+        const file = path.join(dir, 'target.sqlite');
+        if (control) assert.deepEqual(await replay(rounds, control, file), ['1']);
+        await check(rounds, file);
+      }
+    });
+  }
+  test('固定种子：跨视图、撤回、身份变化、事务回滚与重启后，每条可见的新私信恰好一个事件', async (t) => {
+    const { check, dir, control, totals } = await modelReplay(t);
     const count = 2048;
     for (let seed = 1; seed <= count; seed++) {
       const rounds = generateDmHistory(seed, T0);
+      const extra = identityHistory(['upgrade', 'alias', 'collision'][seed % 3], seed, T0);
       // 每 32 个序列使用真实文件、在故障点重开连接；其余使用内存 SQLite 验证事务。
       const file = seed % 32 === 0 ? path.join(dir, 'replay.sqlite') : ':memory:';
-      try { await check(rounds, file); } catch (error) {
-        let minimal = rounds;
-        for (let i = minimal.length - 1; i > 0; i--) {
-          const candidate = minimal.filter((_, j) => j !== i);
-          try { await check(candidate, file); } catch { minimal = candidate; }
+      for (const sequence of [rounds, extra]) {
+        try { await check(sequence, file); } catch (error) {
+          let minimal = sequence;
+          for (let i = minimal.length - 1; i > 0; i--) {
+            const candidate = minimal.filter((_, j) => j !== i);
+            try { await check(candidate, file); } catch { minimal = candidate; }
+          }
+          throw new Error(`seed=${seed} rounds=${JSON.stringify(minimal)}`, { cause: error });
         }
-        throw new Error(`seed=${seed} rounds=${JSON.stringify(minimal)}`, { cause: error });
       }
     }
-    t.diagnostic(`${count} sequences; 0 failures; 64 persistent databases; main comparison=${!!control}`);
+    t.diagnostic(`${count * 2} sequences; 0 failures; 128 file-backed sequences; main comparison=${!!control}; main excess deliveries=${totals.mainDuplicates}`);
   });
 
   test('占位昵称「陌生人消息」既不覆盖真实昵称，也不沿用旧行占位词到 payload.nickname', async () => {

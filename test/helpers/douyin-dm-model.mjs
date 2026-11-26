@@ -36,10 +36,10 @@ export function generateDmHistory(seed, epoch) {
 
 export function modelItem(m) {
   return { id: 'thread-' + m.thread, isStrangerChat: !!m.thread, lastMessage: {
-    serverId: m.ids & 1 ? 'S' + m.number : null, clientMessageId: m.ids & 2 ? 'C' + m.number : null,
+    serverId: m.zero ? '0' : m.ids & 1 ? 'S' + m.number : null, clientMessageId: m.ids & 2 ? 'C' + m.number : null,
     indexInConversation: m.index ? String(m.number + 10) : null,
     createdAt: m.seconds ? m.ms / 1000 : m.ms, isFromMe: m.mine,
-    type: 7, content: JSON.stringify({ text: String(m.number) }),
+    type: 7, content: JSON.stringify({ text: m.text ?? String(m.number) }),
   } };
 }
 
@@ -50,4 +50,34 @@ export function expectedDms(rounds) {
     for (const m of reads) if (m.number > 0 && !m.mine) delivered.add(String(m.number));
   }
   return [...delivered].sort();
+}
+
+// 每个剧本的 number 是预言机的私有标识。用重复正文、身份补齐和不同精度重放同一消息。
+export function identityHistory(kind, seed, epoch) {
+  const ms = epoch + 1000 * (seed % 31);
+  const fraction = 1 + seed * 137 % 999;
+  const peer = (number, time, ids, index, text) => ({ thread: 0, mine: false, number, ms: time, ids, index, text });
+  const row = (dom, ctx = dom, extra = {}) => ({ dom: [dom], context: [ctx], via: 'api', crash: seed % 4, ...extra });
+  const earlier = { ...peer(-9, ms - 2000, 1, true, 'mine'), mine: true };
+  const offscreen = { ...earlier, thread: 1 };
+  if (kind === 'upgrade') {
+    const a = { ...peer(-1, ms + fraction, 0, true, 'old'), seconds: true, zero: seed % 2 === 0 };
+    const b = peer(1, ms, 1, true, 'fresh');
+    const corrected = { ...a, ids: 1, zero: false };
+    if (!a.zero) {
+      const newer = { ...earlier, ms: ms + 2000 };
+      return [row(a, a, { legacy: true }), row(b), row(earlier), row(b), row(newer), row(a), row(corrected)];
+    }
+    return [row(a, a, { legacy: true }), row(b), row(corrected), row(earlier), row(b), row(b)];
+  }
+  if (kind === 'alias') {
+    const coarse = peer(1, ms, 1, false, 'same');
+    const fine = { ...coarse, ms: ms + fraction, ids: 2 };
+    const bridge = { ...fine, ids: 3 };
+    return [row(earlier), row(coarse), row(coarse, fine), row(offscreen, fine), row(offscreen, bridge), row(coarse, fine)];
+  }
+  const a = peer(-1, ms, 0, false, 'same');
+  const b = peer(1, ms, 1, true, 'same');
+  const identifiedA = { ...a, ids: 1, index: true };
+  return [row(a), row(earlier), row(b), row(identifiedA), ...(seed % 2 ? [] : [row(b)]), row(offscreen, seed % 2 ? identifiedA : b)];
 }
