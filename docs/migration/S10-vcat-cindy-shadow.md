@@ -77,7 +77,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.maitian.vcat-cards.p
    - 端点 URL：`http://127.0.0.1:8793/mcp`
    - Bearer Token：从本机 `integrations/vcat/.env` 里的 `VCAT_PROXY_TOKEN` 复制填入（仅本机查看，勿发聊天）
 2. **伙伴 MCP**：在「伙伴设置 → 能力 → MCP」中选择允许列表（allowlist），只勾选本地影子代理。本机已登记的名称为 `vcat-proxy`。伙伴的项目模式可能在运行时恢复继承可用 MCP。
-3. **项目定时任务**：打开运行检出的 `integrations/vcat/project`。本机目录为 `/Users/kinso/code/github/kinsolee/mdldm-maitian-vcat-run/integrations/vcat/project`。清单的提示词和 preRunHook 分别从这个工作目录定位 `../agent-prompt.md` 和 `../hook.mjs`。项目自动化不能在清单中绑定伙伴或指定 MCP 允许列表；任务按项目会话的引擎和工作目录取得可用 MCP。导入前请核对项目会话的工具范围，伙伴允许列表不会自动应用到该任务。
+3. **项目定时任务**：打开运行检出的 `integrations/vcat/project`。本机目录为 `/Users/kinso/code/github/kinsolee/mdldm-maitian-vcat-run/integrations/vcat/project`。清单的提示词和 preRunHook 分别从这个工作目录定位 `../agent-prompt.md` 和 `../hook.mjs`。项目自动化不能在清单中绑定伙伴或指定 MCP 允许列表；任务按项目会话的引擎和工作目录取得可用 MCP。清单显式使用 `agentKind: "codex"`，具体模型沿用 Cindy 的 Codex 配置。每五分钟先运行本机采集检查；没有待处理项且没有待通知卡片时，hook 退出码为 2，调度器跳过本轮模型会话。导入前请核对项目会话的工具范围，伙伴允许列表不会自动应用到该任务。
 
 ## 6. 测试
 
