@@ -13,3 +13,5 @@ integrations/openbot/.env
 integrations/openbot/data/
 integrations/cindy/.env
 integrations/cindy/data/
+integrations/vcat/.env
+integrations/vcat/data/
