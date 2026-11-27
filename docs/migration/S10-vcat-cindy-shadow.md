@@ -76,8 +76,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.maitian.vcat-cards.p
    - 传输类型：`HTTP`
    - 端点 URL：`http://127.0.0.1:8793/mcp`
    - Bearer Token：从本机 `integrations/vcat/.env` 里的 `VCAT_PROXY_TOKEN` 复制填入（仅本机查看，勿发聊天）
-2. **新建影子伙伴**：在 Cindy 新建独立伙伴（例如「小V猫影子助手」），**只勾选**刚添加的「小V猫影子代理（只读）」MCP（不要挂小V猫原生 MCP，也不要挂带写权限的工具）。
-3. **导入定时任务**：在 Cindy 打开项目目录 `/Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/vcat/project`，同意导入 `.cindy/automations/schedules.json` 中的定时任务「小V猫评论私信影子」，并将执行伙伴选为上一步新建的影子伙伴。
+2. **伙伴 MCP**：在「伙伴设置 → 能力 → MCP」中选择允许列表（allowlist），只勾选本地影子代理。本机已登记的名称为 `vcat-proxy`。伙伴的项目模式可能在运行时恢复继承可用 MCP。
+3. **项目定时任务**：打开运行检出的 `integrations/vcat/project`。本机目录为 `/Users/kinso/code/github/kinsolee/mdldm-maitian-vcat-run/integrations/vcat/project`。清单的提示词和 preRunHook 分别从这个工作目录定位 `../agent-prompt.md` 和 `../hook.mjs`。项目自动化不能在清单中绑定伙伴或指定 MCP 允许列表；任务按项目会话的引擎和工作目录取得可用 MCP。导入前请核对项目会话的工具范围，伙伴允许列表不会自动应用到该任务。
 
 ## 6. 测试
 
