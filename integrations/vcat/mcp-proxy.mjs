@@ -206,7 +206,7 @@ export function createVcatProxyHttp({ store, upstream, upstreamTools, token, por
         res.end(JSON.stringify({ error: 'bad request' }));
       } catch {}
     }
-    log(`请求中断：${err.code || err.message}`);
+    log(`请求中断：${err?.code && /^[A-Z0-9_]+$/.test(String(err.code)) ? err.code : 'aborted'}`);
   });
 
   async function handle(req, res) {
@@ -270,7 +270,7 @@ export function createVcatProxyHttp({ store, upstream, upstreamTools, token, por
       await transport.handleRequest(req, res, body);
       done(res.statusCode);
     } catch (err) {
-      log(`处理失败：${err.message}`);
+      log(`处理失败（${err?.code && /^[A-Z0-9_]+$/.test(String(err.code)) ? err.code : 'internal'}）`);
       send(500, { error: 'internal error' });
     }
   }
@@ -312,7 +312,8 @@ export async function main() {
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === import.meta.filename) {
   main().catch((err) => {
-    console.error(`${stamp()} 小V猫只读代理 MCP 启动失败：${err.message}`);
+    const safeMsg = String(err?.message || '未知错误').split('\n')[0].slice(0, 160);
+    console.error(`${stamp()} 小V猫只读代理 MCP 启动失败：${safeMsg}`);
     process.exit(1);
   });
 }

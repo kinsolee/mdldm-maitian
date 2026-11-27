@@ -151,10 +151,12 @@ const CARDS_PAGE_HTML = `<!doctype html>
     function el(tag, attrs = {}, children = []) {
       const node = document.createElement(tag);
       for (const [k, v] of Object.entries(attrs)) {
+        if (v === undefined || v === null || v === false) continue;
         if (k === 'className') node.className = v;
         else if (k === 'text') node.textContent = v;
+        else if (k === 'disabled') node.disabled = Boolean(v);
         else if (k.startsWith('on')) node.addEventListener(k.slice(2).toLowerCase(), v);
-        else node.setAttribute(k, v);
+        else node.setAttribute(k, v === true ? '' : String(v));
       }
       for (const c of children) node.append(typeof c === 'string' ? document.createTextNode(c) : c);
       return node;
@@ -211,20 +213,19 @@ const CARDS_PAGE_HTML = `<!doctype html>
       const btnUse = el('button', {
         className: 'btn primary',
         text: '用这个答案',
-        disabled: card.suggestedReply ? undefined : 'disabled',
+        disabled: !card.suggestedReply,
         onClick: async () => {
           try {
-            await postApi('/api/cards/' + card.id + '/answer', {
+            const res = await postApi('/api/cards/' + card.id + '/answer', {
               question: card.questionSummary,
               platform: card.platform,
               answer: card.suggestedReply,
             });
-            showToast('卡片 #' + card.id + ' 已入问答库');
+            showToast(res.exportWarning ? ('卡片 #' + card.id + ' 已入库（' + res.exportWarning + '）') : ('卡片 #' + card.id + ' 已入问答库'));
             await loadAll();
           } catch (e) { showToast('保存失败：' + e.message); }
         },
       });
-      if (!card.suggestedReply) btnUse.disabled = true;
 
       const btnSave = el('button', {
         className: 'btn secondary',
@@ -233,12 +234,12 @@ const CARDS_PAGE_HTML = `<!doctype html>
           const answer = aInput.value.trim();
           if (!answer) { showToast('请先填写答案'); return; }
           try {
-            await postApi('/api/cards/' + card.id + '/answer', {
+            const res = await postApi('/api/cards/' + card.id + '/answer', {
               question: qInput.value.trim() || card.questionSummary,
               platform: pInput.value.trim() || card.platform || 'all',
               answer,
             });
-            showToast('卡片 #' + card.id + ' 已按编辑内容入库');
+            showToast(res.exportWarning ? ('卡片 #' + card.id + ' 已入库（' + res.exportWarning + '）') : ('卡片 #' + card.id + ' 已按编辑内容入库'));
             await loadAll();
           } catch (e) { showToast('保存失败：' + e.message); }
         },

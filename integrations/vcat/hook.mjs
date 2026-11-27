@@ -35,10 +35,12 @@ export async function runHook(argv, { config, upstream = null, store = null, fet
         });
       }
       const pending = activeStore.pendingCount();
+      const unnotifiedCards = activeStore.unnotifiedPendingCount();
+      const hasWork = pending > 0 || unnotifiedCards > 0;
       const detail = summary
-        ? `新入库 ${summary.accepted} 条（重复 ${summary.duplicate}，跳过本人 ${summary.skippedSelf}），待处理 ${pending} 条`
-        : `待处理 ${pending} 条`;
-      return { code: pending > 0 ? 0 : 2, out: `${detail}\n${PRECHECK_OK}` };
+        ? `新入库 ${summary.accepted} 条（重复 ${summary.duplicate}，跳过本人 ${summary.skippedSelf}），待处理 ${pending} 条，待通知卡片 ${unnotifiedCards} 张`
+        : `待处理 ${pending} 条，待通知卡片 ${unnotifiedCards} 张`;
+      return { code: hasWork ? 0 : 2, out: `${detail}\n${PRECHECK_OK}` };
     } finally {
       if (ownedStore) activeStore.close();
     }
@@ -89,7 +91,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === import.meta.filename
     (code === 1 ? process.stderr : process.stdout).write(`${out}\n`);
     process.exit(code);
   } catch (err) {
-    process.stderr.write(`hook.mjs 出错：${err.message}\n`);
+    const safeMsg = err?.code && /^[A-Z0-9_]+$/.test(String(err.code))
+      ? `系统错误（${err.code}）`
+      : String(err?.message || '未知错误').split('\n')[0].slice(0, 160);
+    process.stderr.write(`hook.mjs 出错：${safeMsg}\n`);
     process.exit(1);
   }
 }

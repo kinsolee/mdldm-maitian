@@ -89,10 +89,20 @@ async function postFeishu(webhook, body, fetchImpl) {
   } catch (err) {
     return { sent: false, why: err.name === 'TimeoutError' ? '超过 10 秒没响应' : `连不上（${err.cause?.code ?? err.name}）` };
   }
-  const json = await res.json().catch(() => ({}));
   if (!res.ok) return { sent: false, why: `HTTP ${res.status}` };
-  if (json.code != null && json.code !== 0) {
-    return { sent: false, rejected: true, why: `飞书返回 code=${json.code}` };
+  let json;
+  try {
+    const raw = await res.text();
+    json = JSON.parse(raw);
+  } catch {
+    return { sent: false, why: '飞书响应不是合法 JSON' };
+  }
+  if (!json || typeof json !== 'object') {
+    return { sent: false, why: '飞书响应格式异常' };
+  }
+  const code = json.code ?? json.StatusCode;
+  if (code !== 0) {
+    return { sent: false, rejected: code != null, why: `飞书返回 code=${code ?? 'missing'}` };
   }
   return { sent: true };
 }
@@ -115,26 +125,33 @@ export async function notifyPendingCards(store, opts = {}) {
     fallbackNotify = lazyDefaultNotify,
     now = Date.now,
     limit = 20,
+    claimTtlMs = 60_000,
   } = opts;
-  const cards = store.unnotifiedPendingCards(limit);
+  const { claimToken, cards } = store.claimUnnotifiedCards(limit, { claimTtlMs, now });
   if (cards.length === 0) return { sent: false, count: 0, cardIds: [], reason: 'no_unnotified_cards' };
 
   const targetWebhook = webhook || readFeishuWebhook(maitianConfig);
   if (!targetWebhook) {
+    store.releaseNotifyClaim(claimToken);
     return { sent: false, count: cards.length, cardIds: cards.map((c) => c.id), reason: 'missing_webhook' };
   }
 
   const cardPayload = buildShadowBatchCard(cards, { cardsUrl, now });
   let outcome = await postFeishu(targetWebhook, { msg_type: 'interactive', card: cardPayload }, fetchImpl);
   if (outcome.rejected) {
-    const fallbackOk = await fallbackNotify(buildFallbackText(cards, { cardsUrl }));
-    outcome = { sent: Boolean(fallbackOk), why: fallbackOk ? 'fallback_defaultNotify' : outcome.why };
+    try {
+      const fallbackOk = await fallbackNotify(buildFallbackText(cards, { cardsUrl }));
+      outcome = { sent: Boolean(fallbackOk), why: fallbackOk ? 'fallback_defaultNotify' : outcome.why };
+    } catch {
+      outcome = { sent: false, why: 'fallback_failed' };
+    }
   }
 
   if (outcome.sent) {
-    const ids = cards.map((c) => c.id);
-    store.markCardsNotified(ids, { now });
-    return { sent: true, count: ids.length, cardIds: ids };
+    const versions = cards.map((c) => ({ id: c.id, notifyVersion: c.notifyVersion }));
+    const confirmed = store.confirmCardsNotified(claimToken, versions, { now });
+    return { sent: true, count: cards.length, confirmed, cardIds: cards.map((c) => c.id) };
   }
+  store.releaseNotifyClaim(claimToken);
   return { sent: false, count: cards.length, cardIds: cards.map((c) => c.id), reason: outcome.why || 'send_failed' };
 }

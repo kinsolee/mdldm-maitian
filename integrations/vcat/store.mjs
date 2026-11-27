@@ -82,7 +82,14 @@ function scoreKbMatch(query, queryTerms, entry, targetPlatform) {
 }
 
 function formatPlatforms(values) {
-  const unique = [...new Set(values.map((v) => String(v || '').trim()).filter(Boolean))];
+  const flattened = [];
+  for (const val of values) {
+    for (const part of String(val || '').split(',')) {
+      const clean = part.trim();
+      if (clean) flattened.push(clean);
+    }
+  }
+  const unique = [...new Set(flattened)];
   if (unique.length === 0) return 'unknown';
   return unique.sort().join(',');
 }
@@ -138,6 +145,9 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         final_answer TEXT,
         kb_entry_id INTEGER,
         notified_at TEXT,
+        notify_version INTEGER NOT NULL DEFAULT 1,
+        notify_claim_token TEXT,
+        notify_claimed_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         resolved_at TEXT
@@ -148,7 +158,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
       CREATE TABLE IF NOT EXISTS card_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
-        inbox_id TEXT NOT NULL REFERENCES inbox(id) ON DELETE CASCADE,
+        inbox_id TEXT NOT NULL UNIQUE REFERENCES inbox(id) ON DELETE CASCADE,
         platform TEXT,
         account TEXT,
         author_name TEXT,
@@ -177,6 +187,11 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         value TEXT NOT NULL
       );
     `);
+
+    const cardCols = new Set(db.prepare('PRAGMA table_info(cards)').all().map((c) => c.name));
+    if (!cardCols.has('notify_version')) db.exec('ALTER TABLE cards ADD COLUMN notify_version INTEGER NOT NULL DEFAULT 1');
+    if (!cardCols.has('notify_claim_token')) db.exec('ALTER TABLE cards ADD COLUMN notify_claim_token TEXT');
+    if (!cardCols.has('notify_claimed_at')) db.exec('ALTER TABLE cards ADD COLUMN notify_claimed_at TEXT');
   }
 
   function tx(fn) {
@@ -360,17 +375,45 @@ export function openShadowStore(file, { readOnly = false } = {}) {
       const cleanSummary = questionSummary.trim();
       const cleanSuggested = String(suggestedReply || '').trim();
 
-      const cardId = tx(() => {
+      const outcome = tx(() => {
         const rows = [];
         const getStmt = db.prepare('SELECT * FROM inbox WHERE id = ?');
+        const getItemCardStmt = db.prepare(`
+          SELECT ci.card_id, c.status
+          FROM card_items ci
+          JOIN cards c ON c.id = ci.card_id
+          WHERE ci.inbox_id = ?
+        `);
+        const getShadowStmt = db.prepare('SELECT decision, card_id FROM shadow_log WHERE inbox_id = ?');
+
+        const existingPendingCardIds = new Set();
         for (const id of uniqueIds) {
           const row = getStmt.get(id);
           if (!row) throw new Error(`inbox 中不存在该条记录：${id}`);
+          const linked = getItemCardStmt.get(id);
+          if (linked) {
+            if (linked.status !== 'pending') {
+              throw new Error(`inbox ${id} 已在卡片 #${linked.card_id}（${linked.status}）处理完毕，禁止重复出卡`);
+            }
+            existingPendingCardIds.add(linked.card_id);
+          } else if (row.processed_at) {
+            const shadowRow = getShadowStmt.get(id);
+            const detail = shadowRow ? `已登记为 ${shadowRow.decision}` : '已标记处理完成';
+            throw new Error(`inbox ${id} ${detail}，禁止重复出卡`);
+          }
           rows.push(row);
         }
 
+        if (existingPendingCardIds.size > 1) {
+          throw new Error('所选 inboxIds 分属多张已存在的待处理卡片，请分别处理');
+        }
+
         let existing = null;
-        if (normTopic) {
+        if (existingPendingCardIds.size === 1) {
+          const [linkedId] = [...existingPendingCardIds];
+          existing = db.prepare("SELECT * FROM cards WHERE id = ? AND status = 'pending'").get(linkedId);
+        }
+        if (!existing && normTopic) {
           existing = db.prepare("SELECT * FROM cards WHERE status = 'pending' AND topic_key = ? ORDER BY id ASC LIMIT 1").get(normTopic);
         }
         if (!existing) {
@@ -429,21 +472,26 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         if (merged) {
           const allItems = db.prepare('SELECT platform, account FROM card_items WHERE card_id = ?').all(targetCardId);
           const nextType = allItems.length > 1 ? 'aggregate' : existing.card_type;
-          const nextPlatform = formatPlatforms([existing.platform, ...allItems.map((i) => i.platform)]);
+          const nextPlatform = allItems.length > 0
+            ? formatPlatforms(allItems.map((i) => i.platform))
+            : formatPlatforms([existing.platform]);
           const nextSuggested = existing.suggested_reply || cleanSuggested;
           db.prepare(`
             UPDATE cards
             SET card_type = ?, platform = ?, suggested_reply = ?, updated_at = ?,
-                notified_at = CASE WHEN ? > 0 THEN NULL ELSE notified_at END
+                notified_at = CASE WHEN ? > 0 THEN NULL ELSE notified_at END,
+                notify_version = CASE WHEN ? > 0 THEN notify_version + 1 ELSE notify_version END,
+                notify_claim_token = CASE WHEN ? > 0 THEN NULL ELSE notify_claim_token END,
+                notify_claimed_at = CASE WHEN ? > 0 THEN NULL ELSE notify_claimed_at END
             WHERE id = ?
-          `).run(nextType, nextPlatform, nextSuggested, at, addedItems, targetCardId);
+          `).run(nextType, nextPlatform, nextSuggested, at, addedItems, addedItems, addedItems, addedItems, targetCardId);
         }
 
-        return { cardId: targetCardId, merged };
+        return { cardId: targetCardId, merged, addedItems };
       });
 
-      const card = this.getCard(cardId.cardId);
-      return { card, merged: cardId.merged };
+      const card = this.getCard(outcome.cardId);
+      return { card, merged: outcome.merged, addedItems: outcome.addedItems };
     },
 
     /** 记录影子判定（hit / new_question / ad / skip），并把 inbox 标为已处理。绝不触发任何真实回复。 */
@@ -457,7 +505,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
       tx(() => {
         const getInboxStmt = db.prepare('SELECT * FROM inbox WHERE id = ?');
         const getKbStmt = db.prepare('SELECT id FROM kb_entries WHERE id = ?');
-        const getCardStmt = db.prepare('SELECT id FROM cards WHERE id = ?');
+        const getCardItemStmt = db.prepare('SELECT card_id FROM card_items WHERE card_id = ? AND inbox_id = ?');
         const insertShadow = db.prepare(`
           INSERT OR IGNORE INTO shadow_log (inbox_id, kind, platform, decision, kb_entry_id, card_id, would_reply, reason, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -483,9 +531,18 @@ export function openShadowStore(file, { readOnly = false } = {}) {
             rejected.push({ inboxId: item.inboxId, reason: `kbEntryId 无效：${item.kbEntryId}` });
             continue;
           }
+          if (item.decision === 'hit' && kbEntryId == null) {
+            rejected.push({ inboxId: item.inboxId, reason: 'decision=hit 时必须提供有效的 kbEntryId' });
+            continue;
+          }
           let cardId = item.cardId != null ? Number(item.cardId) : null;
-          if (cardId != null && (!Number.isInteger(cardId) || !getCardStmt.get(cardId))) {
-            rejected.push({ inboxId: item.inboxId, reason: `cardId 无效：${item.cardId}` });
+          if (item.decision === 'new_question') {
+            if (cardId == null || !Number.isInteger(cardId) || !getCardItemStmt.get(cardId, inboxRow.id)) {
+              rejected.push({ inboxId: item.inboxId, reason: 'decision=new_question 必须关联已通过 card_submit 绑定该 inboxId 的 cardId' });
+              continue;
+            }
+          } else if (cardId != null && (!Number.isInteger(cardId) || !getCardItemStmt.get(cardId, inboxRow.id))) {
+            rejected.push({ inboxId: item.inboxId, reason: `cardId 未绑定当前 inboxId：${item.cardId}` });
             continue;
           }
           const wouldReply = item.wouldReply != null ? String(item.wouldReply).trim() : null;
@@ -537,9 +594,76 @@ export function openShadowStore(file, { readOnly = false } = {}) {
       return hydrateCards(rows);
     },
 
+    unnotifiedPendingCount() {
+      return db.prepare("SELECT COUNT(*) AS n FROM cards WHERE status = 'pending' AND notified_at IS NULL").get().n;
+    },
+
+    /** 原子认领一批待通知卡片，防止并发 cards_notify 重复推送，并携带 notify_version 防止覆盖新合并问题。 */
+    claimUnnotifiedCards(limit = 20, { claimTtlMs = 60_000, now = Date.now } = {}) {
+      const nowMs = typeof now === 'function' ? now() : now;
+      const at = new Date(nowMs).toISOString();
+      const cutoff = new Date(nowMs - Math.max(5_000, Number(claimTtlMs) || 60_000)).toISOString();
+      const claimToken = crypto.randomBytes(12).toString('hex');
+      const safeLimit = Math.max(1, Math.min(50, Number(limit) || 20));
+
+      const claimedRows = tx(() => {
+        const rows = db.prepare(`
+          SELECT * FROM cards
+          WHERE status = 'pending'
+            AND notified_at IS NULL
+            AND (notify_claimed_at IS NULL OR notify_claimed_at < ?)
+          ORDER BY created_at ASC, id ASC
+          LIMIT ?
+        `).all(cutoff, safeLimit);
+        if (rows.length === 0) return [];
+        const claimStmt = db.prepare(`
+          UPDATE cards
+          SET notify_claim_token = ?, notify_claimed_at = ?
+          WHERE id = ? AND status = 'pending' AND notified_at IS NULL
+            AND (notify_claimed_at IS NULL OR notify_claimed_at < ?)
+        `);
+        const locked = [];
+        for (const row of rows) {
+          if (claimStmt.run(claimToken, at, row.id, cutoff).changes > 0) locked.push(row);
+        }
+        return locked;
+      });
+
+      const cards = hydrateCards(claimedRows).map((card, idx) => ({
+        ...card,
+        notifyVersion: claimedRows[idx].notify_version ?? 1,
+      }));
+      return { claimToken, cards };
+    },
+
+    /** 仅对仍在当前认领批次且版本未发生合并变更的卡片标记已通知。 */
+    confirmCardsNotified(claimToken, cardVersions, { now = Date.now } = {}) {
+      const at = iso(now);
+      let confirmed = 0;
+      const stmt = db.prepare(`
+        UPDATE cards
+        SET notified_at = ?, notify_claim_token = NULL, notify_claimed_at = NULL
+        WHERE id = ? AND status = 'pending' AND notified_at IS NULL
+          AND notify_claim_token = ? AND notify_version = ?
+      `);
+      tx(() => {
+        for (const entry of cardVersions) {
+          confirmed += stmt.run(at, Number(entry.id), claimToken, Number(entry.notifyVersion)).changes;
+        }
+      });
+      return confirmed;
+    },
+
+    /** 通知发送失败时释放认领锁，便于后续重试。 */
+    releaseNotifyClaim(claimToken) {
+      tx(() => {
+        db.prepare('UPDATE cards SET notify_claim_token = NULL, notify_claimed_at = NULL WHERE notify_claim_token = ?').run(claimToken);
+      });
+    },
+
     markCardsNotified(cardIds, { now = Date.now } = {}) {
       const at = iso(now);
-      const stmt = db.prepare('UPDATE cards SET notified_at = ? WHERE id = ? AND notified_at IS NULL');
+      const stmt = db.prepare('UPDATE cards SET notified_at = ?, notify_claim_token = NULL, notify_claimed_at = NULL WHERE id = ? AND notified_at IS NULL');
       tx(() => {
         for (const id of cardIds) stmt.run(at, Number(id));
       });
@@ -548,7 +672,13 @@ export function openShadowStore(file, { readOnly = false } = {}) {
     /** Kinso 在本机答题页保存答案：写入 kb_entries（auto_reply 强制 0），卡片标 answered。 */
     answerCard(cardId, { answer, question, platform, keywords = '' }, { now = Date.now, kbExportFile = null } = {}) {
       if (!nonEmpty(answer)) throw new Error('答案不能为空');
-      if (kbExportFile) assertSafeKbExportPath(kbExportFile);
+      let safeExportPath = null;
+      if (kbExportFile) {
+        safeExportPath = assertSafeKbExportPath(kbExportFile);
+        const exportDir = path.dirname(safeExportPath);
+        fs.mkdirSync(exportDir, { recursive: true });
+        fs.accessSync(exportDir, fs.constants.W_OK);
+      }
       const at = iso(now);
       const result = tx(() => {
         const card = db.prepare('SELECT * FROM cards WHERE id = ?').get(Number(cardId));
@@ -574,12 +704,20 @@ export function openShadowStore(file, { readOnly = false } = {}) {
 
       if (!result.ok) return result;
       let exportedTo = null;
-      if (kbExportFile) exportedTo = this.exportKbMarkdown(kbExportFile, { now });
+      let exportWarning = null;
+      if (safeExportPath) {
+        try {
+          exportedTo = this.exportKbMarkdown(safeExportPath, { now });
+        } catch (err) {
+          exportWarning = `答案已入问答库，但只读镜像导出失败：${err.code || err.message}`;
+        }
+      }
       return {
         ok: true,
         card: this.getCard(result.cardId),
         kbEntry: toKbView(db.prepare('SELECT * FROM kb_entries WHERE id = ?').get(result.kbEntryId)),
         exportedTo,
+        ...(exportWarning ? { exportWarning } : {}),
       };
     },
 
@@ -668,7 +806,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
     /** 导出问答库只读镜像到 Markdown（原子写入，先校验路径绝不碰 OpenBot 文件或符号链接）。 */
     exportKbMarkdown(filePath, { now = Date.now } = {}) {
       const safePath = assertSafeKbExportPath(filePath);
-      const entries = this.listKb(1000);
+      const entries = db.prepare('SELECT * FROM kb_entries ORDER BY id DESC').all().map(toKbView);
       const updatedAt = iso(now);
       const lines = [
         '---',
@@ -701,7 +839,12 @@ export function openShadowStore(file, { readOnly = false } = {}) {
       }
       fs.mkdirSync(path.dirname(safePath), { recursive: true });
       const tmp = path.join(path.dirname(safePath), `.vcat-kb-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`);
-      fs.writeFileSync(tmp, lines.join('\n'), 'utf8');
+      const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o644);
+      try {
+        fs.writeFileSync(fd, lines.join('\n'), 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
       fs.renameSync(tmp, safePath);
       return safePath;
     },

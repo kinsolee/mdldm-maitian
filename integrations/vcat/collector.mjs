@@ -5,9 +5,12 @@ import { parseToolResultJson } from './upstream.mjs';
 
 const MAX_SESSIONS_PER_POLL = 30;
 
-function extractArray(payload, candidateKeys = ['items', 'list', 'comments', 'sessions', 'messages', 'accounts', 'data']) {
+/** 严格提取上游返回列表：缺失列表字段时抛错（fail-closed），绝不静默返回空数组把故障误判为空闲。 */
+function extractArrayStrict(payload, candidateKeys, label) {
   if (Array.isArray(payload)) return payload;
-  if (!payload || typeof payload !== 'object') return [];
+  if (!payload || typeof payload !== 'object') {
+    throw new Error(`上游 ${label} 响应格式异常（非对象/数组）`);
+  }
   for (const key of candidateKeys) {
     if (Array.isArray(payload[key])) return payload[key];
     if (payload[key] && typeof payload[key] === 'object') {
@@ -16,7 +19,7 @@ function extractArray(payload, candidateKeys = ['items', 'list', 'comments', 'se
       }
     }
   }
-  return [];
+  throw new Error(`上游 ${label} 响应缺少列表字段`);
 }
 
 function formatDateYmd(ms) {
@@ -60,6 +63,9 @@ function stableHash(parts) {
   return crypto.createHash('sha1').update(parts.map((p) => String(p ?? '')).join('|')).digest('hex').slice(0, 16);
 }
 
+const AUTHOR_ID_KEYS = ['authorId', 'author_id', 'commenterId', 'senderId', 'sender_id', 'fromUid', 'userId', 'user_id'];
+const AUTHOR_NAME_KEYS = ['authorName', 'author_name', 'author', 'nickname', 'userName', 'senderName', 'fromName'];
+
 function isSelfEntry(entry, selfNames, selfIds) {
   if (!entry || typeof entry !== 'object') return false;
   if (
@@ -77,23 +83,31 @@ function isSelfEntry(entry, selfNames, selfIds) {
     return true;
   }
   // 注意：小V猫里顶层 uid 通常表示当前媒体账号 UID，不能当作发言人 ID，否则会把粉丝评论误判为本人。
-  const authorId = pickString(entry, ['authorId', 'author_id', 'commenterId', 'senderId', 'sender_id', 'fromUid']);
-  const authorName = pickString(entry, ['authorName', 'author_name', 'author', 'nickname', 'userName', 'senderName', 'fromName']);
-  if (authorId && selfIds.has(authorId.toLowerCase())) return true;
+  const authorId = pickString(entry, AUTHOR_ID_KEYS);
+  // 当存在明确的发言人 ID 时，只按 ID 判定本人，避免把同名不同 ID 的粉丝误判为本人。
+  if (authorId) return selfIds.has(authorId.toLowerCase());
+  const authorName = pickString(entry, AUTHOR_NAME_KEYS);
   if (authorName && selfNames.has(authorName.toLowerCase())) return true;
   return false;
 }
 
 /** 从上游小V猫只读拉取已采到的评论与私信，跳过本人内容，去重写入 shadow.db。 */
-export async function collectFromUpstream({ upstream, store, lookbackDays = 3, selfAuthors = [], now = Date.now }) {
+export async function collectFromUpstream({
+  upstream,
+  store,
+  lookbackDays = 3,
+  selfAuthors = [],
+  maxSessionsPerPoll = MAX_SESSIONS_PER_POLL,
+  now = Date.now,
+}) {
   const nowMs = typeof now === 'function' ? now() : now;
   const selfNames = new Set(selfAuthors.map((s) => s.toLowerCase()));
   const selfIds = new Set(selfAuthors.map((s) => s.toLowerCase()));
   const accountMap = new Map();
 
   // 1. 读账号列表，用于映射账号名称和识别本人发出内容
-  const accountsRes = await upstream.callReadTool('vcat_list_accounts', {});
-  const accounts = extractArray(parseToolResultJson(accountsRes), ['accounts', 'items', 'list', 'data']);
+  const accountsRes = await upstream.callReadTool('vcat_list_accounts', { refresh: false });
+  const accounts = extractArrayStrict(parseToolResultJson(accountsRes), ['accounts', 'items', 'list', 'data'], 'vcat_list_accounts');
   for (const acc of accounts) {
     const uid = pickString(acc, ['uid', 'accountUid', 'accountId', 'id']);
     const name = pickString(acc, ['nickname', 'name', 'accountName', 'userName']);
@@ -119,7 +133,7 @@ export async function collectFromUpstream({ upstream, store, lookbackDays = 3, s
     includeAuthor: false,
     refresh: false,
   });
-  const comments = extractArray(parseToolResultJson(commentsRes), ['comments', 'items', 'list', 'data']);
+  const comments = extractArrayStrict(parseToolResultJson(commentsRes), ['comments', 'items', 'list', 'data'], 'vcat_list_comments');
   for (const comment of comments) {
     fetchedComments += 1;
     if (isSelfEntry(comment, selfNames, selfIds)) {
@@ -143,25 +157,42 @@ export async function collectFromUpstream({ upstream, store, lookbackDays = 3, s
       workId: pickString(comment, ['workId', 'postId', 'itemId', 'awemeId', 'videoId']) || null,
       workTitle: pickString(comment, ['workTitle', 'postTitle', 'title', 'videoTitle']) || null,
       authorName: pickString(comment, ['authorName', 'author_name', 'author', 'nickname', 'userName']) || null,
-      authorId: pickString(comment, ['authorId', 'author_id', 'userId', 'user_id']) || null,
+      authorId: pickString(comment, AUTHOR_ID_KEYS) || null,
       content,
       occurredAt: parseTimestamp(comment.createdAt ?? comment.commentTime ?? comment.createTime ?? comment.time, nowMs),
       raw: comment,
     });
   }
 
-  // 3. 读私信会话列表 + 逐会话读取本地已采消息（显式 refresh: false）
+  // 3. 读私信会话列表 + 按未读优先与持久化轮转游标逐会话读取本地已采消息（显式 refresh: false），避免超过配额的会话长期饥饿
   const sessionsRes = await upstream.callReadTool('vcat_list_message_sessions', { refresh: false });
-  const sessions = extractArray(parseToolResultJson(sessionsRes), ['sessions', 'items', 'list', 'data']);
-  let inspectedSessions = 0;
+  const sessions = extractArrayStrict(parseToolResultJson(sessionsRes), ['sessions', 'items', 'list', 'data'], 'vcat_list_message_sessions');
+  const sessionLimit = Math.max(1, Number(maxSessionsPerPoll) || MAX_SESSIONS_PER_POLL);
+  const eligibleSessions = [];
   for (const session of sessions) {
-    if (inspectedSessions >= MAX_SESSIONS_PER_POLL) break;
     if (session.lastFromSelf === true || session.lastIsSelf === true) {
       skippedSelf += 1;
       continue;
     }
+    if (pickString(session, ['sessionId', 'session_id', 'talkId', 'conversationId', 'id'])) {
+      eligibleSessions.push(session);
+    }
+  }
+  const rawOffset = Number(store.getMeta('sessionPollOffset') || 0);
+  const startOffset = eligibleSessions.length > 0 && Number.isInteger(rawOffset) && rawOffset >= 0
+    ? rawOffset % eligibleSessions.length
+    : 0;
+  const rotatedSessions = startOffset > 0
+    ? [...eligibleSessions.slice(startOffset), ...eligibleSessions.slice(0, startOffset)]
+    : eligibleSessions;
+  const batchSessions = rotatedSessions.slice(0, sessionLimit);
+  const nextOffset = eligibleSessions.length > sessionLimit
+    ? (startOffset + batchSessions.length) % eligibleSessions.length
+    : 0;
+
+  let inspectedSessions = 0;
+  for (const session of batchSessions) {
     const sessionId = pickString(session, ['sessionId', 'session_id', 'talkId', 'conversationId', 'id']);
-    if (!sessionId) continue;
     const accountId = pickString(session, ['accountUid', 'uid', 'accountId', 'account_id']);
     const accInfo = accountId ? accountMap.get(accountId) : null;
     const platform = pickString(session, ['platform', 'platformName', 'site']) || accInfo?.platform || 'unknown';
@@ -174,7 +205,7 @@ export async function collectFromUpstream({ upstream, store, lookbackDays = 3, s
     if (accountId) msgArgs.uid = accountId;
     if (platform !== 'unknown') msgArgs.platform = platform;
     const messagesRes = await upstream.callReadTool('vcat_get_session_messages', msgArgs);
-    const messages = extractArray(parseToolResultJson(messagesRes), ['messages', 'items', 'list', 'data']);
+    const messages = extractArrayStrict(parseToolResultJson(messagesRes), ['messages', 'items', 'list', 'data'], 'vcat_get_session_messages');
     if (messages.length === 0) continue;
 
     const ordered = [...messages].sort((a, b) => {
@@ -209,7 +240,7 @@ export async function collectFromUpstream({ upstream, store, lookbackDays = 3, s
         accountName: accountName || null,
         sessionId,
         authorName: pickString(msg, ['senderName', 'authorName', 'nickname', 'fromName']) || peerName || null,
-        authorId: pickString(msg, ['senderId', 'authorId', 'fromUid', 'userId']) || peerId || null,
+        authorId: pickString(msg, AUTHOR_ID_KEYS) || peerId || null,
         content,
         occurredAt: parseTimestamp(msg.createdAt ?? msg.sendTime ?? msg.timestamp ?? msg.time, nowMs),
         raw: msg,
@@ -218,11 +249,14 @@ export async function collectFromUpstream({ upstream, store, lookbackDays = 3, s
   }
 
   const { accepted, duplicate } = store.ingestInbox(normalizedItems, { now: nowMs });
+  store.setMeta('sessionPollOffset', String(nextOffset));
   store.setMeta('lastCollectAt', new Date(nowMs).toISOString());
   return {
     fetchedComments,
     fetchedDms,
     skippedSelf,
+    inspectedSessions,
+    totalEligibleSessions: eligibleSessions.length,
     accepted,
     duplicate,
     pending: store.pendingCount(),

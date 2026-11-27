@@ -15,7 +15,6 @@ export const VCAT_READ_WHITELIST = Object.freeze([
 ]);
 
 const WHITELIST_SET = new Set(VCAT_READ_WHITELIST);
-const ALWAYS_FORCE_REFRESH_FALSE_TOOLS = new Set(['vcat_get_session_messages']);
 const REFRESH_KEY_PATTERN = /^(refresh|force_?refresh|live_?refresh)$/i;
 
 export function isAllowedUpstreamTool(name) {
@@ -33,14 +32,12 @@ function deepForceRefreshFalse(value) {
   return out;
 }
 
-/** 净化发往上游的工具参数：任意层级的 refresh 一律强制为 false。 */
+/** 净化发往上游的工具参数：无论是否传参，所有白名单工具顶层与任意嵌套层级的 refresh 一律强制为 false。 */
 export function sanitizeUpstreamArgs(toolName, rawArgs) {
   const base = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
     ? deepForceRefreshFalse(rawArgs)
     : {};
-  if (ALWAYS_FORCE_REFRESH_FALSE_TOOLS.has(toolName) || Object.prototype.hasOwnProperty.call(base, 'refresh')) {
-    base.refresh = false;
-  }
+  base.refresh = false;
   return base;
 }
 
@@ -67,6 +64,14 @@ export function filterUpstreamTools(tools = []) {
           };
         }
       }
+      if (!Object.prototype.hasOwnProperty.call(schema.properties, 'refresh')) {
+        schema.properties.refresh = {
+          type: 'boolean',
+          enum: [false],
+          default: false,
+          description: '只读代理强制锁定为 false（禁止实时刷新平台）',
+        };
+      }
     }
     exposed.push({
       name: tool.name,
@@ -77,11 +82,10 @@ export function filterUpstreamTools(tools = []) {
   return { exposedTools: exposed, upstreamTotal: tools.length, droppedCount };
 }
 
-/** 解析 MCP 工具返回的文本 JSON 内容。 */
+/** 严格解析 MCP 工具返回的 JSON 内容：上游报错、空响应或非 JSON 一律抛脱敏错误，绝不静默返回空值或回显正文。 */
 export function parseToolResultJson(result) {
   if (!result || result.isError) {
-    const msg = result?.content?.map((c) => c.text).filter(Boolean).join('\n') || '上游工具返回错误';
-    throw new Error(msg);
+    throw new Error('上游只读工具返回错误（正文已脱敏）');
   }
   if (result.structuredContent !== undefined) return result.structuredContent;
   const text = (result.content || [])
@@ -89,8 +93,35 @@ export function parseToolResultJson(result) {
     .map((item) => item.text)
     .join('\n')
     .trim();
-  if (!text) return null;
-  try { return JSON.parse(text); } catch { return { text }; }
+  if (!text) {
+    throw new Error('上游只读工具返回空响应');
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('上游只读工具返回非 JSON 响应');
+  }
+}
+
+/** 脱敏上游传输错误：绝不把 SDK 拼入的 HTTP 响应体、参数或令牌泄漏到异常消息与日志。 */
+export function redactUpstreamError(err, action = '上游调用') {
+  if (!err) return new Error(`${action}失败`);
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+    return new Error(`${action}超时`);
+  }
+  const statusCode = Number(err.code || err.status || err.statusCode);
+  if (Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599) {
+    return new Error(`${action}失败（HTTP ${statusCode}）`);
+  }
+  const httpMatch = /\bHTTP\s+(\d{3})\b/i.exec(String(err.message || ''));
+  if (httpMatch) {
+    return new Error(`${action}失败（HTTP ${httpMatch[1]}）`);
+  }
+  const netCode = err.cause?.code || (typeof err.code === 'string' ? err.code : '');
+  if (netCode && /^[A-Z0-9_]+$/.test(netCode)) {
+    return new Error(`${action}网络错误（${netCode}）`);
+  }
+  return new Error(`${action}失败（原因已脱敏）`);
 }
 
 export function createUpstreamClient({ url, token, timeoutMs = 20_000 }) {
@@ -110,6 +141,8 @@ export function createUpstreamClient({ url, token, timeoutMs = 20_000 }) {
     try {
       await client.connect(transport);
       return await fn(client);
+    } catch (err) {
+      throw redactUpstreamError(err, '上游小V猫 MCP');
     } finally {
       clearTimeout(timer);
       await client.close().catch(() => {});
@@ -119,8 +152,20 @@ export function createUpstreamClient({ url, token, timeoutMs = 20_000 }) {
   return {
     url,
     async syncTools() {
-      const { tools = [] } = await withClient((client) => client.listTools());
-      return filterUpstreamTools(tools);
+      const allTools = await withClient(async (client) => {
+        const collected = [];
+        const seenCursors = new Set();
+        let cursor;
+        for (let page = 0; page < 20; page += 1) {
+          const res = await client.listTools(cursor ? { cursor } : undefined);
+          if (Array.isArray(res?.tools)) collected.push(...res.tools);
+          if (!res?.nextCursor || seenCursors.has(res.nextCursor)) break;
+          seenCursors.add(res.nextCursor);
+          cursor = res.nextCursor;
+        }
+        return collected;
+      });
+      return filterUpstreamTools(allTools);
     },
     async callReadTool(name, rawArgs = {}) {
       if (!isAllowedUpstreamTool(name)) {
