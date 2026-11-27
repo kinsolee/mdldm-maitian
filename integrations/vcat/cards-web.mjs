@@ -452,7 +452,10 @@ export async function main() {
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === import.meta.filename) {
   main().catch((err) => {
-    console.error(`${stamp()} 小V猫影子答题页启动失败：${err.message}`);
+    const safeMsg = err?.code && /^[A-Z0-9_]+$/.test(String(err.code))
+      ? `系统错误（${err.code}）`
+      : String(err?.message || '未知错误').split('\n')[0].slice(0, 160);
+    console.error(`${stamp()} 小V猫影子答题页启动失败：${safeMsg}`);
     process.exit(1);
   });
 }

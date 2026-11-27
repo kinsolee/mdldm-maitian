@@ -39,7 +39,7 @@ export function enforceEnvPerms(file = ENV_FILE) {
   let stat = null;
   try { stat = fs.lstatSync(file); } catch (err) { if (err.code !== 'ENOENT') throw err; }
   if (stat?.isSymbolicLink()) {
-    throw new Error(`.env 不能是符号链接：${file}`);
+    throw new Error('VCAT_ENV_FILE 指向的 .env 不能是符号链接');
   }
   baseEnforceEnvPerms(file);
 }
@@ -65,7 +65,7 @@ export function assertSafeKbExportPath(filePath) {
   }
   const resolved = path.resolve(filePath.trim());
   if (OPENBOT_FILES.includes(path.basename(resolved)) || path.extname(resolved) !== '.md') {
-    throw new Error(`VCAT_KB_EXPORT_FILE 必须是独立的 .md 文件，且不能指向 OpenBot 正式文件：${resolved}`);
+    throw new Error('VCAT_KB_EXPORT_FILE 必须是独立的 .md 文件，且不能指向 OpenBot 正式文件');
   }
 
   // 逐级检查路径中的每一段（含所有已存在的父目录和目标文件本身），拒绝任何符号链接（仅放行 macOS 顶层 /var、/tmp、/etc）
@@ -79,12 +79,12 @@ export function assertSafeKbExportPath(filePath) {
       stat = fs.lstatSync(current);
     } catch (err) {
       if (err.code === 'ENOENT') break;
-      throw err;
+      throw new Error(`VCAT_KB_EXPORT_FILE 路径检查失败（${err?.code || 'fs_error'}）`);
     }
     if (stat.isSymbolicLink()) {
       const isTopSystemLink = i === 0 && MACOS_ROOT_SYMLINKS.has(current);
       if (!isTopSystemLink) {
-        throw new Error(`VCAT_KB_EXPORT_FILE 路径或其父目录不能是符号链接：${current}`);
+        throw new Error('VCAT_KB_EXPORT_FILE 路径或其父目录不能是符号链接');
       }
     }
   }
@@ -92,10 +92,12 @@ export function assertSafeKbExportPath(filePath) {
   try {
     const real = fs.realpathSync(resolved);
     if (OPENBOT_FILES.includes(path.basename(real))) {
-      throw new Error(`VCAT_KB_EXPORT_FILE 不能间接指向 OpenBot 正式文件：${real}`);
+      throw new Error('VCAT_KB_EXPORT_FILE 不能间接指向 OpenBot 正式文件');
     }
   } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
+    if (err.code !== 'ENOENT') {
+      throw new Error(`VCAT_KB_EXPORT_FILE 路径解析失败（${err?.code || 'fs_error'}）`);
+    }
   }
   return resolved;
 }
@@ -200,7 +202,7 @@ export function resolveUpstreamToken(config, { execFile = execFileSync } = {}) {
     return token;
   } catch (err) {
     const code = err?.code && /^[A-Z0-9_]+$/.test(String(err.code)) ? err.code : 'op_read_failed';
-    throw new Error(`无法从 1Password 读取小V猫 MCP 令牌（${ref}）：请确认已在 1Password 建立条目「小V猫 MCP」的 credential 字段，或设置 VCAT_UPSTREAM_TOKEN（原因：${code}）`);
+    throw new Error(`无法从 1Password 读取小V猫 MCP 令牌：请确认已在 1Password 建立条目「小V猫 MCP」的 credential 字段，或设置 VCAT_UPSTREAM_TOKEN（原因：${code}）`);
   }
 }
 

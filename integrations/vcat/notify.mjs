@@ -145,10 +145,18 @@ export async function notifyPendingCards(store, opts = {}) {
     return { sent: false, count: cards.length, cardIds: cards.map((c) => c.id), reason: 'missing_webhook' };
   }
 
-  const cardPayload = buildShadowBatchCard(cards, { cardsUrl, now });
+  const claimedVersions = cards.map((c) => ({ id: c.id, notifyVersion: c.notifyVersion }));
+  const dispatchedSet = new Set(store.markNotifyDispatched(claimToken, claimedVersions, { now }));
+  const activeCards = cards.filter((c) => dispatchedSet.has(c.id));
+  if (activeCards.length === 0) {
+    return { sent: false, count: 0, cardIds: [], reason: 'no_unnotified_cards' };
+  }
+  const versions = activeCards.map((c) => ({ id: c.id, notifyVersion: c.notifyVersion }));
+
+  const cardPayload = buildShadowBatchCard(activeCards, { cardsUrl, now });
   let outcome = await postFeishu(targetWebhook, { msg_type: 'interactive', card: cardPayload }, fetchImpl);
   if (outcome.rejected) {
-    const fallbackText = buildFallbackText(cards, { cardsUrl });
+    const fallbackText = buildFallbackText(activeCards, { cardsUrl });
     if (typeof fallbackNotify === 'function') {
       try {
         const res = await fallbackNotify(fallbackText);
@@ -168,10 +176,9 @@ export async function notifyPendingCards(store, opts = {}) {
     }
   }
 
-  const versions = cards.map((c) => ({ id: c.id, notifyVersion: c.notifyVersion }));
   if (outcome.sent) {
     const confirmed = store.confirmCardsNotified(claimToken, versions, { now });
-    return { sent: true, count: cards.length, confirmed, cardIds: cards.map((c) => c.id) };
+    return { sent: true, count: activeCards.length, confirmed, cardIds: activeCards.map((c) => c.id) };
   }
   if (outcome.uncertain) {
     const uncertainCount = store.markNotifyUncertain(claimToken, versions, { now });
@@ -179,11 +186,11 @@ export async function notifyPendingCards(store, opts = {}) {
       sent: false,
       uncertain: true,
       uncertainCount,
-      count: cards.length,
-      cardIds: cards.map((c) => c.id),
+      count: activeCards.length,
+      cardIds: activeCards.map((c) => c.id),
       reason: outcome.why || 'send_uncertain',
     };
   }
-  store.releaseNotifyClaim(claimToken);
-  return { sent: false, uncertain: false, count: cards.length, cardIds: cards.map((c) => c.id), reason: outcome.why || 'send_failed' };
+  store.releaseNotifyClaim(claimToken, versions);
+  return { sent: false, uncertain: false, count: activeCards.length, cardIds: activeCards.map((c) => c.id), reason: outcome.why || 'send_failed' };
 }

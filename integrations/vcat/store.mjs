@@ -146,6 +146,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         kb_entry_id INTEGER,
         notified_at TEXT,
         notify_version INTEGER NOT NULL DEFAULT 1,
+        notify_dispatched_version INTEGER,
         notify_claim_token TEXT,
         notify_claimed_at TEXT,
         notify_state TEXT CHECK (notify_state IS NULL OR notify_state IN ('uncertain')),
@@ -191,6 +192,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
 
     const cardCols = new Set(db.prepare('PRAGMA table_info(cards)').all().map((c) => c.name));
     if (!cardCols.has('notify_version')) db.exec('ALTER TABLE cards ADD COLUMN notify_version INTEGER NOT NULL DEFAULT 1');
+    if (!cardCols.has('notify_dispatched_version')) db.exec('ALTER TABLE cards ADD COLUMN notify_dispatched_version INTEGER');
     if (!cardCols.has('notify_claim_token')) db.exec('ALTER TABLE cards ADD COLUMN notify_claim_token TEXT');
     if (!cardCols.has('notify_claimed_at')) db.exec('ALTER TABLE cards ADD COLUMN notify_claimed_at TEXT');
     if (!cardCols.has('notify_state')) db.exec("ALTER TABLE cards ADD COLUMN notify_state TEXT CHECK (notify_state IS NULL OR notify_state IN ('uncertain'))");
@@ -532,10 +534,11 @@ export function openShadowStore(file, { readOnly = false } = {}) {
                 notified_at = CASE WHEN ? > 0 THEN NULL ELSE notified_at END,
                 notify_state = CASE WHEN ? > 0 THEN NULL ELSE notify_state END,
                 notify_version = CASE WHEN ? > 0 THEN notify_version + 1 ELSE notify_version END,
+                notify_dispatched_version = CASE WHEN ? > 0 THEN NULL ELSE notify_dispatched_version END,
                 notify_claim_token = CASE WHEN ? > 0 THEN NULL ELSE notify_claim_token END,
                 notify_claimed_at = CASE WHEN ? > 0 THEN NULL ELSE notify_claimed_at END
             WHERE id = ?
-          `).run(nextType, nextPlatform, nextSuggested, at, addedItems, addedItems, addedItems, addedItems, addedItems, targetCardId);
+          `).run(nextType, nextPlatform, nextSuggested, at, addedItems, addedItems, addedItems, addedItems, addedItems, addedItems, targetCardId);
         }
 
         return { cardId: targetCardId, merged, addedItems };
@@ -646,7 +649,10 @@ export function openShadowStore(file, { readOnly = false } = {}) {
     unnotifiedPendingCards(limit = 20) {
       const rows = db.prepare(`
         SELECT * FROM cards
-        WHERE status = 'pending' AND notified_at IS NULL AND notify_state IS NULL
+        WHERE status = 'pending'
+          AND notified_at IS NULL
+          AND notify_state IS NULL
+          AND (notify_dispatched_version IS NULL OR notify_dispatched_version < notify_version)
         ORDER BY created_at ASC, id ASC
         LIMIT ?
       `).all(Math.max(1, Math.min(50, Number(limit) || 20)));
@@ -654,7 +660,13 @@ export function openShadowStore(file, { readOnly = false } = {}) {
     },
 
     unnotifiedPendingCount() {
-      return db.prepare("SELECT COUNT(*) AS n FROM cards WHERE status = 'pending' AND notified_at IS NULL AND notify_state IS NULL").get().n;
+      return db.prepare(`
+        SELECT COUNT(*) AS n FROM cards
+        WHERE status = 'pending'
+          AND notified_at IS NULL
+          AND notify_state IS NULL
+          AND (notify_dispatched_version IS NULL OR notify_dispatched_version < notify_version)
+      `).get().n;
     },
 
     /** 原子认领一批待通知卡片，防止并发 cards_notify 重复推送，并携带 notify_version 防止覆盖新合并问题。 */
@@ -671,6 +683,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
           WHERE status = 'pending'
             AND notified_at IS NULL
             AND notify_state IS NULL
+            AND (notify_dispatched_version IS NULL OR notify_dispatched_version < notify_version)
             AND (notify_claimed_at IS NULL OR notify_claimed_at < ?)
           ORDER BY created_at ASC, id ASC
           LIMIT ?
@@ -680,6 +693,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
           UPDATE cards
           SET notify_claim_token = ?, notify_claimed_at = ?
           WHERE id = ? AND status = 'pending' AND notified_at IS NULL AND notify_state IS NULL
+            AND (notify_dispatched_version IS NULL OR notify_dispatched_version < notify_version)
             AND (notify_claimed_at IS NULL OR notify_claimed_at < ?)
         `);
         const locked = [];
@@ -694,6 +708,28 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         notifyVersion: claimedRows[idx].notify_version ?? 1,
       }));
       return { claimToken, cards };
+    },
+
+    /** 在实际发出外部通知请求前持久化“当前版本已开始投递”，防止进程暂停/退出超 TTL 后同版本被重复发送。 */
+    markNotifyDispatched(claimToken, cardVersions, { now = Date.now } = {}) {
+      const at = iso(now);
+      const dispatchedIds = [];
+      const stmt = db.prepare(`
+        UPDATE cards
+        SET notify_dispatched_version = notify_version, updated_at = ?
+        WHERE id = ? AND status = 'pending' AND notified_at IS NULL AND notify_state IS NULL
+          AND (notify_dispatched_version IS NULL OR notify_dispatched_version < notify_version)
+          AND notify_claim_token = ? AND notify_version = ?
+      `);
+      tx(() => {
+        for (const entry of cardVersions) {
+          const cardId = Number(entry.id);
+          if (stmt.run(at, cardId, claimToken, Number(entry.notifyVersion)).changes > 0) {
+            dispatchedIds.push(cardId);
+          }
+        }
+      });
+      return dispatchedIds;
     },
 
     /** 仅对仍在当前认领批次且版本未发生合并变更的卡片标记已通知。 */
@@ -732,16 +768,33 @@ export function openShadowStore(file, { readOnly = false } = {}) {
       return marked;
     },
 
-    /** 通知发送失败时释放认领锁，便于后续重试。 */
-    releaseNotifyClaim(claimToken) {
+    /** 确定未送达（或发前缺失 webhook）时释放认领与投递标记，恢复重试；不会触碰已合并的新版本或已标 uncertain 的记录。 */
+    releaseNotifyClaim(claimToken, cardVersions = null) {
       tx(() => {
-        db.prepare('UPDATE cards SET notify_claim_token = NULL, notify_claimed_at = NULL WHERE notify_claim_token = ?').run(claimToken);
+        if (Array.isArray(cardVersions) && cardVersions.length > 0) {
+          const stmt = db.prepare(`
+            UPDATE cards
+            SET notify_claim_token = NULL, notify_claimed_at = NULL,
+                notify_dispatched_version = CASE WHEN notify_state IS NULL THEN NULL ELSE notify_dispatched_version END
+            WHERE id = ? AND notify_claim_token = ? AND notify_version = ?
+          `);
+          for (const entry of cardVersions) {
+            stmt.run(Number(entry.id), claimToken, Number(entry.notifyVersion));
+          }
+          return;
+        }
+        db.prepare(`
+          UPDATE cards
+          SET notify_claim_token = NULL, notify_claimed_at = NULL,
+              notify_dispatched_version = CASE WHEN notify_state IS NULL THEN NULL ELSE notify_dispatched_version END
+          WHERE notify_claim_token = ?
+        `).run(claimToken);
       });
     },
 
     markCardsNotified(cardIds, { now = Date.now } = {}) {
       const at = iso(now);
-      const stmt = db.prepare('UPDATE cards SET notified_at = ?, notify_claim_token = NULL, notify_claimed_at = NULL WHERE id = ? AND notified_at IS NULL');
+      const stmt = db.prepare('UPDATE cards SET notified_at = ?, notify_state = NULL, notify_claim_token = NULL, notify_claimed_at = NULL WHERE id = ? AND notified_at IS NULL');
       tx(() => {
         for (const id of cardIds) stmt.run(at, Number(id));
       });

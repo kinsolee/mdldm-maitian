@@ -1204,18 +1204,22 @@ describe('第 2 轮评审阻断与非阻断回归测试', () => {
 
   test('R2-2 & N2：配置校验错误不回显查询参数/令牌，[::1] 被拒，代理直调上游 isError 正文脱敏', async () => {
     const secretMarker = 'SECRET_URL_TOKEN_998877';
-    try {
-      parseCardsUrl(`http://127.0.0.1:8794/cards?token=${secretMarker}`, 8794);
-      assert.fail('should throw');
-    } catch (err) {
-      assert.ok(!err.message.includes(secretMarker), 'VCAT_CARDS_URL 报错不得回显查询参数令牌');
-    }
-    try {
-      parseUpstreamUrl(`http://127.0.0.1:3199/mcp?token=${secretMarker}`);
-      assert.fail('should throw');
-    } catch (err) {
-      assert.ok(!err.message.includes(secretMarker), 'VCAT_UPSTREAM_URL 报错不得回显查询参数令牌');
-    }
+    assert.throws(
+      () => parseCardsUrl(`http://127.0.0.1:8794/cards?token=${secretMarker}`, 8794),
+      (err) => {
+        assert.match(err.message, /VCAT_CARDS_URL/);
+        assert.ok(!err.message.includes(secretMarker), 'VCAT_CARDS_URL 报错不得回显查询参数令牌');
+        return true;
+      },
+    );
+    assert.throws(
+      () => parseUpstreamUrl(`http://127.0.0.1:3199/mcp?token=${secretMarker}`),
+      (err) => {
+        assert.match(err.message, /VCAT_UPSTREAM_URL/);
+        assert.ok(!err.message.includes(secretMarker), 'VCAT_UPSTREAM_URL 报错不得回显查询参数令牌');
+        return true;
+      },
+    );
     assert.throws(() => parseCardsUrl('http://[::1]:8794/cards', 8794), /回环/);
 
     // 代理直调白名单工具遇到上游 isError 时，不得把原始错误正文回显给调用方
@@ -1406,5 +1410,184 @@ describe('第 2 轮评审阻断与非阻断回归测试', () => {
     } finally {
       store.close();
     }
+  });
+});
+
+describe('第 3 轮评审阻断项回归测试', () => {
+  test('R3-1：飞书投递前持久化已开始投递，超 60s TTL 绝不重发同版本，晚归 ECONNRESET 仍精准记 uncertainCount=1', async () => {
+    const store = openShadowStore(':memory:');
+    try {
+      store.ingestInbox([
+        { id: 'r3:1', kind: 'comment', platform: 'Douyin', content: '超时重入测试', occurredAt: '2026-11-27T01:00:00.000Z' },
+        { id: 'r3:2', kind: 'comment', platform: 'Bili', content: '合并新版测试', occurredAt: '2026-11-27T01:01:00.000Z' },
+        { id: 'r3:3', kind: 'comment', platform: 'Douyin', content: '确定未送达可重试', occurredAt: '2026-11-27T01:02:00.000Z' },
+      ]);
+      const card1 = store.submitCard({ inboxIds: ['r3:1'], questionSummary: '超时问题', topicKey: 'r3-timeout' });
+
+      let clockMs = Date.parse('2026-11-27T02:00:00.000Z');
+      const now = () => clockMs;
+      let sendCount = 0;
+      let rejectFirst;
+      const hangingFetch = () => {
+        sendCount += 1;
+        return new Promise((_, reject) => {
+          rejectFirst = () => reject(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }));
+        });
+      };
+
+      // 第 1 次发出请求，在回执返回前卡住
+      const p1 = notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: hangingFetch,
+        now,
+      });
+      assert.equal(sendCount, 1);
+      assert.equal(store.unnotifiedPendingCount(), 0, '已开始投递的同版本不应继续唤醒轮询');
+
+      // 时钟推进 60,001 ms（超过默认 60s claim TTL），再调一次绝不能重新认领并重发版本 1
+      clockMs += 60_001;
+      const r2 = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: hangingFetch,
+        now,
+      });
+      assert.equal(r2.sent, false);
+      assert.equal(r2.reason, 'no_unnotified_cards');
+      assert.equal(sendCount, 1, '超过 60s 后同版本仍不得重复发送');
+
+      // 第一次请求晚归 ECONNRESET：原 claimToken 未被抢走，uncertainCount 必须精确为 1
+      rejectFirst();
+      const r1 = await p1;
+      assert.equal(r1.sent, false);
+      assert.equal(r1.uncertain, true);
+      assert.equal(r1.uncertainCount, 1);
+      assert.equal(store.getCard(card1.card.id).notifiedAt, null);
+
+      // 合并新问题 r3:2 后版本递增，允许发出新版聚合卡
+      store.submitCard({ inboxIds: ['r3:2'], questionSummary: '超时问题', topicKey: 'r3-timeout' });
+      const rMerged = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: async () => {
+          sendCount += 1;
+          return new Response(JSON.stringify({ code: 0 }), { status: 200 });
+        },
+        now,
+      });
+      assert.equal(rMerged.sent, true);
+      assert.equal(sendCount, 2);
+
+      // 确定未送达（ECONNREFUSED）时应释放投递标记，下一轮允许重试并成功
+      store.submitCard({ inboxIds: ['r3:3'], questionSummary: '连接被拒问题', topicKey: 'r3-refused' });
+      const refused = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: async () => {
+          throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+        },
+        now,
+      });
+      assert.equal(refused.sent, false);
+      assert.equal(refused.uncertain, false);
+      assert.equal(store.unnotifiedPendingCount(), 1, '确定未送达必须恢复可重试状态');
+      const retried = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: async () => new Response(JSON.stringify({ code: 0 }), { status: 200 }),
+        now,
+      });
+      assert.equal(retried.sent, true);
+      assert.equal(retried.confirmed, 1);
+    } finally {
+      store.close();
+    }
+  });
+
+  test('R3-2：tools/list 返回空字符串 nextCursor 时按字段存在继续翻页并原样传递游标，重复空游标按循环报错', async () => {
+    const seenParams = [];
+    const serverEmptyCursor = http.createServer(async (req, res) => {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+        res.end(JSON.stringify({ error: 'method not allowed' }));
+        return;
+      }
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const mcp = new Server({ name: 'empty-cursor-ok', version: '0.1.0' }, { capabilities: { tools: {} } });
+      mcp.setRequestHandler(ListToolsRequestSchema, async (request) => {
+        const hasCursor = Boolean(request.params && Object.prototype.hasOwnProperty.call(request.params, 'cursor'));
+        seenParams.push(hasCursor ? request.params.cursor : undefined);
+        if (!hasCursor) {
+          return {
+            tools: [{ name: 'vcat_non_whitelist_1', description: 'p1', inputSchema: { type: 'object', properties: {} } }],
+            nextCursor: '',
+          };
+        }
+        assert.equal(request.params.cursor, '');
+        return {
+          tools: [{ name: 'vcat_list_accounts', description: 'p2', inputSchema: { type: 'object', properties: {} } }],
+        };
+      });
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+      res.on('close', () => { transport.close().catch(() => {}); mcp.close().catch(() => {}); });
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res, body);
+    });
+    await new Promise((r) => serverEmptyCursor.listen(0, '127.0.0.1', r));
+
+    const serverEmptyLoop = http.createServer(async (req, res) => {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+        res.end(JSON.stringify({ error: 'method not allowed' }));
+        return;
+      }
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const mcp = new Server({ name: 'empty-cursor-loop', version: '0.1.0' }, { capabilities: { tools: {} } });
+      mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+        tools: [{ name: 'vcat_list_accounts', description: 'loop', inputSchema: { type: 'object', properties: {} } }],
+        nextCursor: '',
+      }));
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+      res.on('close', () => { transport.close().catch(() => {}); mcp.close().catch(() => {}); });
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res, body);
+    });
+    await new Promise((r) => serverEmptyLoop.listen(0, '127.0.0.1', r));
+
+    try {
+      const upOk = createUpstreamClient({ url: `http://127.0.0.1:${serverEmptyCursor.address().port}/mcp`, token: UPSTREAM_TOKEN });
+      const synced = await upOk.syncTools();
+      assert.deepEqual(seenParams, [undefined, '']);
+      assert.deepEqual(synced.exposedTools.map((t) => t.name), ['vcat_list_accounts']);
+
+      const upLoop = createUpstreamClient({ url: `http://127.0.0.1:${serverEmptyLoop.address().port}/mcp`, token: UPSTREAM_TOKEN });
+      await assert.rejects(() => upLoop.syncTools(), /循环分页游标/);
+    } finally {
+      await new Promise((r) => serverEmptyCursor.close(r));
+      await new Promise((r) => serverEmptyLoop.close(r));
+    }
+  });
+
+  test('R3-3：VCAT_KB_EXPORT_FILE 与 VCAT_UPSTREAM_TOKEN_OP_REF 校验失败均不回显环境变量值', () => {
+    const secret = 'FIXTURE_ONLY_SECRET_999';
+    assert.throws(
+      () => readConfig({ VCAT_KB_EXPORT_FILE: `/tmp/review-demo?token=${secret}` }),
+      (err) => {
+        assert.match(err.message, /VCAT_KB_EXPORT_FILE/);
+        assert.ok(!err.message.includes(secret), 'VCAT_KB_EXPORT_FILE 报错不得回显路径或查询参数');
+        return true;
+      },
+    );
+    assert.throws(
+      () => resolveUpstreamToken(
+        { upstreamTokenEnv: '', upstreamTokenOpRef: `op://Private/${secret}/credential`, opBin: 'op' },
+        { execFile: () => { throw new Error('missing'); } },
+      ),
+      (err) => {
+        assert.match(err.message, /小V猫 MCP/);
+        assert.ok(!err.message.includes(secret), 'resolveUpstreamToken 报错不得回显 op:// 引用内容');
+        return true;
+      },
+    );
   });
 });

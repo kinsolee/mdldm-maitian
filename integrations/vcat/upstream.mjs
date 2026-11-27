@@ -158,10 +158,19 @@ export function createUpstreamClient({ url, token, timeoutMs = 20_000 }) {
         const collected = [];
         const seenCursors = new Set();
         let cursor;
+        let hasCursor = false;
         for (let page = 0; page < MAX_TOOL_LIST_PAGES; page += 1) {
-          const res = await client.listTools(cursor ? { cursor } : undefined);
+          const res = await client.listTools(hasCursor ? { cursor } : undefined);
           if (Array.isArray(res?.tools)) collected.push(...res.tools);
-          if (!res?.nextCursor) return collected;
+          const hasNext = res != null
+            && Object.prototype.hasOwnProperty.call(res, 'nextCursor')
+            && res.nextCursor != null;
+          if (!hasNext) return collected;
+          if (typeof res.nextCursor !== 'string') {
+            const err = new Error('上游 tools/list 返回非法分页游标，拒绝截断启动');
+            err.vcatSafeError = true;
+            throw err;
+          }
           if (seenCursors.has(res.nextCursor)) {
             const err = new Error('上游 tools/list 返回循环分页游标，拒绝截断启动');
             err.vcatSafeError = true;
@@ -169,6 +178,7 @@ export function createUpstreamClient({ url, token, timeoutMs = 20_000 }) {
           }
           seenCursors.add(res.nextCursor);
           cursor = res.nextCursor;
+          hasCursor = true;
         }
         const err = new Error(`上游 tools/list 超过 ${MAX_TOOL_LIST_PAGES} 页上限，拒绝截断启动`);
         err.vcatSafeError = true;
