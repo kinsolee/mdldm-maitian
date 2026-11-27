@@ -630,6 +630,34 @@ describe('配置与路径安全防护', () => {
     }
   });
 
+  test('钥匙串使用独立 argv，默认账户可覆盖，环境令牌优先', () => {
+    for (const account of ['', 'custom account']) {
+      const cfg = readConfig({ VCAT_UPSTREAM_TOKEN_KEYCHAIN_SERVICE: 'my service', VCAT_UPSTREAM_TOKEN_KEYCHAIN_ACCOUNT: account });
+      const execFile = (bin, args, opts) => {
+        assert.equal(bin, '/usr/bin/security');
+        assert.deepEqual(args, ['find-generic-password', '-s', 'my service', '-a', account || os.userInfo().username, '-w']);
+        assert.equal(opts.shell, undefined);
+        return ' fixture\n';
+      };
+      assert.equal(resolveUpstreamToken(cfg, { execFile }), 'fixture');
+      assert.equal(resolveUpstreamToken({ ...cfg, upstreamTokenEnv: 'direct' }, { execFile: assert.fail }), 'direct');
+    }
+  });
+
+  test('钥匙串失败或返回空值时停止，不泄漏错误内容', () => {
+    const cfg = readConfig({ VCAT_UPSTREAM_TOKEN_KEYCHAIN_SERVICE: 'service' });
+    for (const empty of [true, false]) {
+      let calls = 0;
+      const execFile = () => {
+        calls++;
+        if (empty) return ' ';
+        throw Object.assign(new Error('private'), { status: 44, stdout: 'private', stderr: 'private' });
+      };
+      assert.throws(() => resolveUpstreamToken(cfg, { execFile }), { message: empty ? 'keychain_read_failed' : 'keychain_read_failed (exit 44)' });
+      assert.equal(calls, 1);
+    }
+  });
+
   test('resolveUpstreamToken 支持 env 优先或启动时 op read（不落盘）', () => {
     assert.equal(resolveUpstreamToken({ upstreamTokenEnv: 'vcat_mcp_direct', upstreamTokenOpRef: '', opBin: 'op' }), 'vcat_mcp_direct');
     let received = null;

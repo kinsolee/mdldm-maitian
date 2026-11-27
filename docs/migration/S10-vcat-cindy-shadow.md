@@ -5,7 +5,7 @@
 ## 1. 架构与数据流
 
 ```text
-小V猫桌面端 MCP (127.0.0.1:3199/mcp, Bearer 令牌来自 1Password)
+小V猫桌面端 MCP (127.0.0.1:3199/mcp, Bearer 令牌来自登录钥匙串)
         ▲  (仅 initialize / tools/list / 固定白名单只读工具；refresh 强制 false)
         │
    ┌────┴─────────────────────────────────────────────────────────┐
@@ -42,16 +42,11 @@ hook.mjs check (Cindy preRunHook, 每 5 分钟)          mcp-proxy.mjs (127.0.0.
   - `127.0.0.1:8793/mcp`：仅回环监听、`Host` 白名单、`Authorization: Bearer` 常数时间校验、日志仅记方法与状态码（绝不写令牌、参数或正文）。
   - `127.0.0.1:8794/cards`：仅回环监听；所有接口校验回环 + 本机 `Host` + 无代理头；所有写接口额外要求 `Origin` 与 `http://<host>` 严格同源。
 
-## 3. 小V猫上游令牌约定（1Password）
+## 3. 配置上游令牌
 
-严禁从 `~/.vcat/local.config` 或系统钥匙串直接读取令牌，也严禁将令牌写入仓库、日志或汇报。
+在 macOS「钥匙串访问」的登录钥匙串中建立通用密码，名称为 `vcat-mcp`，账户为运行代理的 macOS 用户名，密码为上游令牌。在运行目录的 0600 `.env` 和 LaunchAgent 中设置 `VCAT_UPSTREAM_TOKEN_KEYCHAIN_SERVICE=vcat-mcp`。其他账户名可用 `VCAT_UPSTREAM_TOKEN_KEYCHAIN_ACCOUNT` 指定。首次启动可能需要在桌面批准访问。轮换时更新同一条目的密码，再重启代理以重新读取。
 
-- **推荐方式（动态读取、不落盘）**：
-  1. 在 1Password 的 `Private` 库新建条目，名称为 **`小V猫 MCP`**（API Credential 或 Password 类型），将小V猫设置里的 MCP Bearer Token（`vcat_mcp_...`）填入 **`credential`** 字段。
-  2. `integrations/vcat/.env` 保持默认 `VCAT_UPSTREAM_TOKEN_OP_REF=op://Private/小V猫 MCP/credential`。
-  3. 代理进程与 `hook.mjs check` 在启动时调用 `op read "op://Private/小V猫 MCP/credential"` 读取到内存使用，不落盘。
-- **备选方式（0600 `.env` 或 1Password Environment 挂载）**：
-  - 若通过 1Password Developer Environment 挂载或手填到 `integrations/vcat/.env`（权限必须 `chmod 600`），可设置 `VCAT_UPSTREAM_TOKEN=<token>`，设置后优先使用环境变量。
+解析顺序为进程环境中的 `VCAT_UPSTREAM_TOKEN`、指定的钥匙串服务、旧版 1Password 引用。使用钥匙串时清除直接令牌配置。钥匙串读取失败即退出，仅未指定钥匙串服务时才走旧版引用。代理和独立采集 hook 共用此解析逻辑。
 
 ## 4. 安装与启动（部署阶段）
 
@@ -60,7 +55,7 @@ hook.mjs check (Cindy preRunHook, 每 5 分钟)          mcp-proxy.mjs (127.0.0.
 cp integrations/vcat/.env.example integrations/vcat/.env
 chmod 600 integrations/vcat/.env
 
-# 2. 单独验证上游连通性与只读采集（需先在 1Password 存入「小V猫 MCP」令牌）
+# 2. 单独验证上游连通性与只读采集（需先配置登录钥匙串条目）
 node integrations/vcat/hook.mjs check; echo "exit=$?"
 
 # 3. 安装 launchd 服务（代理 8793 + 答题页 8794）

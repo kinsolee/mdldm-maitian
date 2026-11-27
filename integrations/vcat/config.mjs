@@ -1,5 +1,5 @@
 // 小V猫只读影子版配置：环境变量从 integrations/vcat/.env（0600）读取。
-// 上游小V猫令牌绝不进仓库、不打日志；支持进程环境变量、0600 .env，或启动时经 1Password CLI (op read) 动态读取不落盘。
+// 上游凭据仅供进程使用，禁止记录凭据输出。
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -171,6 +171,8 @@ export function readConfig(env = process.env) {
   return {
     upstreamUrl: parseUpstreamUrl(env.VCAT_UPSTREAM_URL || DEFAULT_UPSTREAM_URL),
     upstreamTokenEnv: env.VCAT_UPSTREAM_TOKEN ? String(env.VCAT_UPSTREAM_TOKEN).trim() : '',
+    keychainService: String(env.VCAT_UPSTREAM_TOKEN_KEYCHAIN_SERVICE || '').trim(),
+    keychainAccount: String(env.VCAT_UPSTREAM_TOKEN_KEYCHAIN_ACCOUNT || '').trim(),
     upstreamTokenOpRef: String(env.VCAT_UPSTREAM_TOKEN_OP_REF ?? DEFAULT_OP_REF).trim(),
     opBin: String(env.VCAT_OP_BIN || DEFAULT_OP_BIN).trim(),
     proxyPort,
@@ -184,14 +186,24 @@ export function readConfig(env = process.env) {
   };
 }
 
-/**
- * 启动时获取上游小V猫 MCP 令牌：
- * 1. 优先读环境变量 VCAT_UPSTREAM_TOKEN（可由 0600 .env 或 1Password Environment 注入）；
- * 2. 否则按 VCAT_UPSTREAM_TOKEN_OP_REF（默认 op://Private/小V猫 MCP/credential）调 `op read`，仅放内存不落盘。
- * 严禁从 ~/.vcat/local.config 或系统钥匙串读取。
- */
+/** 优先使用环境变量，其次使用指定钥匙串条目，未指定服务时兼容旧 op 引用。 */
 export function resolveUpstreamToken(config, { execFile = execFileSync } = {}) {
   if (config.upstreamTokenEnv) return config.upstreamTokenEnv;
+  if (config.keychainService) {
+    const account = config.keychainAccount || os.userInfo().username;
+    const args = ['find-generic-password', '-s', config.keychainService, '-a', account, '-w'];
+    let token;
+    try {
+      token = execFile('/usr/bin/security', args, {
+        encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch (err) {
+      const status = Number.isInteger(err?.status) ? ' (exit ' + err.status + ')' : '';
+      throw new Error('keychain_read_failed' + status);
+    }
+    if (!token) throw new Error('keychain_read_failed');
+    return token;
+  }
   const ref = config.upstreamTokenOpRef;
   if (!ref || !ref.startsWith('op://')) {
     throw new Error('未配置 VCAT_UPSTREAM_TOKEN，且 VCAT_UPSTREAM_TOKEN_OP_REF 不是有效的 op:// 引用');
