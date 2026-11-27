@@ -4,71 +4,470 @@
 <body>
 <wujie-app></wujie-app>
 <script>
-// 模式（?mode=）：ok | fail | silent | mangle | lastme | nobox | nouid
+// 模式（?mode=）：ok | scroll | swap | swap-header | swap-list | pending | fail | phonecheck | fail-history | locked | lastme | nobox | mangle | silent | nouid
+// 扩展回归模式：scroll-same-peer | old-pending-promote | old-pending-with-svr-promote | missing-msglist | fail-history-silent | async-fail-during-type | anon-pending-fail | anon-failure-swap | phonecheck-preexisting | swap-during-type | swap-before-click | ancestor-conflict | editor-ancestor-mismatch | deep-editor-ancestor-mismatch | dialog-disabled | nobtn-msg-send | toast-leak | toast-race-leak | other-text-anon-pending | sessionlist-null-entry | guard-throw-before-click | mousedown-insert-fail | mousedown-insert-pending
 const mode = new URLSearchParams(location.search).get('mode') || 'ok';
 if (mode !== 'nouid') window.__loginUser = { uniqId: 'v2_me', nickname: '麦田测试号' };
 const ME_USER = 'me_finder';
-let sendClicks = 0, seq = 0, openId = null;
+let sendClicks = 0, msgTextClicks = 0, seq = 0, listSid = '', headerSid = '', scrollLoads = 0, sawPending = false, toastRaceReads = 0;
+let page2Loaded = false, page2Loading = false;
+const scrolledTargets = [];
 const sr = document.querySelector('wujie-app').attachShadow({ mode: 'open' });
 sr.innerHTML = `<style>
-  .session-item { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
-  textarea { width: 300px; }
+  .private-msg-wrapper { display: flex; gap: 12px; font-family: sans-serif; }
+  .session-container { width: 220px; height: 220px; overflow-y: auto; border: 1px solid #ddd; }
+  .session-wrap { box-sizing: border-box; height: 44px; padding: 10px 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+  .session-wrap.active-session { background: #eef6ff; }
+  .session-dialog { flex: 1; min-width: 320px; }
+  .session-dialog .header { padding: 8px; border-bottom: 1px solid #ddd; font-weight: bold; }
+  .session-dialog .message-list { min-height: 120px; padding: 8px; }
+  textarea.edit_area { width: 300px; height: 60px; }
+  .weui-desktop-btn_disabled { opacity: 0.5; pointer-events: none; }
+  .phone-check-dialog { position: fixed; bottom: 16px; right: 16px; width: 220px; padding: 16px; background: #fff; border: 1px solid #c00; }
   .weui-desktop-toast { position: fixed; top: 4px; right: 4px; }
-</style><div class="session-wrap"><div class="session-list"></div></div><div class="chat-panel"></div><div class="toast-holder"></div>`;
+</style>
+<div class="private-msg-wrapper">
+  <div class="session-container"><div class="session-tg"></div></div>
+  <div class="session-dialog"></div>
+    <div class="phone-check-dialog" style="display:${mode === 'phonecheck-preexisting' ? 'block' : 'none'}">请先完成手机号安全验证</div>
+  <div class="toast-holder"></div>
+</div>`;
 const ts = Math.floor(Date.now() / 1000) - 3600;
-// 仿 S0：messageList 新到旧
-const msg = (msgId, from, to, t, text) => ({ message: { msgId, fromUsername: from, toUsername: to, ts: t, msgType: 1, textMsg: { content: text } } });
-const sessionList = [
-  ['s_1', { sessionInfo: { sessionId: 's_1', username: 'peer_a', nickname: '甲' }, messageList: [msg('m2', 'peer_a', ME_USER, ts + 10, '在吗'), msg('m1', ME_USER, 'peer_a', ts, '你好')], newMsgCount: 1, sessionIsUnread: true, sessionType: 1 }],
-  ['s_2', { sessionInfo: { sessionId: 's_2', username: 'peer_b', nickname: '乙' }, messageList: [msg('m3', 'peer_b', ME_USER, ts, '哈喽')], newMsgCount: 0, sessionIsUnread: false, sessionType: 1 }],
+// 仿真实视频号私信页：messageList 新到旧，带 currentMsgStatus（0=None, 1=Pending, 2=Success, 3=Failure）与服务端 svrMsgId
+const histMsg = (msgId, svrMsgId, from, to, t, text) => ({
+  currentMsgStatus: 0,
+  outLimitWarn: false,
+  message: { msgId, svrMsgId, sendMsgFlag: false, fromUsername: from, toUsername: to, ts: t, msgType: 1, textMsg: { content: text } },
+});
+const makeFiller = (idx) => {
+  const id = `s_f${String(idx).padStart(2, '0')}`;
+  const user = `peer_f${idx}`;
+  return [id, {
+    sessionInfo: { sessionId: id, username: user, nickname: `路人${idx}` },
+    messageList: [histMsg(`mf_${idx}`, `73800000000000010${String(idx).padStart(2, '0')}`, user, ME_USER, ts - idx * 60, `你好${idx}`)],
+    newMsgCount: 0, sessionIsUnread: false, sessionType: 1,
+  }];
+};
+const targetSessions = [
+  ['s_1', {
+    sessionInfo: { sessionId: 's_1', username: 'peer_a', nickname: '甲' },
+    messageList: [
+      histMsg('m2', '7380000000000000002', 'peer_a', ME_USER, ts + 10, '在吗'),
+      histMsg('m1', '7380000000000000001', ME_USER, 'peer_a', ts, '你好'),
+    ],
+    newMsgCount: 1, sessionIsUnread: true, sessionType: 1,
+  }],
+  ['s_2', {
+    sessionInfo: { sessionId: 's_2', username: 'peer_b', nickname: '乙' },
+    messageList: [histMsg('m3', '7380000000000000003', 'peer_b', ME_USER, ts, '哈喽')],
+    newMsgCount: 0, sessionIsUnread: false, sessionType: 1,
+  }],
 ];
-if (mode === 'lastme') sessionList[0][1].messageList.unshift(msg('m9', ME_USER, 'peer_a', ts + 20, '稍等'));
-sr.querySelector('.session-wrap').__vue__ = { $data: { sessionList } };
+if (mode === 'lastme') {
+  targetSessions[0][1].messageList.unshift(histMsg('m9', '7380000000000000009', ME_USER, 'peer_a', ts + 20, '稍等'));
+}
+if (mode === 'fail-history' || mode === 'fail-history-silent') {
+  targetSessions[0][1].messageList.unshift({
+    currentMsgStatus: 3,
+    outLimitWarn: false,
+    message: { msgId: 'old-fail-uuid', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 20, msgType: 1, textMsg: { content: '上次没发出去' } },
+  });
+}
+if (mode === 'old-pending-promote') {
+  targetSessions[0][1].messageList.splice(1, 0, {
+    currentMsgStatus: 1,
+    outLimitWarn: false,
+    message: { msgId: 'old-pending-uuid', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 5, msgType: 1, textMsg: { content: '你好，在的' } },
+  });
+}
+if (mode === 'old-pending-with-svr-promote') {
+  targetSessions[0][1].messageList.splice(1, 0, {
+    currentMsgStatus: 1,
+    outLimitWarn: false,
+    message: { msgId: 'old-pending-svr-uuid', svrMsgId: '7390000000000008888', sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 5, msgType: 1, textMsg: { content: '你好，在的' } },
+  });
+}
+if (mode === 'missing-msglist') {
+  delete targetSessions[0][1].messageList;
+}
+if (mode === 'anon-pending-fail') {
+  targetSessions[0][1].messageList.splice(1, 0, {
+    currentMsgStatus: 1,
+    outLimitWarn: false,
+    message: { msgId: null, svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 5, msgType: 1, textMsg: { content: '你好，在的' } },
+  });
+}
+if (mode === 'anon-failure-swap') {
+  targetSessions[0][1].messageList.splice(1, 0, {
+    currentMsgStatus: 3,
+    outLimitWarn: false,
+    message: { msgId: null, svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: 'peer_a', ts: ts + 5, msgType: 1, textMsg: { content: '你好，在的' } },
+  });
+}
+if (mode === 'nobtn-msg-send') {
+  targetSessions[0][1].messageList.unshift(histMsg('m_send_txt', '7380000000000000088', 'peer_a', ME_USER, ts + 15, '发送'));
+}
+
+const samePeerOther = ['s_other', {
+  sessionInfo: { sessionId: 's_other', username: 'peer_a', nickname: '甲' },
+  messageList: [histMsg('m_other', '7380000000000000099', 'peer_a', ME_USER, ts + 5, '另一个会话')],
+  newMsgCount: 0, sessionIsUnread: false, sessionType: 1,
+}];
+
+const sessionList = mode === 'scroll'
+  ? Array.from({ length: 12 }, (_, idx) => makeFiller(idx + 1))
+  : mode === 'scroll-same-peer'
+    ? [samePeerOther, ...Array.from({ length: 11 }, (_, idx) => makeFiller(idx + 1))]
+  : mode === 'sessionlist-null-entry'
+    ? [null, ['s_null_val', null], 'bad_entry', ...targetSessions]
+  : [...targetSessions];
+
+const wrapperEl = sr.querySelector('.private-msg-wrapper');
+const containerEl = sr.querySelector('.session-container');
+const tgEl = sr.querySelector('.session-tg');
+const dialogEl = sr.querySelector('.session-dialog');
+
+const tgVm = {
+  $options: { name: 'transition-group', _componentTag: 'transition-group' },
+  children: [],
+  _vnode: { children: [] },
+  $children: [],
+};
+const scrollListVm = {
+  $options: { name: 'CommonScrollList' },
+  $children: [tgVm],
+};
+const listVm = {
+  $data: { sessionList },
+  get currentSessionId() { return mode === 'ancestor-conflict' ? '' : listSid; },
+  $children: [scrollListVm],
+};
+wrapperEl.__vue__ = listVm;
+containerEl.__vue__ = scrollListVm;
+tgEl.__vue__ = tgVm;
+
+const headerVm = {
+  $props: {},
+  $data: {},
+  get sessionInfo() {
+    if (mode === 'ancestor-conflict' || mode === 'editor-ancestor-mismatch' || mode === 'deep-editor-ancestor-mismatch') return {};
+    const hit = sessionList.find((entry) => Array.isArray(entry) && entry[0] === headerSid && entry[1]);
+    return hit ? hit[1].sessionInfo : null;
+  },
+  $children: [],
+};
+const editorVm = { $props: {}, $data: {}, $children: [] };
+if (mode === 'ancestor-conflict') {
+  editorVm.$props = { sessionId: 's_1' };
+  editorVm.$data = { sessionId: 's_2' };
+}
+if (mode === 'editor-ancestor-mismatch') {
+  editorVm.$props = { sessionId: 's_2' };
+}
+dialogEl.__vue__ = { $props: {}, $data: {}, $children: [headerVm, editorVm] };
+if (mode === 'dialog-disabled') {
+  dialogEl.setAttribute('aria-disabled', 'true');
+}
+
+containerEl.addEventListener('scroll', () => {
+  if ((mode !== 'scroll' && mode !== 'scroll-same-peer') || page2Loaded || page2Loading) return;
+  if (containerEl.scrollTop + containerEl.clientHeight < containerEl.scrollHeight - 20) return;
+  page2Loading = true;
+  setTimeout(() => {
+    page2Loaded = true;
+    page2Loading = false;
+    scrollLoads++;
+    for (let idx = 13; idx <= 18; idx++) sessionList.push(makeFiller(idx));
+    sessionList.push(...targetSessions);
+    renderList();
+  }, 150);
+});
 
 function renderList() {
-  const l = sr.querySelector('.session-list');
-  l.innerHTML = '';
-  for (const [id, s] of sessionList) {
+  tgEl.innerHTML = '';
+  const vnodes = [];
+  // 让 DOM 顺序与 sessionList 顺序不同，确保测试覆盖 transition-group vnode.key 主路径而非索引回退
+  const renderItems = [...sessionList].filter((entry) => Array.isArray(entry) && entry[0] != null && entry[1]).reverse();
+  for (const [id, s] of renderItems) {
     const el = document.createElement('div');
-    el.className = 'session-item';
-    el.textContent = s.sessionInfo.nickname + '：' + s.messageList[0].message.textMsg.content;
-    el.__vue__ = { $props: { session: s.sessionInfo } };
-    el.onclick = () => { openId = mode === 'swap' ? sessionList[1][0] : id; renderPanel(); };
-    l.appendChild(el);
+    el.className = 'session-wrap' + (id === listSid ? ' active-session' : '');
+    el.textContent = s.sessionInfo.nickname + '：' + (s.messageList?.[0]?.message?.textMsg?.content ?? '');
+    const origScroll = el.scrollIntoView.bind(el);
+    el.scrollIntoView = (opt) => {
+      scrolledTargets.push({ id, opt: opt ?? null });
+      return origScroll(opt);
+    };
+    // 真实页面中 .session-wrap 是普通元素，不挂 __vue__
+    el.onclick = () => {
+      if (mode === 'swap') { listSid = 's_2'; headerSid = 's_2'; }
+      else if (mode === 'swap-header') { listSid = id; headerSid = 's_2'; }
+      else if (mode === 'swap-list') { listSid = 's_2'; headerSid = id; }
+      else { listSid = id; headerSid = id; }
+      renderList();
+      renderPanel();
+    };
+    tgEl.appendChild(el);
+    vnodes.push({ key: id, elm: el });
   }
+  tgVm.children = vnodes;
+  tgVm._vnode = { children: vnodes };
 }
 
 function renderPanel() {
-  const s = sessionList.find(([id]) => id === openId)[1];
-  const p = sr.querySelector('.chat-panel');
-  p.innerHTML = '';
-  // 仿 Vue：聊天区组件的 props 里带当前会话
-  p.__vue__ = { $props: { session: s.sessionInfo } };
-  for (const m of [...s.messageList].reverse()) { const d = document.createElement('div'); d.textContent = m.message.textMsg.content; p.appendChild(d); }
-  if (mode === 'nobox') return;
-  const f = document.createElement('div');
-  f.className = 'footer';
-  f.innerHTML = '<textarea class="edit_area"></textarea><div class="op"><button class="weui-desktop-btn">发送</button></div>';
-  p.appendChild(f);
-  const ta = f.querySelector('textarea');
-  if (mode === 'mangle') ta.addEventListener('input', () => { if (!ta.dataset.m) { ta.dataset.m = '1'; ta.value = ta.value.slice(0, -1); } });
-  f.querySelector('button').onclick = () => onSend(s, ta);
-}
+  const activeId = headerSid || listSid;
+  const hit = sessionList.find((entry) => Array.isArray(entry) && entry[0] === activeId && entry[1]);
+  dialogEl.innerHTML = '';
+  if (!hit) return;
+  const s = hit[1];
+  const header = document.createElement('div');
+  header.className = 'header';
+  header.textContent = s.sessionInfo.nickname;
+  header.__vue__ = headerVm;
+  dialogEl.appendChild(header);
 
-function toast(m) { sr.querySelector('.toast-holder').innerHTML = `<div class="weui-desktop-toast"><span>${m}</span></div>`; }
+  const msgBox = document.createElement('div');
+  msgBox.className = 'message-list';
+  if (mode === 'ancestor-conflict') {
+    // 无关子组件挂着目标 sessionId，核验不应采信非 .header 里的无关组件
+    msgBox.__vue__ = { $props: {}, $data: {}, sessionInfo: { sessionId: 's_1' } };
+  }
+  for (const m of [...(s.messageList ?? [])].reverse()) {
+    const d = document.createElement('div');
+    d.textContent = m.message.textMsg.content;
+    d.onclick = () => { msgTextClicks++; };
+    msgBox.appendChild(d);
+  }
+  dialogEl.appendChild(msgBox);
+
+  if (mode === 'nobox') return;
+  const footer = document.createElement('div');
+  footer.className = 'footer';
+  footer.__vue__ = editorVm;
+  footer.innerHTML = mode === 'nobtn-msg-send'
+    ? '<textarea class="edit_area"></textarea>'
+    : mode === 'dialog-disabled'
+      ? '<textarea class="edit_area"></textarea><div class="weui-desktop-btn_wrp"><div class="weui-desktop-btn" role="button">发送</div></div>'
+    : '<textarea class="edit_area"></textarea><div class="weui-desktop-btn_wrp"><button class="weui-desktop-btn weui-desktop-btn_disabled" disabled>发送</button></div>';
+  if (mode === 'deep-editor-ancestor-mismatch') {
+    const outer = document.createElement('div');
+    outer.className = 'deep-editor-root';
+    outer.__vue__ = { $props: { sessionId: 's_2' }, $data: {}, $children: [] };
+    let cur = outer;
+    for (let depth = 0; depth < 15; depth++) {
+      const wrap = document.createElement('div');
+      wrap.className = `deep-wrap-${depth}`;
+      cur.appendChild(wrap);
+      cur = wrap;
+    }
+    cur.appendChild(footer);
+    dialogEl.appendChild(outer);
+  } else {
+    dialogEl.appendChild(footer);
+  }
+
+  const ta = footer.querySelector('textarea');
+  const btn = footer.querySelector('button, [role=button]');
+  const syncBtn = () => {
+    if (!btn || btn.tagName !== 'BUTTON') return;
+    const canSend = mode !== 'locked' && ta.value.trim().length > 0;
+    btn.disabled = !canSend;
+    btn.classList.toggle('weui-desktop-btn_disabled', !canSend);
+  };
+  ta.addEventListener('input', () => {
+    if (mode === 'mangle' && !ta.dataset.m) { ta.dataset.m = '1'; ta.value = ta.value.slice(0, -1); }
+    if (mode === 'async-fail-during-type' && !ta.dataset.af) {
+      ta.dataset.af = '1';
+      s.messageList.unshift({
+        currentMsgStatus: 3,
+        outLimitWarn: false,
+        message: { msgId: 'async-old-fail', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: ts + 3, msgType: 1, textMsg: { content: '异步补入的历史失败' } },
+      });
+    }
+    if (mode === 'swap-during-type' && !ta.dataset.sw) {
+      ta.dataset.sw = '1';
+      listSid = 's_2';
+      headerSid = 's_2';
+    }
+    syncBtn();
+  });
+  if (btn && mode === 'swap-before-click') {
+    btn.addEventListener('mousedown', () => {
+      listSid = 's_2';
+      headerSid = 's_2';
+    });
+  }
+  if (btn && mode === 'guard-throw-before-click') {
+    btn.addEventListener('mousedown', () => {
+      Object.defineProperty(listVm.$data, 'sessionList', {
+        configurable: true,
+        get() { throw new Error('sessionList broken during click'); },
+      });
+    });
+  }
+  if (btn && mode === 'mousedown-insert-fail') {
+    btn.addEventListener('mousedown', () => {
+      if (btn.dataset.mf) return;
+      btn.dataset.mf = '1';
+      s.messageList.unshift({
+        currentMsgStatus: 3,
+        outLimitWarn: false,
+        message: { msgId: 'mousedown-old-fail', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: ts + 12, msgType: 1, textMsg: { content: ta.value } },
+      });
+    });
+  }
+  if (btn && mode === 'mousedown-insert-pending') {
+    btn.addEventListener('mousedown', () => {
+      if (btn.dataset.mp) return;
+      btn.dataset.mp = '1';
+      s.messageList.splice(1, 0, {
+        currentMsgStatus: 1,
+        outLimitWarn: false,
+        message: { msgId: 'mousedown-old-pending', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: ts + 5, msgType: 1, textMsg: { content: ta.value } },
+      });
+    });
+  }
+  if (btn) btn.onclick = () => { if (!btn.disabled) onSend(s, ta); };
+}
 
 function onSend(s, ta) {
   sendClicks++;
   const text = ta.value;
-  if (mode === 'fail') { setTimeout(() => toast('发送失败'), 200); return; }
-  if (mode === 'silent') return;
-  setTimeout(() => { s.messageList.unshift(msg('nm' + (++seq), ME_USER, s.sessionInfo.username, Math.floor(Date.now() / 1000), text)); renderList(); renderPanel(); }, 300);
+  if (mode === 'silent' || mode === 'fail-history-silent' || mode === 'async-fail-during-type' || mode === 'phonecheck-preexisting' || mode === 'mousedown-insert-fail') return;
+  if (mode === 'mousedown-insert-pending') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message?.msgId === 'mousedown-old-pending');
+      if (old) {
+        old.currentMsgStatus = 2;
+        old.message.svrMsgId = '7390000000000007777';
+      }
+    }, 200);
+    return;
+  }
+  if (mode === 'old-pending-promote') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message?.msgId === 'old-pending-uuid');
+      if (old) {
+        old.currentMsgStatus = 2;
+        old.message.svrMsgId = '7390000000000009999';
+      }
+    }, 200);
+    return;
+  }
+  if (mode === 'old-pending-with-svr-promote') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message?.msgId === 'old-pending-svr-uuid');
+      if (old) {
+        old.currentMsgStatus = 2;
+      }
+    }, 200);
+    return;
+  }
+  if (mode === 'anon-pending-fail') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message && m.message.msgId == null && m.currentMsgStatus === 1);
+      if (old) old.currentMsgStatus = 3;
+    }, 200);
+    return;
+  }
+  if (mode === 'anon-failure-swap') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message && m.message.msgId == null && m.currentMsgStatus === 3);
+      if (old) old.message.msgId = 'promoted-old-fail-uuid';
+      s.messageList.unshift({
+        currentMsgStatus: 1,
+        outLimitWarn: false,
+        message: { msgId: null, svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: Math.floor(Date.now() / 1000), msgType: 1, textMsg: { content: text } },
+      });
+    }, 200);
+    return;
+  }
+  if (mode === 'other-text-anon-pending') {
+    setTimeout(() => {
+      s.messageList.unshift({
+        currentMsgStatus: 1,
+        outLimitWarn: false,
+        message: { msgId: null, svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: Math.floor(Date.now() / 1000), msgType: 1, textMsg: { content: '另一条不同正文的待发消息' } },
+      });
+    }, 150);
+    return;
+  }
+  if (mode === 'toast-leak') {
+    setTimeout(() => {
+      const holder = sr.querySelector('.toast-holder');
+      holder.innerHTML = `<div class="weui-desktop-toast">发送失败：${text}</div>`;
+    }, 200);
+    return;
+  }
+  if (mode === 'toast-race-leak') {
+    const holder = sr.querySelector('.toast-holder');
+    const toastEl = document.createElement('div');
+    toastEl.className = 'weui-desktop-toast';
+    toastEl.textContent = '占位';
+    Object.defineProperty(toastEl, 'innerText', {
+      configurable: true,
+      get() {
+        toastRaceReads++;
+        return toastRaceReads === 1 ? '' : `发送失败：${text}`;
+      },
+    });
+    holder.innerHTML = '';
+    holder.appendChild(toastEl);
+    return;
+  }
+  const localId = 'local-uuid-' + (++seq);
+  const entry = {
+    currentMsgStatus: 1,
+    outLimitWarn: false,
+    message: {
+      msgId: localId,
+      svrMsgId: null,
+      sendMsgFlag: true,
+      fromUsername: ME_USER,
+      toUsername: s.sessionInfo.username,
+      ts: Math.floor(Date.now() / 1000),
+      msgType: 1,
+      textMsg: { content: text },
+    },
+  };
+  s.messageList.unshift(entry);
+  sawPending = true;
+  renderList();
+  renderPanel();
+
+  if (mode === 'pending') return;
+  if (mode === 'fail') {
+    setTimeout(() => { entry.currentMsgStatus = 3; }, 200);
+    return;
+  }
+  if (mode === 'phonecheck') {
+    setTimeout(() => {
+      entry.currentMsgStatus = 3;
+      sr.querySelector('.phone-check-dialog').style.display = 'block';
+    }, 200);
+    return;
+  }
+  setTimeout(() => {
+    entry.currentMsgStatus = 2;
+    entry.message.svrMsgId = '739000000000000000' + seq;
+    renderList();
+    renderPanel();
+  }, 350);
 }
 
 window.__probe = () => ({
-  sendClicks, openId,
+  sendClicks,
+  msgTextClicks,
+  openId: listSid,
+  headerId: headerSid,
+  scrollLoads,
+  sawPending,
+  toastRaceReads,
+  scrolledTargets,
+  rowHasVue: [...sr.querySelectorAll('.session-wrap')].some((el) => '__vue__' in el),
   boxes: [...sr.querySelectorAll('textarea.edit_area')].map((b) => b.value),
-  mine: sessionList.flatMap(([id, s]) => s.messageList.filter((m) => m.message.msgId.startsWith('nm')).map((m) => ({ session: id, text: m.message.textMsg.content }))),
+  mine: sessionList.filter((entry) => Array.isArray(entry) && entry[0] != null && entry[1]).flatMap(([id, s]) => (s.messageList ?? [])
+    .filter((m) => m.currentMsgStatus === 2 && m.message?.svrMsgId)
+    .map((m) => ({ session: id, svrMsgId: m.message.svrMsgId, text: m.message.textMsg.content }))),
 });
 renderList();
 </script>
