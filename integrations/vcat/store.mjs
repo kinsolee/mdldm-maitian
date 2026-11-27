@@ -148,6 +148,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         notify_version INTEGER NOT NULL DEFAULT 1,
         notify_claim_token TEXT,
         notify_claimed_at TEXT,
+        notify_state TEXT CHECK (notify_state IS NULL OR notify_state IN ('uncertain')),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         resolved_at TEXT
@@ -192,6 +193,55 @@ export function openShadowStore(file, { readOnly = false } = {}) {
     if (!cardCols.has('notify_version')) db.exec('ALTER TABLE cards ADD COLUMN notify_version INTEGER NOT NULL DEFAULT 1');
     if (!cardCols.has('notify_claim_token')) db.exec('ALTER TABLE cards ADD COLUMN notify_claim_token TEXT');
     if (!cardCols.has('notify_claimed_at')) db.exec('ALTER TABLE cards ADD COLUMN notify_claimed_at TEXT');
+    if (!cardCols.has('notify_state')) db.exec("ALTER TABLE cards ADD COLUMN notify_state TEXT CHECK (notify_state IS NULL OR notify_state IN ('uncertain'))");
+
+    // 兼容旧版库迁移：清理同一 inbox_id 绑定多张卡的历史脏数据，并补建 UNIQUE 索引防止重复入库
+    const dupInboxes = db.prepare(`
+      SELECT inbox_id FROM card_items GROUP BY inbox_id HAVING COUNT(*) > 1
+    `).all();
+    if (dupInboxes.length > 0) {
+      const nowAt = new Date().toISOString();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const listRows = db.prepare(`
+          SELECT ci.id AS item_id, ci.card_id, c.status
+          FROM card_items ci
+          JOIN cards c ON c.id = ci.card_id
+          WHERE ci.inbox_id = ?
+          ORDER BY CASE c.status
+            WHEN 'answered' THEN 0
+            WHEN 'skipped' THEN 1
+            WHEN 'expired' THEN 2
+            ELSE 3
+          END, c.id ASC, ci.id ASC
+        `);
+        const delItem = db.prepare('DELETE FROM card_items WHERE id = ?');
+        const fixShadow = db.prepare("UPDATE shadow_log SET card_id = ? WHERE inbox_id = ? AND decision = 'new_question'");
+        const affectedCardIds = new Set();
+        for (const { inbox_id: inboxId } of dupInboxes) {
+          const linked = listRows.all(inboxId);
+          const keeper = linked[0];
+          for (let i = 1; i < linked.length; i += 1) {
+            delItem.run(linked[i].item_id);
+            affectedCardIds.add(linked[i].card_id);
+          }
+          if (keeper) fixShadow.run(keeper.card_id, inboxId);
+        }
+        const countCardItems = db.prepare('SELECT COUNT(*) AS n FROM card_items WHERE card_id = ?');
+        const closeEmptyPending = db.prepare(`
+          UPDATE cards SET status = 'skipped', resolved_at = COALESCE(resolved_at, ?), updated_at = ?
+          WHERE id = ? AND status = 'pending'
+        `);
+        for (const cid of affectedCardIds) {
+          if (countCardItems.get(cid).n === 0) closeEmptyPending.run(nowAt, nowAt, cid);
+        }
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+    }
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_card_items_inbox_unique ON card_items (inbox_id)');
   }
 
   function tx(fn) {
@@ -480,11 +530,12 @@ export function openShadowStore(file, { readOnly = false } = {}) {
             UPDATE cards
             SET card_type = ?, platform = ?, suggested_reply = ?, updated_at = ?,
                 notified_at = CASE WHEN ? > 0 THEN NULL ELSE notified_at END,
+                notify_state = CASE WHEN ? > 0 THEN NULL ELSE notify_state END,
                 notify_version = CASE WHEN ? > 0 THEN notify_version + 1 ELSE notify_version END,
                 notify_claim_token = CASE WHEN ? > 0 THEN NULL ELSE notify_claim_token END,
                 notify_claimed_at = CASE WHEN ? > 0 THEN NULL ELSE notify_claimed_at END
             WHERE id = ?
-          `).run(nextType, nextPlatform, nextSuggested, at, addedItems, addedItems, addedItems, addedItems, targetCardId);
+          `).run(nextType, nextPlatform, nextSuggested, at, addedItems, addedItems, addedItems, addedItems, addedItems, targetCardId);
         }
 
         return { cardId: targetCardId, merged, addedItems };
@@ -545,12 +596,20 @@ export function openShadowStore(file, { readOnly = false } = {}) {
             rejected.push({ inboxId: item.inboxId, reason: `cardId 未绑定当前 inboxId：${item.cardId}` });
             continue;
           }
-          const wouldReply = item.wouldReply != null ? String(item.wouldReply).trim() : null;
+          if (item.wouldReply != null && typeof item.wouldReply !== 'string') {
+            rejected.push({ inboxId: item.inboxId, reason: 'wouldReply 必须是字符串' });
+            continue;
+          }
+          const wouldReply = typeof item.wouldReply === 'string' ? item.wouldReply.trim() : null;
           if (item.decision === 'hit' && !nonEmpty(wouldReply)) {
             rejected.push({ inboxId: item.inboxId, reason: 'decision=hit 时必须提供 wouldReply（本来会怎么回）' });
             continue;
           }
-          const reason = item.reason != null ? String(item.reason).trim() : null;
+          if (item.reason != null && typeof item.reason !== 'string') {
+            rejected.push({ inboxId: item.inboxId, reason: 'reason 必须是字符串' });
+            continue;
+          }
+          const reason = typeof item.reason === 'string' ? item.reason.trim() : null;
           const changes = insertShadow.run(
             inboxRow.id,
             inboxRow.kind,
@@ -587,7 +646,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
     unnotifiedPendingCards(limit = 20) {
       const rows = db.prepare(`
         SELECT * FROM cards
-        WHERE status = 'pending' AND notified_at IS NULL
+        WHERE status = 'pending' AND notified_at IS NULL AND notify_state IS NULL
         ORDER BY created_at ASC, id ASC
         LIMIT ?
       `).all(Math.max(1, Math.min(50, Number(limit) || 20)));
@@ -595,7 +654,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
     },
 
     unnotifiedPendingCount() {
-      return db.prepare("SELECT COUNT(*) AS n FROM cards WHERE status = 'pending' AND notified_at IS NULL").get().n;
+      return db.prepare("SELECT COUNT(*) AS n FROM cards WHERE status = 'pending' AND notified_at IS NULL AND notify_state IS NULL").get().n;
     },
 
     /** 原子认领一批待通知卡片，防止并发 cards_notify 重复推送，并携带 notify_version 防止覆盖新合并问题。 */
@@ -611,6 +670,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
           SELECT * FROM cards
           WHERE status = 'pending'
             AND notified_at IS NULL
+            AND notify_state IS NULL
             AND (notify_claimed_at IS NULL OR notify_claimed_at < ?)
           ORDER BY created_at ASC, id ASC
           LIMIT ?
@@ -619,7 +679,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         const claimStmt = db.prepare(`
           UPDATE cards
           SET notify_claim_token = ?, notify_claimed_at = ?
-          WHERE id = ? AND status = 'pending' AND notified_at IS NULL
+          WHERE id = ? AND status = 'pending' AND notified_at IS NULL AND notify_state IS NULL
             AND (notify_claimed_at IS NULL OR notify_claimed_at < ?)
         `);
         const locked = [];
@@ -642,7 +702,7 @@ export function openShadowStore(file, { readOnly = false } = {}) {
       let confirmed = 0;
       const stmt = db.prepare(`
         UPDATE cards
-        SET notified_at = ?, notify_claim_token = NULL, notify_claimed_at = NULL
+        SET notified_at = ?, notify_state = NULL, notify_claim_token = NULL, notify_claimed_at = NULL
         WHERE id = ? AND status = 'pending' AND notified_at IS NULL
           AND notify_claim_token = ? AND notify_version = ?
       `);
@@ -652,6 +712,24 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         }
       });
       return confirmed;
+    },
+
+    /** 请求已发出但回执丢失/不可解析：fail-closed 标记 notify_state=uncertain，绝不误记已通知也不自动重发同版本。 */
+    markNotifyUncertain(claimToken, cardVersions, { now = Date.now } = {}) {
+      const at = iso(now);
+      let marked = 0;
+      const stmt = db.prepare(`
+        UPDATE cards
+        SET notify_state = 'uncertain', notify_claim_token = NULL, notify_claimed_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'pending' AND notified_at IS NULL
+          AND notify_claim_token = ? AND notify_version = ?
+      `);
+      tx(() => {
+        for (const entry of cardVersions) {
+          marked += stmt.run(at, Number(entry.id), claimToken, Number(entry.notifyVersion)).changes;
+        }
+      });
+      return marked;
     },
 
     /** 通知发送失败时释放认领锁，便于后续重试。 */
@@ -684,6 +762,18 @@ export function openShadowStore(file, { readOnly = false } = {}) {
         const card = db.prepare('SELECT * FROM cards WHERE id = ?').get(Number(cardId));
         if (!card) return { ok: false, code: 404, error: '找不到这张卡片' };
         if (card.status !== 'pending') return { ok: false, code: 409, error: `卡片已处理（当前状态：${card.status}）` };
+
+        const dupAnswered = db.prepare(`
+          SELECT ci1.inbox_id, c2.id AS other_card_id
+          FROM card_items ci1
+          JOIN card_items ci2 ON ci2.inbox_id = ci1.inbox_id AND ci2.card_id != ci1.card_id
+          JOIN cards c2 ON c2.id = ci2.card_id AND c2.status = 'answered'
+          WHERE ci1.card_id = ?
+          LIMIT 1
+        `).get(card.id);
+        if (dupAnswered) {
+          return { ok: false, code: 409, error: `该卡关联的问题已在卡片 #${dupAnswered.other_card_id} 回答入库，禁止重复生成问答条目` };
+        }
 
         const kbQuestion = nonEmpty(question) ? question.trim() : card.question_summary;
         const kbPlatform = nonEmpty(platform) ? platform.trim() : (card.platform || 'all');

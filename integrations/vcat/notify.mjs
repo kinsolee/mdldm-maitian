@@ -77,6 +77,8 @@ export function buildFallbackText(cards, { cardsUrl = 'http://127.0.0.1:8794/car
   return lines.join('\n');
 }
 
+const DEFINITE_CONNECT_ERRORS = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH']);
+
 async function postFeishu(webhook, body, fetchImpl) {
   let res;
   try {
@@ -87,34 +89,41 @@ async function postFeishu(webhook, body, fetchImpl) {
       signal: AbortSignal.timeout(10_000),
     });
   } catch (err) {
-    return { sent: false, why: err.name === 'TimeoutError' ? '超过 10 秒没响应' : `连不上（${err.cause?.code ?? err.name}）` };
+    const code = err?.cause?.code || (typeof err?.code === 'string' ? err.code : '');
+    if (code && DEFINITE_CONNECT_ERRORS.has(code)) {
+      return { sent: false, uncertain: false, why: `连不上（${code}）` };
+    }
+    return {
+      sent: false,
+      uncertain: true,
+      why: err?.name === 'TimeoutError' ? '超过 10 秒没响应（结果未知，已暂停自动重发）' : `回执中断（${code || err?.name || 'unknown'}，结果未知，已暂停自动重发）`,
+    };
   }
-  if (!res.ok) return { sent: false, why: `HTTP ${res.status}` };
+  if (!res.ok) return { sent: false, uncertain: false, why: `HTTP ${res.status}` };
   let json;
   try {
     const raw = await res.text();
     json = JSON.parse(raw);
   } catch {
-    return { sent: false, why: '飞书响应不是合法 JSON' };
+    return { sent: false, uncertain: true, why: '飞书响应不是合法 JSON（结果未知，已暂停自动重发）' };
   }
   if (!json || typeof json !== 'object') {
-    return { sent: false, why: '飞书响应格式异常' };
+    return { sent: false, uncertain: true, why: '飞书响应格式异常（结果未知，已暂停自动重发）' };
   }
   const code = json.code ?? json.StatusCode;
-  if (code !== 0) {
-    return { sent: false, rejected: code != null, why: `飞书返回 code=${code ?? 'missing'}` };
+  if (code == null) {
+    return { sent: false, uncertain: true, why: '飞书响应缺少状态码（结果未知，已暂停自动重发）' };
   }
-  return { sent: true };
-}
-
-async function lazyDefaultNotify(text) {
-  const mod = await import('../../src/ops/login.mjs');
-  return mod.defaultNotify(text);
+  if (code !== 0) {
+    return { sent: false, uncertain: false, rejected: true, why: `飞书返回 code=${code}` };
+  }
+  return { sent: true, uncertain: false };
 }
 
 /**
  * 把未推送的 pending 卡片合批发出一次飞书交互卡片。
- * 只有飞书确认发送成功才给卡片打上 notified_at；没配 webhook 或发送失败不丢卡片。
+ * 只有飞书确认发送成功（HTTP 2xx + 合法 JSON + code=0）才打上 notified_at；
+ * 确定未送达释放认领锁允许重试；回执丢失/非 JSON 等未知结果 fail-closed 标记 uncertain，既不误记已发送也不自动重发同版本。
  */
 export async function notifyPendingCards(store, opts = {}) {
   const {
@@ -122,7 +131,7 @@ export async function notifyPendingCards(store, opts = {}) {
     webhook = null,
     maitianConfig,
     fetchImpl = fetch,
-    fallbackNotify = lazyDefaultNotify,
+    fallbackNotify = null,
     now = Date.now,
     limit = 20,
     claimTtlMs = 60_000,
@@ -139,19 +148,42 @@ export async function notifyPendingCards(store, opts = {}) {
   const cardPayload = buildShadowBatchCard(cards, { cardsUrl, now });
   let outcome = await postFeishu(targetWebhook, { msg_type: 'interactive', card: cardPayload }, fetchImpl);
   if (outcome.rejected) {
-    try {
-      const fallbackOk = await fallbackNotify(buildFallbackText(cards, { cardsUrl }));
-      outcome = { sent: Boolean(fallbackOk), why: fallbackOk ? 'fallback_defaultNotify' : outcome.why };
-    } catch {
-      outcome = { sent: false, why: 'fallback_failed' };
+    const fallbackText = buildFallbackText(cards, { cardsUrl });
+    if (typeof fallbackNotify === 'function') {
+      try {
+        const res = await fallbackNotify(fallbackText);
+        if (res === true || (res && typeof res === 'object' && res.sent === true)) {
+          outcome = { sent: true, uncertain: false, why: 'fallback_custom' };
+        } else if (res && typeof res === 'object' && res.uncertain === true) {
+          outcome = { sent: false, uncertain: true, why: res.why || 'fallback_uncertain' };
+        } else {
+          outcome = { sent: false, uncertain: false, why: (res && res.why) || outcome.why };
+        }
+      } catch {
+        outcome = { sent: false, uncertain: true, why: 'fallback_uncertain' };
+      }
+    } else {
+      // 默认文本降级复用同一飞书 webhook，仍走严格 JSON + code===0 校验，绝不把非 JSON 200 误记成功
+      outcome = await postFeishu(targetWebhook, { msg_type: 'text', content: { text: fallbackText } }, fetchImpl);
     }
   }
 
+  const versions = cards.map((c) => ({ id: c.id, notifyVersion: c.notifyVersion }));
   if (outcome.sent) {
-    const versions = cards.map((c) => ({ id: c.id, notifyVersion: c.notifyVersion }));
     const confirmed = store.confirmCardsNotified(claimToken, versions, { now });
     return { sent: true, count: cards.length, confirmed, cardIds: cards.map((c) => c.id) };
   }
+  if (outcome.uncertain) {
+    const uncertainCount = store.markNotifyUncertain(claimToken, versions, { now });
+    return {
+      sent: false,
+      uncertain: true,
+      uncertainCount,
+      count: cards.length,
+      cardIds: cards.map((c) => c.id),
+      reason: outcome.why || 'send_uncertain',
+    };
+  }
   store.releaseNotifyClaim(claimToken);
-  return { sent: false, count: cards.length, cardIds: cards.map((c) => c.id), reason: outcome.why || 'send_failed' };
+  return { sent: false, uncertain: false, count: cards.length, cardIds: cards.map((c) => c.id), reason: outcome.why || 'send_failed' };
 }

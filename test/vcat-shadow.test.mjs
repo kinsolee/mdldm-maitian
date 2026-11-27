@@ -961,12 +961,13 @@ describe('第 1 轮评审阻断项回归测试', () => {
       const pre = await runHook(['check', '--no-collect'], { config: {}, store });
       assert.equal(pre.code, 0);
 
-      // 非 JSON 200 响应不能算成功
-      const nonJsonRes = await notifyPendingCards(store, {
+      // 确定失败（HTTP 500）应释放认领锁允许后续重试，不写 notified_at
+      const http500Res = await notifyPendingCards(store, {
         webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
-        fetchImpl: async () => new Response('<html>gateway ok</html>', { status: 200 }),
+        fetchImpl: async () => new Response('server error', { status: 500 }),
       });
-      assert.equal(nonJsonRes.sent, false);
+      assert.equal(http500Res.sent, false);
+      assert.equal(http500Res.uncertain, false);
       assert.equal(store.unnotifiedPendingCount(), 1);
 
       // 并发调用两次 notifyPendingCards：第二次不得重复发请求；且发送期间合并了 n:2 后，旧请求回写不能吞掉更新后的卡
@@ -1129,6 +1130,280 @@ describe('第 1 轮评审阻断项回归测试', () => {
       assert.equal(disabledBtn.disabled, true);
     } finally {
       await new Promise((r) => server.close(r));
+      store.close();
+    }
+  });
+});
+
+describe('第 2 轮评审阻断与非阻断回归测试', () => {
+  test('R2-1：tools/list 超过 20 页正常翻完第 21 页；超上限或循环游标 fail-closed 抛错', async () => {
+    // 场景 A：21 页有效分页，白名单工具在第 21 页必须被发现
+    const server21 = http.createServer(async (req, res) => {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+        res.end(JSON.stringify({ error: 'method not allowed' }));
+        return;
+      }
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const mcp = new Server({ name: 'paged-21', version: '0.1.0' }, { capabilities: { tools: {} } });
+      mcp.setRequestHandler(ListToolsRequestSchema, async (request) => {
+        const page = Number(request.params?.cursor || 1);
+        if (page < 21) {
+          return {
+            tools: [{ name: `vcat_dummy_tool_${page}`, description: 'non-whitelist', inputSchema: { type: 'object', properties: {} } }],
+            nextCursor: String(page + 1),
+          };
+        }
+        return {
+          tools: [{ name: 'vcat_list_accounts', description: 'on page 21', inputSchema: { type: 'object', properties: {} } }],
+        };
+      });
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+      res.on('close', () => { transport.close().catch(() => {}); mcp.close().catch(() => {}); });
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res, body);
+    });
+    await new Promise((r) => server21.listen(0, '127.0.0.1', r));
+
+    // 场景 B：循环游标必须 fail-closed 抛错，不得静默截断
+    const serverLoop = http.createServer(async (req, res) => {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+        res.end(JSON.stringify({ error: 'method not allowed' }));
+        return;
+      }
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const mcp = new Server({ name: 'paged-loop', version: '0.1.0' }, { capabilities: { tools: {} } });
+      mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+        tools: [{ name: 'vcat_list_accounts', description: 'loop', inputSchema: { type: 'object', properties: {} } }],
+        nextCursor: 'same-cursor',
+      }));
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+      res.on('close', () => { transport.close().catch(() => {}); mcp.close().catch(() => {}); });
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res, body);
+    });
+    await new Promise((r) => serverLoop.listen(0, '127.0.0.1', r));
+
+    try {
+      const up21 = createUpstreamClient({ url: `http://127.0.0.1:${server21.address().port}/mcp`, token: UPSTREAM_TOKEN });
+      const synced = await up21.syncTools();
+      assert.deepEqual(synced.exposedTools.map((t) => t.name), ['vcat_list_accounts']);
+
+      const upLoop = createUpstreamClient({ url: `http://127.0.0.1:${serverLoop.address().port}/mcp`, token: UPSTREAM_TOKEN });
+      await assert.rejects(() => upLoop.syncTools(), /循环分页游标/);
+    } finally {
+      await new Promise((r) => server21.close(r));
+      await new Promise((r) => serverLoop.close(r));
+    }
+  });
+
+  test('R2-2 & N2：配置校验错误不回显查询参数/令牌，[::1] 被拒，代理直调上游 isError 正文脱敏', async () => {
+    const secretMarker = 'SECRET_URL_TOKEN_998877';
+    try {
+      parseCardsUrl(`http://127.0.0.1:8794/cards?token=${secretMarker}`, 8794);
+      assert.fail('should throw');
+    } catch (err) {
+      assert.ok(!err.message.includes(secretMarker), 'VCAT_CARDS_URL 报错不得回显查询参数令牌');
+    }
+    try {
+      parseUpstreamUrl(`http://127.0.0.1:3199/mcp?token=${secretMarker}`);
+      assert.fail('should throw');
+    } catch (err) {
+      assert.ok(!err.message.includes(secretMarker), 'VCAT_UPSTREAM_URL 报错不得回显查询参数令牌');
+    }
+    assert.throws(() => parseCardsUrl('http://[::1]:8794/cards', 8794), /回环/);
+
+    // 代理直调白名单工具遇到上游 isError 时，不得把原始错误正文回显给调用方
+    const store = openShadowStore(':memory:');
+    const fakeUpstream = {
+      callReadTool: async () => ({ isError: true, content: [{ type: 'text', text: `internal leak ${secretMarker}` }] }),
+    };
+    const proxyServer = http.createServer();
+    await new Promise((r) => proxyServer.listen(0, '127.0.0.1', r));
+    const port = proxyServer.address().port;
+    proxyServer.on('request', createVcatProxyHttp({
+      store,
+      upstream: fakeUpstream,
+      upstreamTools: [{ name: 'vcat_list_accounts', description: 'read', inputSchema: { type: 'object', properties: {} } }],
+      token: PROXY_TOKEN,
+      port,
+      log: () => {},
+    }));
+    const client = new Client({ name: 'test-proxy-redact', version: '0.1.0' });
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}${MCP_PATH}`), {
+      requestInit: { headers: { Authorization: `Bearer ${PROXY_TOKEN}` } },
+    });
+    try {
+      await client.connect(transport);
+      const res = await client.callTool({ name: 'vcat_list_accounts', arguments: {} });
+      assert.equal(res.isError, true);
+      const txt = res.content.map((c) => c.text).join('\n');
+      assert.ok(!txt.includes(secretMarker), '代理直调上游 isError 时不得回显原始正文');
+    } finally {
+      await client.close().catch(() => {});
+      await new Promise((r) => proxyServer.close(r));
+      store.close();
+    }
+  });
+
+  test('R2-4：旧版无 UNIQUE 约束的数据库升级后自动清理重复 card_items，禁止同一 inbox 生成第 2 条 KB', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vcat-legacy-'));
+    const dbFile = path.join(dir, 'shadow.db');
+    try {
+      // 用原生 DatabaseSync 模拟旧版 0c5f9f1 表结构与已产生的重复出卡数据
+      const { DatabaseSync } = await import('node:sqlite');
+      const legacyDb = new DatabaseSync(dbFile);
+      legacyDb.exec(`
+        CREATE TABLE inbox (
+          id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform TEXT NOT NULL,
+          account_id TEXT, account_name TEXT, session_id TEXT, work_id TEXT, work_title TEXT,
+          author_name TEXT, author_id TEXT, content TEXT NOT NULL,
+          occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, raw_json TEXT, processed_at TEXT
+        );
+        CREATE TABLE kb_entries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT NOT NULL, answer TEXT NOT NULL,
+          platform TEXT NOT NULL DEFAULT 'all', source_card_id INTEGER,
+          auto_reply INTEGER NOT NULL DEFAULT 0 CHECK (auto_reply = 0),
+          keywords TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE cards (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, card_type TEXT NOT NULL, platform TEXT NOT NULL,
+          account TEXT, question_summary TEXT NOT NULL, suggested_reply TEXT, topic_key TEXT,
+          status TEXT NOT NULL DEFAULT 'pending', final_answer TEXT, kb_entry_id INTEGER,
+          notified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT
+        );
+        CREATE TABLE card_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, card_id INTEGER NOT NULL, inbox_id TEXT NOT NULL,
+          platform TEXT, account TEXT, author_name TEXT, excerpt TEXT, created_at TEXT NOT NULL,
+          UNIQUE (card_id, inbox_id)
+        );
+        CREATE TABLE shadow_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, inbox_id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+          platform TEXT NOT NULL, decision TEXT NOT NULL, kb_entry_id INTEGER, card_id INTEGER,
+          would_reply TEXT, reason TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      `);
+      const ts = '2026-11-27T01:00:00.000Z';
+      legacyDb.prepare("INSERT INTO inbox (id, kind, platform, content, occurred_at, received_at, processed_at) VALUES ('dup:1', 'comment', 'Douyin', '旧重复问题', ?, ?, ?)").run(ts, ts, ts);
+      legacyDb.prepare("INSERT INTO kb_entries (id, question, answer, platform, source_card_id, auto_reply, keywords, created_at, updated_at) VALUES (1, '旧重复问题', '旧答案1', 'Douyin', 1, 0, '', ?, ?)").run(ts, ts);
+      legacyDb.prepare("INSERT INTO cards (id, card_type, platform, question_summary, status, final_answer, kb_entry_id, created_at, updated_at, resolved_at) VALUES (1, 'comment', 'Douyin', '旧重复问题', 'answered', '旧答案1', 1, ?, ?, ?)").run(ts, ts, ts);
+      legacyDb.prepare("INSERT INTO cards (id, card_type, platform, question_summary, status, created_at, updated_at) VALUES (2, 'comment', 'Douyin', '旧重复问题（重放卡）', 'pending', ?, ?)").run(ts, ts);
+      legacyDb.prepare("INSERT INTO card_items (card_id, inbox_id, platform, excerpt, created_at) VALUES (1, 'dup:1', 'Douyin', '旧重复问题', ?)").run(ts);
+      legacyDb.prepare("INSERT INTO card_items (card_id, inbox_id, platform, excerpt, created_at) VALUES (2, 'dup:1', 'Douyin', '旧重复问题', ?)").run(ts);
+      legacyDb.prepare("INSERT INTO shadow_log (inbox_id, kind, platform, decision, card_id, created_at) VALUES ('dup:1', 'comment', 'Douyin', 'new_question', 2, ?)").run(ts);
+      legacyDb.close();
+
+      // 用新版 openShadowStore 打开旧库：自动去重迁移 + 关停空壳重复卡 + 建 UNIQUE 索引
+      const store = openShadowStore(dbFile);
+      try {
+        const secondCard = store.getCard(2);
+        assert.equal(secondCard.status, 'skipped', '旧库空壳重复 pending 卡应被自动关闭');
+        const ansRes = store.answerCard(2, { answer: '试图二次入库' });
+        assert.equal(ansRes.ok, false);
+        assert.equal(ansRes.code, 409);
+        assert.equal(store.listKb(10).length, 1, '同一 inbox 最终只能有 1 条 KB');
+        assert.equal(store.listShadowLog(10)[0].cardId, 1, 'shadow_log 应回指已保留的卡片 #1');
+      } finally {
+        store.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('R2-5：shadow_record 拒绝非字符串 wouldReply（如 {}）与非字符串 reason', () => {
+    const store = openShadowStore(':memory:');
+    try {
+      store.ingestInbox([
+        { id: 'type:1', kind: 'comment', platform: 'Douyin', content: '怎么用', occurredAt: '2026-11-27T01:00:00.000Z' },
+        { id: 'type:2', kind: 'comment', platform: 'Douyin', content: '广告', occurredAt: '2026-11-27T01:01:00.000Z' },
+      ]);
+      store.db.prepare(`
+        INSERT INTO kb_entries (id, question, answer, platform, source_card_id, auto_reply, keywords, created_at, updated_at)
+        VALUES (1, '怎么用', '看置顶', 'all', NULL, 0, '', '2026-11-27T01:00:00.000Z', '2026-11-27T01:00:00.000Z')
+      `).run();
+
+      const badRes = store.recordShadow([
+        { inboxId: 'type:1', decision: 'hit', kbEntryId: 1, wouldReply: {} },
+        { inboxId: 'type:2', decision: 'ad', reason: ['bad'] },
+      ]);
+      assert.equal(badRes.recorded, 0);
+      assert.equal(badRes.rejected.length, 2);
+      assert.equal(store.pendingCount(), 2, '非字符串 wouldReply/reason 不得将 inbox 标记为已处理');
+    } finally {
+      store.close();
+    }
+  });
+
+  test('R2-8：飞书降级文本路径返回非 JSON 200 拒判成功；回执丢失 fail-closed 不重复推送，新问题合并后可再发', async () => {
+    const store = openShadowStore(':memory:');
+    try {
+      store.ingestInbox([
+        { id: 'f:1', kind: 'comment', platform: 'Douyin', content: '降级测试', occurredAt: '2026-11-27T01:00:00.000Z' },
+        { id: 'f:2', kind: 'comment', platform: 'Douyin', content: '断线测试1', occurredAt: '2026-11-27T01:01:00.000Z' },
+        { id: 'f:3', kind: 'comment', platform: 'Bili', content: '断线测试2', occurredAt: '2026-11-27T01:02:00.000Z' },
+      ]);
+
+      // 场景 A：主请求返回非零业务码 -> 触发默认降级文本 -> 降级收到 HTTP 200 非 JSON -> 绝不误记 sent
+      const cFallback = store.submitCard({ inboxIds: ['f:1'], questionSummary: '降级测试', topicKey: 'fb-topic' });
+      let callIdx = 0;
+      const fallbackRes = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: async () => {
+          callIdx += 1;
+          if (callIdx === 1) return new Response(JSON.stringify({ code: 19001, msg: 'card rejected' }), { status: 200 });
+          return new Response('<html>proxy ok</html>', { status: 200 });
+        },
+      });
+      assert.equal(callIdx, 2);
+      assert.equal(fallbackRes.sent, false);
+      assert.equal(fallbackRes.uncertain, true);
+      assert.equal(store.getCard(cFallback.card.id).notifiedAt, null, '降级返回非 JSON 时绝不能写入 notified_at');
+
+      // 场景 B：接收方已收到但响应前断线 -> 下一轮绝不重复发送同一版本；合并新问题后再发新版本
+      const cDrop = store.submitCard({ inboxIds: ['f:2'], questionSummary: '断线问题', topicKey: 'drop-topic' });
+      let receivedByPeer = 0;
+      const dropFetch = async () => {
+        receivedByPeer += 1;
+        throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+      };
+      const drop1 = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: dropFetch,
+      });
+      assert.equal(drop1.sent, false);
+      assert.equal(drop1.uncertain, true);
+      assert.equal(receivedByPeer, 1);
+      assert.equal(store.getCard(cDrop.card.id).notifiedAt, null);
+
+      // 下一轮通知同一版本：不得再次发送给接收方
+      const drop2 = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: dropFetch,
+      });
+      assert.equal(drop2.sent, false);
+      assert.equal(drop2.reason, 'no_unnotified_cards');
+      assert.equal(receivedByPeer, 1, '回执丢失后同版本绝不自动重发');
+
+      // 当新问题 f:3 合并进该卡后（notify_version 递增），允许发出新版聚合卡
+      store.submitCard({ inboxIds: ['f:3'], questionSummary: '断线问题', topicKey: 'drop-topic' });
+      const resent = await notifyPendingCards(store, {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: async () => {
+          receivedByPeer += 1;
+          return new Response(JSON.stringify({ code: 0 }), { status: 200 });
+        },
+      });
+      assert.equal(resent.sent, true);
+      assert.equal(receivedByPeer, 2);
+      assert.ok(store.getCard(cDrop.card.id).notifiedAt);
+    } finally {
       store.close();
     }
   });

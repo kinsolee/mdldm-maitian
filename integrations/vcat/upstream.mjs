@@ -16,6 +16,7 @@ export const VCAT_READ_WHITELIST = Object.freeze([
 
 const WHITELIST_SET = new Set(VCAT_READ_WHITELIST);
 const REFRESH_KEY_PATTERN = /^(refresh|force_?refresh|live_?refresh)$/i;
+const MAX_TOOL_LIST_PAGES = 200;
 
 export function isAllowedUpstreamTool(name) {
   return typeof name === 'string' && WHITELIST_SET.has(name);
@@ -106,6 +107,7 @@ export function parseToolResultJson(result) {
 /** 脱敏上游传输错误：绝不把 SDK 拼入的 HTTP 响应体、参数或令牌泄漏到异常消息与日志。 */
 export function redactUpstreamError(err, action = '上游调用') {
   if (!err) return new Error(`${action}失败`);
+  if (err.vcatSafeError === true) return err;
   if (err.name === 'AbortError' || err.name === 'TimeoutError') {
     return new Error(`${action}超时`);
   }
@@ -156,14 +158,21 @@ export function createUpstreamClient({ url, token, timeoutMs = 20_000 }) {
         const collected = [];
         const seenCursors = new Set();
         let cursor;
-        for (let page = 0; page < 20; page += 1) {
+        for (let page = 0; page < MAX_TOOL_LIST_PAGES; page += 1) {
           const res = await client.listTools(cursor ? { cursor } : undefined);
           if (Array.isArray(res?.tools)) collected.push(...res.tools);
-          if (!res?.nextCursor || seenCursors.has(res.nextCursor)) break;
+          if (!res?.nextCursor) return collected;
+          if (seenCursors.has(res.nextCursor)) {
+            const err = new Error('上游 tools/list 返回循环分页游标，拒绝截断启动');
+            err.vcatSafeError = true;
+            throw err;
+          }
           seenCursors.add(res.nextCursor);
           cursor = res.nextCursor;
         }
-        return collected;
+        const err = new Error(`上游 tools/list 超过 ${MAX_TOOL_LIST_PAGES} 页上限，拒绝截断启动`);
+        err.vcatSafeError = true;
+        throw err;
       });
       return filterUpstreamTools(allTools);
     },

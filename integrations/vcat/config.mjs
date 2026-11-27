@@ -29,6 +29,7 @@ export const OPENBOT_FILES = Object.freeze([
 ]);
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+const CARDS_LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
 const MACOS_ROOT_SYMLINKS = new Set(['/var', '/tmp', '/etc']);
 
 export const loadEnvFile = (file = ENV_FILE) => loadEnv(file);
@@ -102,10 +103,13 @@ export function assertSafeKbExportPath(filePath) {
 /** 校验上游地址只能是本机回环 HTTP，避免令牌外泄。 */
 export function parseUpstreamUrl(rawUrl = DEFAULT_UPSTREAM_URL) {
   let parsed;
-  try { parsed = new URL(rawUrl); } catch { throw new Error(`VCAT_UPSTREAM_URL 不是合法地址：${rawUrl}`); }
-  if (parsed.protocol !== 'http:') throw new Error(`VCAT_UPSTREAM_URL 只允许本机 http 协议：${rawUrl}`);
+  try { parsed = new URL(rawUrl); } catch { throw new Error('VCAT_UPSTREAM_URL 不是合法地址'); }
+  if (parsed.protocol !== 'http:') throw new Error('VCAT_UPSTREAM_URL 只允许本机 http 协议');
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('VCAT_UPSTREAM_URL 不允许包含用户信息、查询参数或锚点');
+  }
   if (!LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
-    throw new Error(`VCAT_UPSTREAM_URL 只允许本机回环地址（127.0.0.1 / localhost）：${rawUrl}`);
+    throw new Error('VCAT_UPSTREAM_URL 只允许本机回环地址（127.0.0.1 / localhost）');
   }
   return parsed.toString();
 }
@@ -115,7 +119,7 @@ function parseFixedPort(raw, expectedPort, name) {
   if (raw == null || String(raw).trim() === '') return expectedPort;
   const port = Number(raw);
   if (!Number.isInteger(port) || port !== expectedPort) {
-    throw new Error(`${name} 必须固定为 ${expectedPort}（当前：${raw}）`);
+    throw new Error(`${name} 必须固定为 ${expectedPort}`);
   }
   return port;
 }
@@ -128,19 +132,22 @@ export function parseCardsUrl(rawUrl, cardsPort = DEFAULT_CARDS_PORT) {
   try {
     parsed = new URL(input);
   } catch {
-    throw new Error(`VCAT_CARDS_URL 不是合法地址：${input}`);
+    throw new Error('VCAT_CARDS_URL 不是合法地址');
   }
   if (parsed.protocol !== 'http:') {
-    throw new Error(`VCAT_CARDS_URL 只允许本机 http 协议：${input}`);
+    throw new Error('VCAT_CARDS_URL 只允许本机 http 协议');
   }
-  if (!LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
-    throw new Error(`VCAT_CARDS_URL 只允许本机回环地址：${input}`);
+  if (parsed.username || parsed.password) {
+    throw new Error('VCAT_CARDS_URL 不允许包含用户信息');
+  }
+  if (!CARDS_LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
+    throw new Error('VCAT_CARDS_URL 只允许本机回环地址（127.0.0.1 / localhost）');
   }
   if (Number(parsed.port) !== cardsPort) {
-    throw new Error(`VCAT_CARDS_URL 端口必须为 ${cardsPort}：${input}`);
+    throw new Error(`VCAT_CARDS_URL 端口必须为 ${cardsPort}`);
   }
   if (parsed.pathname !== '/cards' || parsed.search || parsed.hash) {
-    throw new Error(`VCAT_CARDS_URL 路径必须为 /cards：${input}`);
+    throw new Error('VCAT_CARDS_URL 路径必须为 /cards（不允许查询参数或锚点）');
   }
   return parsed.toString();
 }
@@ -150,7 +157,7 @@ export function readConfig(env = process.env) {
   const cardsPort = parseFixedPort(env.VCAT_CARDS_PORT, DEFAULT_CARDS_PORT, 'VCAT_CARDS_PORT');
   const lookbackDays = Number(env.VCAT_LOOKBACK_DAYS || DEFAULT_LOOKBACK_DAYS);
   if (!Number.isInteger(lookbackDays) || lookbackDays <= 0 || lookbackDays > 90) {
-    throw new Error(`VCAT_LOOKBACK_DAYS 必须是 1 到 90 的整数：${env.VCAT_LOOKBACK_DAYS}`);
+    throw new Error('VCAT_LOOKBACK_DAYS 必须是 1 到 90 的整数');
   }
   const kbExportFile = env.VCAT_KB_EXPORT_FILE === ''
     ? null

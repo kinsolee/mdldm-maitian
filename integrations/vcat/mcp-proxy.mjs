@@ -183,7 +183,11 @@ export function buildProxyMcpServer({ store, upstream, upstreamTools = [], notif
       if (!isAllowedUpstreamTool(name) || !exposedUpstreamNames.has(name)) {
         return errText(`工具 ${name} 未暴露或不在只读白名单中，禁止调用`);
       }
-      return await upstream.callReadTool(name, args);
+      const upstreamResult = await upstream.callReadTool(name, args);
+      if (upstreamResult?.isError) {
+        return errText('上游只读工具返回错误（正文已脱敏）');
+      }
+      return upstreamResult;
     } catch (err) {
       return errText(err.message || '工具执行失败');
     }
