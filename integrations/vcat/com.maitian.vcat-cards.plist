@@ -12,6 +12,7 @@
   <key>WorkingDirectory</key><string>/Users/kinso/code/github/kinsolee/mdldm-maitian</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>VCAT_UPSTREAM_TOKEN_KEYCHAIN_SERVICE</key><string>vcat-mcp</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>RunAtLoad</key><true/>
