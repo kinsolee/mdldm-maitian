@@ -5,7 +5,7 @@
 <wujie-app></wujie-app>
 <script>
 // 模式（?mode=）：ok | scroll | swap | swap-header | swap-list | pending | fail | phonecheck | fail-history | locked | lastme | nobox | mangle | silent | nouid
-// 扩展回归模式：scroll-same-peer | old-pending-promote | old-pending-with-svr-promote | missing-msglist | fail-history-silent | async-fail-during-type | anon-pending-fail | anon-failure-swap | phonecheck-preexisting | swap-during-type | swap-before-click | ancestor-conflict | editor-ancestor-mismatch | dialog-disabled | nobtn-msg-send | toast-leak | toast-race-leak | other-text-anon-pending
+// 扩展回归模式：scroll-same-peer | old-pending-promote | old-pending-with-svr-promote | missing-msglist | fail-history-silent | async-fail-during-type | anon-pending-fail | anon-failure-swap | phonecheck-preexisting | swap-during-type | swap-before-click | ancestor-conflict | editor-ancestor-mismatch | deep-editor-ancestor-mismatch | dialog-disabled | nobtn-msg-send | toast-leak | toast-race-leak | other-text-anon-pending | sessionlist-null-entry | guard-throw-before-click | mousedown-insert-fail | mousedown-insert-pending
 const mode = new URLSearchParams(location.search).get('mode') || 'ok';
 if (mode !== 'nouid') window.__loginUser = { uniqId: 'v2_me', nickname: '麦田测试号' };
 const ME_USER = 'me_finder';
@@ -118,6 +118,8 @@ const sessionList = mode === 'scroll'
   ? Array.from({ length: 12 }, (_, idx) => makeFiller(idx + 1))
   : mode === 'scroll-same-peer'
     ? [samePeerOther, ...Array.from({ length: 11 }, (_, idx) => makeFiller(idx + 1))]
+  : mode === 'sessionlist-null-entry'
+    ? [null, ['s_null_val', null], 'bad_entry', ...targetSessions]
   : [...targetSessions];
 
 const wrapperEl = sr.querySelector('.private-msg-wrapper');
@@ -148,8 +150,8 @@ const headerVm = {
   $props: {},
   $data: {},
   get sessionInfo() {
-    if (mode === 'ancestor-conflict' || mode === 'editor-ancestor-mismatch') return {};
-    const hit = sessionList.find(([id]) => id === headerSid);
+    if (mode === 'ancestor-conflict' || mode === 'editor-ancestor-mismatch' || mode === 'deep-editor-ancestor-mismatch') return {};
+    const hit = sessionList.find((entry) => Array.isArray(entry) && entry[0] === headerSid && entry[1]);
     return hit ? hit[1].sessionInfo : null;
   },
   $children: [],
@@ -185,7 +187,7 @@ function renderList() {
   tgEl.innerHTML = '';
   const vnodes = [];
   // 让 DOM 顺序与 sessionList 顺序不同，确保测试覆盖 transition-group vnode.key 主路径而非索引回退
-  const renderItems = [...sessionList].reverse();
+  const renderItems = [...sessionList].filter((entry) => Array.isArray(entry) && entry[0] != null && entry[1]).reverse();
   for (const [id, s] of renderItems) {
     const el = document.createElement('div');
     el.className = 'session-wrap' + (id === listSid ? ' active-session' : '');
@@ -213,7 +215,7 @@ function renderList() {
 
 function renderPanel() {
   const activeId = headerSid || listSid;
-  const hit = sessionList.find(([id]) => id === activeId);
+  const hit = sessionList.find((entry) => Array.isArray(entry) && entry[0] === activeId && entry[1]);
   dialogEl.innerHTML = '';
   if (!hit) return;
   const s = hit[1];
@@ -246,7 +248,22 @@ function renderPanel() {
     : mode === 'dialog-disabled'
       ? '<textarea class="edit_area"></textarea><div class="weui-desktop-btn_wrp"><div class="weui-desktop-btn" role="button">发送</div></div>'
     : '<textarea class="edit_area"></textarea><div class="weui-desktop-btn_wrp"><button class="weui-desktop-btn weui-desktop-btn_disabled" disabled>发送</button></div>';
-  dialogEl.appendChild(footer);
+  if (mode === 'deep-editor-ancestor-mismatch') {
+    const outer = document.createElement('div');
+    outer.className = 'deep-editor-root';
+    outer.__vue__ = { $props: { sessionId: 's_2' }, $data: {}, $children: [] };
+    let cur = outer;
+    for (let depth = 0; depth < 15; depth++) {
+      const wrap = document.createElement('div');
+      wrap.className = `deep-wrap-${depth}`;
+      cur.appendChild(wrap);
+      cur = wrap;
+    }
+    cur.appendChild(footer);
+    dialogEl.appendChild(outer);
+  } else {
+    dialogEl.appendChild(footer);
+  }
 
   const ta = footer.querySelector('textarea');
   const btn = footer.querySelector('button, [role=button]');
@@ -279,13 +296,53 @@ function renderPanel() {
       headerSid = 's_2';
     });
   }
+  if (btn && mode === 'guard-throw-before-click') {
+    btn.addEventListener('mousedown', () => {
+      Object.defineProperty(listVm.$data, 'sessionList', {
+        configurable: true,
+        get() { throw new Error('sessionList broken during click'); },
+      });
+    });
+  }
+  if (btn && mode === 'mousedown-insert-fail') {
+    btn.addEventListener('mousedown', () => {
+      if (btn.dataset.mf) return;
+      btn.dataset.mf = '1';
+      s.messageList.unshift({
+        currentMsgStatus: 3,
+        outLimitWarn: false,
+        message: { msgId: 'mousedown-old-fail', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: ts + 12, msgType: 1, textMsg: { content: ta.value } },
+      });
+    });
+  }
+  if (btn && mode === 'mousedown-insert-pending') {
+    btn.addEventListener('mousedown', () => {
+      if (btn.dataset.mp) return;
+      btn.dataset.mp = '1';
+      s.messageList.splice(1, 0, {
+        currentMsgStatus: 1,
+        outLimitWarn: false,
+        message: { msgId: 'mousedown-old-pending', svrMsgId: null, sendMsgFlag: true, fromUsername: ME_USER, toUsername: s.sessionInfo.username, ts: ts + 5, msgType: 1, textMsg: { content: ta.value } },
+      });
+    });
+  }
   if (btn) btn.onclick = () => { if (!btn.disabled) onSend(s, ta); };
 }
 
 function onSend(s, ta) {
   sendClicks++;
   const text = ta.value;
-  if (mode === 'silent' || mode === 'fail-history-silent' || mode === 'async-fail-during-type' || mode === 'phonecheck-preexisting') return;
+  if (mode === 'silent' || mode === 'fail-history-silent' || mode === 'async-fail-during-type' || mode === 'phonecheck-preexisting' || mode === 'mousedown-insert-fail') return;
+  if (mode === 'mousedown-insert-pending') {
+    setTimeout(() => {
+      const old = s.messageList.find((m) => m.message?.msgId === 'mousedown-old-pending');
+      if (old) {
+        old.currentMsgStatus = 2;
+        old.message.svrMsgId = '7390000000000007777';
+      }
+    }, 200);
+    return;
+  }
   if (mode === 'old-pending-promote') {
     setTimeout(() => {
       const old = s.messageList.find((m) => m.message?.msgId === 'old-pending-uuid');
@@ -408,7 +465,7 @@ window.__probe = () => ({
   scrolledTargets,
   rowHasVue: [...sr.querySelectorAll('.session-wrap')].some((el) => '__vue__' in el),
   boxes: [...sr.querySelectorAll('textarea.edit_area')].map((b) => b.value),
-  mine: sessionList.flatMap(([id, s]) => (s.messageList ?? [])
+  mine: sessionList.filter((entry) => Array.isArray(entry) && entry[0] != null && entry[1]).flatMap(([id, s]) => (s.messageList ?? [])
     .filter((m) => m.currentMsgStatus === 2 && m.message?.svrMsgId)
     .map((m) => ({ session: id, svrMsgId: m.message.svrMsgId, text: m.message.textMsg.content }))),
 });

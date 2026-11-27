@@ -154,33 +154,53 @@ const FIND_SESSION_VM = `let v = null;
   for (let x = sr.querySelector('.session-wrap'), i = 0; x && i < 8 && !v; x = x.parentElement, i++) if (Array.isArray(x.__vue__?.$data?.sessionList)) v = x.__vue__;
   if (!v) for (const e of sr.querySelectorAll('*')) if (Array.isArray(e.__vue__?.$data?.sessionList)) { v = e.__vue__; break; }`;
 
-const DM_SESSIONS_MAP_BODY = `const mapSessions = (list) => list.map(([id, s]) => ({
-    sessionId: id,
-    sessionType: s?.sessionType ?? null,
-    newMsgCount: s?.newMsgCount ?? 0,
-    sessionIsUnread: !!s?.sessionIsUnread,
-    sessionInfo: {
-      sessionId: s?.sessionInfo?.sessionId,
-      username: s?.sessionInfo?.username,
-      nickname: s?.sessionInfo?.nickname,
-      fromUserType: s?.sessionInfo?.fromUserType ?? null,
-    },
-    hasMessageList: Array.isArray(s?.messageList),
-    messageList: Array.isArray(s?.messageList) ? s.messageList.filter(Boolean).map((m) => ({
-      currentMsgStatus: typeof m.currentMsgStatus === 'number' ? m.currentMsgStatus : null,
-      outLimitWarn: !!m.outLimitWarn,
-      message: m.message ? {
-        msgId: m.message.msgId ?? m.message.newMsgId ?? null,
-        svrMsgId: m.message.svrMsgId ?? null,
-        sendMsgFlag: !!m.message.sendMsgFlag,
-        fromUsername: m.message.fromUsername,
-        toUsername: m.message.toUsername,
-        ts: m.message.ts,
-        msgType: m.message.msgType,
-        textMsg: m.message.textMsg ? { content: m.message.textMsg.content } : null,
-      } : null,
-    })) : null,
-  }));`;
+const DM_SESSIONS_MAP_BODY = `const mapSessions = (list) => {
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const entry of list) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const [id, s] = entry;
+      if (id == null || !s || typeof s !== 'object') continue;
+      const hasMessageList = Array.isArray(s.messageList);
+      let mappedMessages = null;
+      if (hasMessageList) {
+        mappedMessages = [];
+        for (const m of s.messageList) {
+          if (!m || typeof m !== 'object') continue;
+          const msg = m.message && typeof m.message === 'object' ? m.message : null;
+          mappedMessages.push({
+            currentMsgStatus: typeof m.currentMsgStatus === 'number' ? m.currentMsgStatus : null,
+            outLimitWarn: !!m.outLimitWarn,
+            message: msg ? {
+              msgId: msg.msgId ?? msg.newMsgId ?? null,
+              svrMsgId: msg.svrMsgId ?? null,
+              sendMsgFlag: !!msg.sendMsgFlag,
+              fromUsername: msg.fromUsername,
+              toUsername: msg.toUsername,
+              ts: msg.ts,
+              msgType: msg.msgType,
+              textMsg: msg.textMsg && typeof msg.textMsg === 'object' ? { content: msg.textMsg.content } : null,
+            } : null,
+          });
+        }
+      }
+      out.push({
+        sessionId: id,
+        sessionType: s.sessionType ?? null,
+        newMsgCount: s.newMsgCount ?? 0,
+        sessionIsUnread: !!s.sessionIsUnread,
+        sessionInfo: {
+          sessionId: s.sessionInfo?.sessionId,
+          username: s.sessionInfo?.username,
+          nickname: s.sessionInfo?.nickname,
+          fromUserType: s.sessionInfo?.fromUserType ?? null,
+        },
+        hasMessageList,
+        messageList: mappedMessages,
+      });
+    }
+    return out;
+  };`;
 
 const DM_SESSIONS_SRC = `${FIND_SESSION_VM}
   if (!v) return null;
@@ -191,7 +211,7 @@ const FIND_ROW_SRC = `const sr = document.querySelector('wujie-app')?.shadowRoot
   ${FIND_SESSION_VM}
   if (v) {
     const list = v.$data.sessionList;
-    const ids = new Set(list.map(([id]) => String(id)));
+    const ids = new Set(list.filter((e) => Array.isArray(e) && e[0] != null).map((e) => String(e[0])));
     const isTg = (c) => c && (c.$options?.name === 'transition-group' || c.$options?._componentTag === 'transition-group' || c.$vnode?.componentOptions?.tag === 'transition-group');
     let foundSessionTg = false;
     const scanTg = (c) => {
@@ -230,7 +250,7 @@ const FIND_ROW_SRC = `const sr = document.querySelector('wujie-app')?.shadowRoot
     if (foundSessionTg) return null;
     const wraps = [...sr.querySelectorAll('.session-wrap')].filter((w) => !w.__vue__?.$data?.sessionList && !w.querySelector('.session-wrap, .session-list, .session-container'));
     if (wraps.length && wraps.length === list.length) {
-      const idx = list.findIndex(([id]) => String(id) === arg);
+      const idx = list.findIndex((e) => Array.isArray(e) && e[0] != null && String(e[0]) === arg);
       if (idx >= 0) return wraps[idx];
     }
   }
@@ -266,7 +286,9 @@ const READ_OPENED_SIDS_BODY = `${FIND_SESSION_VM}
   for (const id of headerIds) addUnique(ids, id);
   if (box) {
     const idOf = (val) => (val && typeof val === 'object' ? val.sessionId ?? val.sessionInfo?.sessionId ?? null : null);
-    for (let el = box, depth = 0; el && depth < 12; el = el.parentElement || el.getRootNode()?.host, depth++) {
+    const seenAnc = new Set();
+    for (let el = box, depth = 0; el && depth < 200 && !seenAnc.has(el); el = el.parentElement || el.getRootNode?.()?.host || null, depth++) {
+      seenAnc.add(el);
       const vm = el.__vue__;
       if (!vm) continue;
       if (Array.isArray(vm.$data?.sessionList)) {
@@ -387,33 +409,62 @@ const PRE_CLICK_SNAPSHOT_SRC = `try { window.__mtChannelsDmGuard?.cleanup?.(); d
   };
   const check = verifyState(arg.sid, arg.peer);
   if (!check.ok) return { ok: false, reason: check.reason };
-  let mineAnonPendingCount = 0;
-  for (const raw of check.cur.messageList) {
-    if (typeof raw?.currentMsgStatus === 'number' && raw.message?.fromUsername !== arg.peer && raw.currentMsgStatus === 1 && !normLocal(raw.message?.msgId)) {
-      mineAnonPendingCount++;
+  const hasMineAnonPending = (session, peerName) => {
+    for (const raw of session?.messageList ?? []) {
+      if (typeof raw?.currentMsgStatus === 'number' && raw.message?.fromUsername !== peerName && raw.currentMsgStatus === 1 && !normLocal(raw.message?.msgId)) {
+        return true;
+      }
     }
-  }
-  if (mineAnonPendingCount > 0) {
+    return false;
+  };
+  if (hasMineAnonPending(check.cur, arg.peer)) {
     return { ok: false, reason: '点击发送前存在无本地 ID 的发送中消息，无法安全核对回读' };
   }
-  const phoneDialogVisible = __qa('.phone-check-dialog').some((el) => isVisible(el));
+  const readPhoneDialogVisible = () => __qa('.phone-check-dialog').some((el) => isVisible(el));
   const toastRe = /失败|错误|异常|频繁|稍后|违规|无法|不能|受限|限制|不支持/;
-  const curToasts = [];
-  for (const el of __qa('[class*=toast], [class*=Toast], [role=alert], [class*=notice], [class*=Notice]')) {
-    const text = (el.innerText || '').trim();
-    if (text && text.length < 80 && toastRe.test(text) && el.getClientRects().length) curToasts.push(text);
-  }
-  const guard = { blockedReason: null, cleanup: null };
+  const readVisibleToasts = () => {
+    const list = [];
+    for (const el of __qa('[class*=toast], [class*=Toast], [role=alert], [class*=notice], [class*=Notice]')) {
+      const text = (el.innerText || '').trim();
+      if (text && text.length < 80 && toastRe.test(text) && el.getClientRects().length) list.push(text);
+    }
+    return [...new Set(list)];
+  };
+  const phoneDialogVisible = readPhoneDialogVisible();
+  const curToasts = readVisibleToasts();
+  const guard = { fired: false, blockedReason: null, clickSnapshot: null, cleanup: null };
+  const blockClick = (ev) => {
+    try { ev.preventDefault(); } catch {}
+    try { ev.stopImmediatePropagation(); } catch {}
+    guard.blockedReason = ${JSON.stringify(DM_GUARD_BLOCKED_ERR)};
+  };
   const onClick = (ev) => {
-    const path = typeof ev.composedPath === 'function' ? ev.composedPath() : [];
-    const hitSend = path.includes(check.markedSend) || (ev.target instanceof Node && check.markedSend.contains(ev.target));
+    let hitSend = false;
+    try {
+      const path = typeof ev.composedPath === 'function' ? ev.composedPath() : [];
+      hitSend = path.includes(check.markedSend) || (ev.target instanceof Node && check.markedSend.contains(ev.target));
+    } catch {
+      guard.fired = true;
+      try { guard.cleanup?.(); } catch {}
+      blockClick(ev);
+      return;
+    }
     if (!hitSend) return;
-    guard.cleanup?.();
-    const live = verifyState(arg.sid, arg.peer);
-    if (!live.ok) {
-      ev.preventDefault();
-      ev.stopImmediatePropagation();
-      guard.blockedReason = ${JSON.stringify(DM_GUARD_BLOCKED_ERR)};
+    guard.fired = true;
+    try { guard.cleanup?.(); } catch {}
+    try {
+      const live = verifyState(arg.sid, arg.peer);
+      if (!live?.ok || hasMineAnonPending(live.cur, arg.peer)) {
+        blockClick(ev);
+        return;
+      }
+      guard.clickSnapshot = {
+        cur: live.cur,
+        phoneDialogVisible: readPhoneDialogVisible(),
+        toasts: readVisibleToasts(),
+      };
+    } catch {
+      blockClick(ev);
     }
   };
   sr.addEventListener('click', onClick, true);
@@ -422,13 +473,21 @@ const PRE_CLICK_SNAPSHOT_SRC = `try { window.__mtChannelsDmGuard?.cleanup?.(); d
     guard.cleanup = null;
   };
   window.__mtChannelsDmGuard = guard;
-  return { ok: true, cur: check.cur, phoneDialogVisible, toasts: [...new Set(curToasts)] };`;
+  return { ok: true, cur: check.cur, phoneDialogVisible, toasts: curToasts };`;
 
 const PHONE_DIALOG_SRC = `${IS_VISIBLE_BODY}
   return __qa('.phone-check-dialog').some((el) => isVisible(el));`;
 
+const READ_DM_GUARD_SRC = `const g = window.__mtChannelsDmGuard;
+  if (!g) return null;
+  return {
+    fired: !!g.fired,
+    blockedReason: g.blockedReason ?? null,
+    clickSnapshot: arg?.needSnap ? (g.clickSnapshot ?? null) : null,
+  };`;
+
 const clearDmClickGuard = (page) => inPage(page, 'try { window.__mtChannelsDmGuard?.cleanup?.(); delete window.__mtChannelsDmGuard; } catch {} return true;').catch(() => {});
-const readDmGuardBlocked = (page) => inPage(page, 'return window.__mtChannelsDmGuard?.blockedReason ?? null;').catch(() => null);
+const readDmGuardState = (page, needSnap) => inPage(page, READ_DM_GUARD_SRC, { needSnap }).catch(() => null);
 
 const dmSessions = async (page) => (await inShadow(page, DM_SESSIONS_SRC)) ?? [];
 const lastOf = (s) => [...(s.messageList ?? [])]
@@ -453,23 +512,25 @@ const SAFE_DM_ERRORS = new Set([
   '私信发送失败（页面消息状态 Failure，触发条数/频控限制）',
   '私信发送失败（页面消息状态 Failure）',
   DM_GUARD_BLOCKED_ERR,
+  '私信发送触发平台安全验证提示',
+  '私信发送触发频控或条数限制提示',
+  '私信发送触发内容审核限制提示',
+  '私信发送受限（平台页面提示无法发送）',
+  '私信发送失败（平台页面弹出错误提示）',
 ]);
-const SAFE_TOAST_ERROR_RE = /^私信发送(?:触发平台安全验证提示|触发频控或条数限制提示|触发内容审核限制提示|受限（平台页面提示无法发送）|失败（平台页面弹出错误提示）)(?:（errcode=-?\d{1,6}）)?$/;
 
 function sanitizeToastError(rawToast) {
   const text = String(rawToast ?? '');
-  const codeMatch = text.match(/(?:errcode|err_code|错误码)[=:：\s]*(-?\d{1,6})(?!\d)/i);
-  const codeSuffix = codeMatch ? `（errcode=${codeMatch[1]}）` : '';
-  if (/验证|风控|安全|手机/.test(text)) return `私信发送触发平台安全验证提示${codeSuffix}`;
-  if (/频繁|频控|稍后|上限|限流|条数/.test(text)) return `私信发送触发频控或条数限制提示${codeSuffix}`;
-  if (/违规|敏感|涉政|违禁/.test(text)) return `私信发送触发内容审核限制提示${codeSuffix}`;
-  if (/不支持|无法|不能|受限|限制|拒收|拉黑|关闭/.test(text)) return `私信发送受限（平台页面提示无法发送）${codeSuffix}`;
-  return `私信发送失败（平台页面弹出错误提示）${codeSuffix}`;
+  if (/验证|风控|安全|手机/.test(text)) return '私信发送触发平台安全验证提示';
+  if (/频繁|频控|稍后|上限|限流|条数/.test(text)) return '私信发送触发频控或条数限制提示';
+  if (/违规|敏感|涉政|违禁/.test(text)) return '私信发送触发内容审核限制提示';
+  if (/不支持|无法|不能|受限|限制|拒收|拉黑|关闭/.test(text)) return '私信发送受限（平台页面提示无法发送）';
+  return '私信发送失败（平台页面弹出错误提示）';
 }
 
 function sanitizeDmSendError(raw) {
   const text = String(raw ?? '').trim();
-  if (SAFE_DM_ERRORS.has(text) || SAFE_TOAST_ERROR_RE.test(text)) return text;
+  if (SAFE_DM_ERRORS.has(text)) return text;
   return sanitizeToastError(text);
 }
 
@@ -574,27 +635,34 @@ async function prepareDM({ page, params, t }) {
   if (lastIsMe(now)) return { blocked: 'last-is-me', detail: '打开会话后看到最后一句是我说的' };
   const wantText = norm(params.text);
   let baseline = null;
+  let baselineSyncedFromClick = false;
+  let guardBlockedReason = null;
+  let guardFired = false;
 
-  const snapshotBeforeClick = async () => {
-    const snap = await inPage(page, PRE_CLICK_SNAPSHOT_SRC, { sid, peer });
-    if (!snap?.ok) {
-      await clearBox(page).catch(() => {});
-      throw new Error(snap?.reason ?? '点击发送前页面状态校验失败');
-    }
-    const cur = snap.cur;
+  const buildBaseline = (snap) => {
+    const cur = snap?.cur;
     const allLocalIds = new Set();
     const beforeAllSvrIds = new Set();
+    const beforeLegacyIds = new Set();
+    let peerLastTs = null;
     let minePendingCount = 0;
     let mineAnonPendingCount = 0;
     let mineSameTextAnonPendingCount = 0;
     let mineAnonUnsettledCount = 0;
-    for (const raw of cur.messageList ?? []) {
+    for (const raw of cur?.messageList ?? []) {
       const m = raw?.message;
       if (!m) continue;
       const lid = normLocalId(m.msgId);
       if (lid) allLocalIds.add(lid);
       const svrId = validSvrMsgId(m.svrMsgId);
       if (svrId) beforeAllSvrIds.add(svrId);
+      if (typeof raw.currentMsgStatus !== 'number') {
+        beforeLegacyIds.add(String(m.msgId ?? `${m.ts}:${m.fromUsername}`));
+      }
+      if (raw.currentMsgStatus !== 3 && m.fromUsername === peer && m.ts != null) {
+        const numTs = Number(m.ts);
+        if (Number.isFinite(numTs) && (peerLastTs === null || numTs > peerLastTs)) peerLastTs = numTs;
+      }
       if (typeof raw.currentMsgStatus === 'number' && m.fromUsername !== peer) {
         if (raw.currentMsgStatus === 1) minePendingCount++;
         if (!lid) {
@@ -606,24 +674,60 @@ async function prepareDM({ page, params, t }) {
         }
       }
     }
-    baseline = {
+    return {
       allLocalIds,
       beforeAllSvrIds,
+      beforeLegacyIds,
+      peerLastTs,
       minePendingCount,
       mineAnonPendingCount,
       mineSameTextAnonPendingCount,
       mineAnonUnsettledCount,
-      phoneDialogVisible: Boolean(snap.phoneDialogVisible),
-      toasts: new Set(snap.toasts ?? []),
+      phoneDialogVisible: Boolean(snap?.phoneDialogVisible),
+      toasts: new Set(snap?.toasts ?? []),
     };
-    return cur;
+  };
+
+  const isOlderThanPeerLast = (msg) => {
+    if (!baseline || baseline.peerLastTs == null || msg?.ts == null) return false;
+    const numTs = Number(msg.ts);
+    return Number.isFinite(numTs) && numTs < baseline.peerLastTs;
+  };
+
+  const syncFromClickGuard = async () => {
+    if (guardBlockedReason) return { fired: true, blockedReason: guardBlockedReason };
+    const state = await readDmGuardState(page, !baselineSyncedFromClick);
+    if (!state) return { fired: guardFired, blockedReason: null };
+    if (state.fired) guardFired = true;
+    if (state.blockedReason) {
+      guardBlockedReason = state.blockedReason;
+      return { fired: true, blockedReason: guardBlockedReason };
+    }
+    if (!baselineSyncedFromClick && state.clickSnapshot) {
+      baseline = buildBaseline(state.clickSnapshot);
+      baselineSyncedFromClick = true;
+    }
+    return { fired: guardFired, blockedReason: null };
+  };
+
+  const snapshotBeforeClick = async () => {
+    const snap = await inPage(page, PRE_CLICK_SNAPSHOT_SRC, { sid, peer });
+    if (!snap?.ok) {
+      await clearBox(page).catch(() => {});
+      throw new Error(snap?.reason ?? '点击发送前页面状态校验失败');
+    }
+    baseline = buildBaseline(snap);
+    return snap.cur;
   };
 
   return {
     send: dmSendSrc(sid),
     items: async () => {
       const isBaselinePass = !baseline;
-      if (!isBaselinePass && await readDmGuardBlocked(page)) return [];
+      if (!isBaselinePass) {
+        const guard = await syncFromClickGuard();
+        if (guard.blockedReason || !guard.fired || !baselineSyncedFromClick) return [];
+      }
       const cur = isBaselinePass ? await snapshotBeforeClick() : bySid(await dmSessions(page));
       if (!cur?.hasMessageList) return [];
       const localIdCounts = countLocalIds(cur?.messageList);
@@ -644,18 +748,25 @@ async function prepareDM({ page, params, t }) {
             if (lid && (localIdCounts.get(lid) ?? 0) > 1) continue;
             if (!lid && baseline.minePendingCount > 0) continue;
             if (baseline.mineAnonPendingCount > 0) continue;
+            if (isOlderThanPeerLast(m)) continue;
           }
           out.push({ id: svrId, mine: m.fromUsername !== peer, rel: true, text: m.textMsg?.content ?? null });
         } else {
-          out.push({ id: String(m.msgId ?? `${m.ts}:${m.fromUsername}`), mine: m.fromUsername !== peer, rel: true, text: m.textMsg?.content ?? null });
+          const legacyId = String(m.msgId ?? `${m.ts}:${m.fromUsername}`);
+          if (!isBaselinePass && m.fromUsername !== peer) {
+            if (baseline.beforeLegacyIds.has(legacyId)) continue;
+            if (isOlderThanPeerLast(m)) continue;
+          }
+          out.push({ id: legacyId, mine: m.fromUsername !== peer, rel: true, text: m.textMsg?.content ?? null });
         }
       }
       return out;
     },
     apiError: async () => {
       if (!baseline) return null;
-      const guardBlocked = await readDmGuardBlocked(page);
-      if (guardBlocked) return guardBlocked;
+      const guard = await syncFromClickGuard();
+      if (guard.blockedReason) return guard.blockedReason;
+      if (!guard.fired || !baselineSyncedFromClick) return null;
       const cur = bySid(await dmSessions(page));
       const phoneNow = Boolean(await inPage(page, PHONE_DIALOG_SRC));
       if (!baseline.phoneDialogVisible && phoneNow) {
@@ -681,6 +792,7 @@ async function prepareDM({ page, params, t }) {
           }
           if (baseline.allLocalIds.has(lid)) continue;
           if (svrId && baseline.beforeAllSvrIds.has(svrId)) continue;
+          if (isOlderThanPeerLast(m)) continue;
           if (norm(m.textMsg?.content) === wantText) sameTextNewMineWithId.push({ raw, lid });
         }
         const noAnonAmbiguity = baseline.mineAnonUnsettledCount === 0 && curAnonUnsettledCount === 0 && !hasAnonNewMineSuccess;
@@ -699,6 +811,8 @@ async function prepareDM({ page, params, t }) {
     },
     diagnose: async () => {
       if (!baseline) return null;
+      const guard = await syncFromClickGuard();
+      if (guard.blockedReason || !guard.fired || !baselineSyncedFromClick) return null;
       const cur = bySid(await dmSessions(page));
       if (!cur?.hasMessageList) return null;
       let curSameTextAnonPendingCount = 0;
@@ -711,10 +825,11 @@ async function prepareDM({ page, params, t }) {
         if (norm(m.textMsg?.content) !== wantText) continue;
         const lid = normLocalId(m.msgId);
         if (!lid) {
-          if (st === 1) curSameTextAnonPendingCount++;
+          if (st === 1 && !isOlderThanPeerLast(m)) curSameTextAnonPendingCount++;
           continue;
         }
         if (baseline.allLocalIds.has(lid)) continue;
+        if (isOlderThanPeerLast(m)) continue;
         if (st === 1) hasNewPending = true;
         if (st === 2 && !validSvrMsgId(m.svrMsgId)) hasNewNoSvrSuccess = true;
       }
