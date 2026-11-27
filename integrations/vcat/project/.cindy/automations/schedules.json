@@ -4,7 +4,8 @@
     {
       "id": "vcat-comments-dms-shadow",
       "name": "小V猫评论私信影子",
-      "prompt": "先完整读 /Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/vcat/agent-prompt.md，严格照它执行本轮影子处理。绝不发真实回复，绝不调用写工具，不碰 OpenBot 文件。",
+      "prompt": "先从本任务的项目工作目录读取并完整阅读 ../agent-prompt.md，严格照它执行本轮影子处理。绝不发真实回复，绝不调用写工具，不碰 OpenBot 文件。",
+      "agentKind": "codex",
       "cronExpr": "*/5 * * * *",
       "timezone": "Asia/Taipei",
       "recurring": true,
@@ -12,7 +13,7 @@
       "persistentSession": false,
       "silentWhenIdle": true,
       "preRunHook": {
-        "command": "/opt/homebrew/bin/node /Users/kinso/code/github/kinsolee/mdldm-maitian/integrations/vcat/hook.mjs check",
+        "command": "/opt/homebrew/bin/node ../hook.mjs check",
         "timeoutMs": 25000
       },
       "notify": { "desktop": false, "feishu": false }
