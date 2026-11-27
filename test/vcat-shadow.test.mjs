@@ -948,6 +948,29 @@ describe('第 1 轮评审阻断项回归测试', () => {
     }
   });
 
+  test('HTTP 504 后保留认领，下一轮不重复投递', async () => {
+    const store = openShadowStore(':memory:');
+    try {
+      store.ingestInbox([{ id: 'n:1', kind: 'comment', platform: 'Douyin', content: '问1', occurredAt: '2026-11-27T01:00:00.000Z' }]);
+      store.submitCard({ inboxIds: ['n:1'], questionSummary: '问1', topicKey: 'same-topic' });
+      let posts = 0;
+      const options = {
+        webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
+        fetchImpl: async (_url, init) => {
+          assert.equal(init.method, 'POST');
+          posts += 1;
+          return new Response(null, { status: 504 });
+        },
+      };
+      const first = await notifyPendingCards(store, options);
+      assert.equal(first.uncertainCount, 1);
+      await notifyPendingCards(store, options);
+      assert.equal(posts, 1);
+    } finally {
+      store.close();
+    }
+  });
+
   test('R1-8：飞书通知原子互斥防重发、合并新问题不被旧回写覆盖、非 JSON 拒判成功、遗留未发卡片唤醒 preRunHook', async () => {
     const store = openShadowStore(':memory:');
     try {
@@ -961,13 +984,13 @@ describe('第 1 轮评审阻断项回归测试', () => {
       const pre = await runHook(['check', '--no-collect'], { config: {}, store });
       assert.equal(pre.code, 0);
 
-      // 确定失败（HTTP 500）应释放认领锁允许后续重试，不写 notified_at
-      const http500Res = await notifyPendingCards(store, {
+      // 确定失败（HTTP 400）应释放认领锁允许后续重试，不写 notified_at
+      const http400Res = await notifyPendingCards(store, {
         webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/fake',
-        fetchImpl: async () => new Response('server error', { status: 500 }),
+        fetchImpl: async () => new Response('bad request', { status: 400 }),
       });
-      assert.equal(http500Res.sent, false);
-      assert.equal(http500Res.uncertain, false);
+      assert.equal(http400Res.sent, false);
+      assert.equal(http400Res.uncertain, false);
       assert.equal(store.unnotifiedPendingCount(), 1);
 
       // 并发调用两次 notifyPendingCards：第二次不得重复发请求；且发送期间合并了 n:2 后，旧请求回写不能吞掉更新后的卡

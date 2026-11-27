@@ -99,7 +99,10 @@ async function postFeishu(webhook, body, fetchImpl) {
       why: err?.name === 'TimeoutError' ? '超过 10 秒没响应（结果未知，已暂停自动重发）' : `回执中断（${code || err?.name || 'unknown'}，结果未知，已暂停自动重发）`,
     };
   }
-  if (!res.ok) return { sent: false, uncertain: false, why: `HTTP ${res.status}` };
+  if (!res.ok) {
+    const rejected = res.status >= 400 && res.status < 500 && res.status !== 408;
+    return { sent: false, uncertain: !rejected, why: `HTTP ${res.status}` };
+  }
   let json;
   try {
     const raw = await res.text();
